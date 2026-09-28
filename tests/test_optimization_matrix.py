@@ -21,7 +21,7 @@ class MatrixTests(unittest.TestCase):
         process = Mock(pid=1234)
         process.wait.side_effect = [subprocess.TimeoutExpired("worker", 1), 0, 0]
         with tempfile.TemporaryDirectory() as directory:
-            with patch.object(matrix.subprocess, "Popen", return_value=process), patch.object(matrix.os, "killpg", create=True) as kill:
+            with patch.object(matrix.signal, "SIGKILL", 9, create=True), patch.object(matrix.subprocess, "Popen", return_value=process), patch.object(matrix.os, "killpg", create=True) as kill:
                 with self.assertRaises(subprocess.TimeoutExpired):
                     matrix.execute(["worker"], Path(directory) / "run.log", 1)
                 self.assertEqual(kill.call_count, 2)
