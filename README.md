@@ -37,7 +37,7 @@ HF_MODEL=/models/your-merged-bf16 TEST_IMAGE=/data/test.png AVI_GPUS=2,3 bash sc
 
 ## 服务器运行步骤
 
-在 Linux 服务器上传整个项目。需要 CUDA 版 PyTorch 及版本匹配的 torchvision（图片预处理使用）、匹配的 CUDA toolkit（包含 nvcc）、CMake >=3.24、G++、OpenMPI 开发包、NCCL 开发包。**驱动 580.126.09 不等于已经安装 CUDA 编译器。** 使用服务器现有 CUDA PyTorch 环境，或单独创建相同版本的环境。CPU-only PyTorch 不能构建。
+在 Linux 服务器上传整个项目。需要 CUDA 版 PyTorch 及版本匹配的 torchvision（图片预处理使用）、匹配的 CUDA toolkit（包含 nvcc）、CMake >=3.18、G++、OpenMPI 开发包、NCCL 开发包。**驱动 580.126.09 不等于已经安装 CUDA 编译器。** 使用服务器现有 CUDA PyTorch 环境，或单独创建相同版本的环境。CPU-only PyTorch 不能构建。
 
 Ubuntu 的常用系统依赖（NCCL 包通常需 NVIDIA 软件源）：
 
@@ -191,3 +191,5 @@ python tools/benchmark_http.py --body request-body.json --requests 20 --concurre
 ## 本地检查记录
 
 2026-09-28：15 项 Python 单元/HTTP 接口测试、工具 AST 检查及纯 C++ JSON grammar 和显存预算测试，结果见 docs/implementation-status.md。加载器预期的 1184 个非 MTP 权重名称此前已与官方索引核对。CUDA 内核测试和服务器集成脚本已提供，尚未执行。源码和参考许可见 NOTICE。
+
+构建兼容说明：不再调用 CMake 3.24 才提供的 `--fresh`，最低配置版本为 3.18（CUDA sm_80 支持）。构建前仅重置 build/CMakeCache.txt 和 build/CMakeFiles；不会删除测试日志或模型。旧 CMake 对新 CUDA Toolkit 的具体兼容性仍以服务器配置结果为准。

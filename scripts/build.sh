@@ -14,7 +14,11 @@ if [[ -n "$nccl_root" ]]; then
   extra+=("-DNCCL_INCLUDE_DIR=$nccl_root/include")
   if [[ -f "$nccl_root/lib/libnccl.so.2" ]]; then extra+=("-DNCCL_LIBRARY=$nccl_root/lib/libnccl.so.2"); fi
 fi
-cmake --fresh -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$prefix" \
+# Reset only generated CMake configuration; retain compiled objects and all test results.
+python tools/reset_cmake_cache.py --build build
+command -v cmake
+cmake --version
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$prefix" \
   -DCMAKE_CUDA_COMPILER="$CUDACXX" -DCUDAToolkit_ROOT="$CUDA_HOME" -DCUDA_TOOLKIT_ROOT_DIR="$CUDA_HOME" \
   -DCMAKE_CUDA_ARCHITECTURES=80 "${extra[@]}"
 cmake --build build --parallel "${BUILD_JOBS:-2}"
