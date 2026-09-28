@@ -1,0 +1,8 @@
+numpy>=1.26,<3
+safetensors>=0.5,<1
+transformers==5.8.0
+peft==0.19.1
+accelerate==1.13.0
+Pillow>=10,<13
+# Install a CUDA-enabled PyTorch separately. CMake links that exact installation.
+# torchvision is also required for preprocessing; install the version matched to your torch build.

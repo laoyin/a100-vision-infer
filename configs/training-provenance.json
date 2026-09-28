@@ -1,0 +1,19 @@
+{
+  "source": "user-provided args.json and adapter configuration summary; original files not inspected",
+  "base_model": "Qwen/Qwen3.8-27B",
+  "base_revision": null,
+  "training_hardware": {"gpu": "NVIDIA A100-SXM4-80GB", "count": 4, "memory_per_gpu_mib": 81920, "driver": "580.126.09"},
+  "training_software": {"python": "3.12", "ms_swift": "4.2.0", "transformers": "5.8.0", "peft": "0.19.1", "accelerate": "1.13.0", "deepspeed": "0.18.9", "torch": null, "cuda_toolkit": null},
+  "training": {
+    "model_type": "qwen3_5", "template": "qwen3_5", "dtype": "bfloat16",
+    "lora_rank": 128, "lora_alpha": 128, "lora_dropout": 0.05,
+    "target_modules": "all-linear", "freeze_vit": false, "freeze_aligner": false, "freeze_llm": false,
+    "learning_rate": 0.00003, "num_train_epochs": 10,
+    "per_device_train_batch_size": 1, "per_device_eval_batch_size": 1,
+    "gradient_accumulation_steps": 8, "gradient_checkpointing": true,
+    "max_length": 20480, "max_pixels": 4000000, "packing": false,
+    "lr_scheduler_type": "cosine", "warmup_ratio": 0.05,
+    "save_steps": 100, "eval_steps": 100, "seed": 42
+  },
+  "inference_target": {"gpu": "A100 80GB", "count": 2, "tensor_parallel_size": 2, "weight_precision": "FP8", "planned_compute_precision": "BF16", "fp8_format": null, "interconnect": null}
+}
