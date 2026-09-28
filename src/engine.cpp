@@ -106,7 +106,7 @@ Tensor Engine::linear(Tensor x,const std::string& name,bool reduce) {
   auto it=weights_.find(name+".weight"); TORCH_CHECK(it!=weights_.end(),"Missing linear ",name);
   auto& w=it->second; Tensor y;
   TORCH_CHECK(w.data.dim()>=2,"Invalid matrix ",name);
-  if(w.scale.defined() && options_.optimized) {
+  if(w.scale.defined() && options_.optimized && !(options_.cublas_prefill && x.numel()/x.size(-1)>8)) {
     y=fp8_linear(x.reshape({-1,x.size(-1)}).contiguous(),w.data,w.scale);
     auto shape=x.sizes().vec();shape.back()=w.data.size(0);y=y.reshape(shape);
   } else if(w.scale.defined()) {
@@ -175,7 +175,8 @@ Tensor Engine::full_attention(Tensor x,Tensor positions,int layer,const std::str
   TORCH_CHECK(decode_mode_ || state.length+T<=session_capacity(),"KV capacity exceeded");
   if(!state.key.defined()) { state.key=at::empty({session_capacity(),HK,D},x.options()); state.value=at::empty_like(state.key); }
   if(decode_mode_) {
-    auto out=gqa_decode(q,k,v,state.key,state.value,decode_offset_).reshape({T,H*D})*gate.sigmoid();
+    auto out=gqa_decode(q,k,v,state.key,state.value,decode_offset_).reshape({T,H*D});
+    out=(options_.optimized&&options_.extra_fusions)?fused_sigmoid_gate(out,gate):out*gate.sigmoid();
     return finish?linear(out,p+".o_proj",true):out;
   }
   int old=state.length; state.key.narrow(0,old,T).copy_(k); state.value.narrow(0,old,T).copy_(v); state.length+=T;
@@ -186,7 +187,7 @@ Tensor Engine::full_attention(Tensor x,Tensor positions,int layer,const std::str
   auto ints=x.options().dtype(at::kLong);
   auto mask=at::arange(state.length,ints).unsqueeze(0)<=at::arange(old,state.length,ints).unsqueeze(1);
   auto out=at::scaled_dot_product_attention(qp,keys,values,mask,0.0,false).squeeze(0).transpose(0,1).reshape({T,H*D});
-  out=out*gate.sigmoid();return finish?linear(out,p+".o_proj",true):out;
+  out=(options_.optimized&&options_.extra_fusions)?fused_sigmoid_gate(out,gate):out*gate.sigmoid();return finish?linear(out,p+".o_proj",true):out;
 }
 Tensor Engine::delta_attention(Tensor x,int layer,const std::string& p,Tensor projected,bool finish) {
   int K=text_.at("linear_key_head_dim"), V=text_.at("linear_value_head_dim");
@@ -215,12 +216,14 @@ Tensor Engine::delta_attention(Tensor x,int layer,const std::string& p,Tensor pr
   q=(q.to(at::kFloat)*at::rsqrt(q.to(at::kFloat).square().sum(-1,true)+1e-6)).to(at::kBFloat16).repeat_interleave(H/HK,1).contiguous();
   k=(k.to(at::kFloat)*at::rsqrt(k.to(at::kFloat).square().sum(-1,true)+1e-6)).to(at::kBFloat16).repeat_interleave(H/HK,1).contiguous();
   }
-  auto a=(options_.optimized?projected.narrow(-1,C+H*V+H,H):linear(x,p+".in_proj_a")).to(at::kFloat);
-  auto g=-tensor(p+".A_log").to(at::kFloat).exp()*at::softplus(a+tensor(p+".dt_bias").to(at::kFloat));
-  auto beta=(options_.optimized?projected.narrow(-1,C+H*V,H):linear(x,p+".in_proj_b")).sigmoid().to(at::kFloat);
+  auto a=(options_.optimized?projected.narrow(-1,C+H*V+H,H):linear(x,p+".in_proj_a"));
+  auto b=(options_.optimized?projected.narrow(-1,C+H*V,H):linear(x,p+".in_proj_b"));
+  Tensor g,beta;
+  if(options_.optimized&&options_.extra_fusions){auto gates=fused_gdn_gates(a,b,tensor(p+".A_log"),tensor(p+".dt_bias"));g=gates.first;beta=gates.second;}
+  else {g=-tensor(p+".A_log").to(at::kFloat).exp()*at::softplus(a.to(at::kFloat)+tensor(p+".dt_bias").to(at::kFloat));beta=b.sigmoid().to(at::kFloat);}
   auto result=(options_.optimized&&(K==128||K==16))?delta_scan_fast(q,k,v.contiguous(),g.contiguous(),beta.contiguous(),s.recurrent):delta_scan(q,k,v.contiguous(),g.contiguous(),beta.contiguous(),s.recurrent);
   auto z=(options_.optimized?projected.narrow(-1,C,H*V):linear(x,p+".in_proj_z")).reshape({T,H,V});
-  result=(norm(result,p+".norm",false).to(at::kFloat)*at::silu(z.to(at::kFloat))).to(at::kBFloat16);
+  result=(options_.optimized&&options_.extra_fusions)?fused_rms_gate(result,tensor(p+".norm.weight"),z,eps_):(norm(result,p+".norm",false).to(at::kFloat)*at::silu(z.to(at::kFloat))).to(at::kBFloat16);
   result=result.reshape({T,H*V});return finish?linear(result,p+".out_proj",true):result;
 }
 Tensor Engine::step(Tensor x,Tensor positions) {

@@ -30,6 +30,8 @@ int main(int argc,char** argv) {
       std::string key=argv[i];
       if(key=="--baseline"){options.optimized=false;continue;}
       if(key=="--cuda-graph"){options.cuda_graph=true;continue;}
+      if(key=="--extra-fusions"){options.extra_fusions=true;continue;}
+      if(key=="--cublas-prefill"){options.cublas_prefill=true;continue;}
       if(key=="--trace") { trace=true; continue; }
       TORCH_CHECK(i+1<argc,"Missing argument for ",key); std::string value=argv[++i];
       if(key=="--model") model=value; else if(key=="--request") request=value;

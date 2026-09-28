@@ -67,6 +67,8 @@ int main(int argc,char** argv){
  try {
   std::string model;int capacity=20480,concurrency=2,chunk=128,queue_limit=64;avi::EngineOptions options;uint64_t workspace_bytes=8ULL<<30;
   for(int i=1;i<argc;i++){std::string key=argv[i];if(key=="--baseline"){options.optimized=false;continue;}if(key=="--cuda-graph"){options.cuda_graph=true;continue;}
+      if(key=="--extra-fusions"){options.extra_fusions=true;continue;}
+      if(key=="--cublas-prefill"){options.cublas_prefill=true;continue;}
    TORCH_CHECK(i+1<argc,"Missing value for ",key);std::string value=argv[++i];
    if(key=="--model")model=value;else if(key=="--max-context")capacity=std::stoi(value);else if(key=="--max-concurrency")concurrency=std::stoi(value);else if(key=="--prefill-chunk")chunk=std::stoi(value);
    else if(key=="--prefix-cache-bytes")options.prefix_cache_bytes=std::stoull(value);else if(key=="--workspace-mib")workspace_bytes=std::stoull(value)<<20;else if(key=="--host-prefix-cache-mib")options.host_prefix_cache_bytes=std::stoull(value)<<20;

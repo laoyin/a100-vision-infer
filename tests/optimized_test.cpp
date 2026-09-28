@@ -34,6 +34,20 @@ void run_optimized_tests(){
  auto x=at::randn({3,512},opt).to(at::kBFloat16),w=at::randn({512},opt).to(at::kBFloat16);
  auto f=x.to(at::kFloat);auto expected=(f*at::rsqrt((f*f).mean(-1,true)+1e-6)*(1+w.to(at::kFloat))).to(at::kBFloat16);
  TORCH_CHECK(at::allclose(avi::fused_rms(x,w,1e-6,true).to(at::kFloat),expected.to(at::kFloat),0.02,0.02),"Fused RMS mismatch");
+ for(int D:{16,128,257})for(int T:{1,17}){
+  auto input=at::randn({T,2,D},opt).to(at::kBFloat16),gate=(at::randn({T,2,D},opt)*8).to(at::kBFloat16);
+  auto weight=at::randn({D},opt).to(at::kBFloat16);
+  auto ref=(avi::fused_rms(input,weight,1e-6,false).to(at::kFloat)*at::silu(gate.to(at::kFloat))).to(at::kBFloat16);
+  TORCH_CHECK(at::allclose(avi::fused_rms_gate(input,weight,gate,1e-6).to(at::kFloat),ref.to(at::kFloat),.01,.01),"Fused RMS gate mismatch");
+  TORCH_CHECK(at::allclose(avi::fused_sigmoid_gate(input,gate).to(at::kFloat),(input*gate.sigmoid()).to(at::kFloat),.01,.001),"Fused sigmoid gate mismatch");
+ }
+ {
+  auto a=(at::randn({17,24},opt)*30).to(at::kBFloat16),b=at::randn_like(a);
+  auto decay=at::randn({24},opt),bias=at::randn({24},opt);
+  auto gates=avi::fused_gdn_gates(a,b,decay,bias);
+  TORCH_CHECK(at::allclose(gates.first,-decay.exp()*at::softplus(a.to(at::kFloat)+bias),1e-5,1e-6),"GDN decay gate mismatch");
+  TORCH_CHECK(at::allclose(gates.second,b.sigmoid().to(at::kFloat),.005,1e-5),"GDN beta gate mismatch");
+ }
  auto gu=at::randn({4,128},opt).to(at::kBFloat16);auto sg=at::silu(gu.narrow(1,0,64))*gu.narrow(1,64,64);
  TORCH_CHECK(at::allclose(avi::fused_swiglu(gu).to(at::kFloat),sg.to(at::kFloat),0.02,0.02),"SwiGLU mismatch");
  for(int K:{16,128}){

@@ -12,7 +12,7 @@ using json = nlohmann::json;
 Tensor fp8_decode(Tensor codes, Tensor scales);
 Tensor delta_scan(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, Tensor state);
 struct Weight { Tensor data, scale; };
-struct EngineOptions { bool optimized=true; bool cuda_graph=false; size_t image_cache_bytes=256ULL<<20; size_t prefix_cache_bytes=512ULL<<20; size_t host_prefix_cache_bytes=0; };
+struct EngineOptions { bool optimized=true; bool extra_fusions=false; bool cublas_prefill=false; bool cuda_graph=false; size_t image_cache_bytes=256ULL<<20; size_t prefix_cache_bytes=512ULL<<20; size_t host_prefix_cache_bytes=0; };
 struct DecodeGraph;
 class Engine {
  public:

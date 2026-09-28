@@ -17,6 +17,8 @@ def main():
  p.add_argument('--worker',default='build/avi-worker');p.add_argument('--tp',type=int,default=2);p.add_argument('--concurrency',type=int,default=1)
  p.add_argument('--requests',type=int,default=5);p.add_argument('--warmup',type=int,default=1);p.add_argument('--timeout',type=float,default=600)
  p.add_argument('--mode',choices=['baseline','optimized','graph'],default='optimized');p.add_argument('--prefill-chunk',type=int,default=128);p.add_argument('--cache',action='store_true')
+ p.add_argument('--inherit-process-group',action='store_true',help=argparse.SUPPRESS)
+ p.add_argument('--extra-fusions',action='store_true');p.add_argument('--cublas-prefill',action='store_true')
  a=p.parse_args()
  if a.requests<1 or a.warmup<0 or not 1<=a.concurrency<=8 or a.timeout<=0:p.error('Invalid benchmark limits')
  if Path(a.out).exists():p.error('Output exists')
@@ -25,7 +27,9 @@ def main():
       '--max-concurrency',str(a.concurrency),'--prefill-chunk',str(a.prefill_chunk),'--image-cache-mib',str(256 if a.cache else 0),'--prefix-cache-mib',str(512 if a.cache else 0)]
  if a.mode=='baseline':cmd+=['--baseline']
  if a.mode=='graph':cmd+=['--cuda-graph']
- process=subprocess.Popen(cmd,stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True,bufsize=1,start_new_session=True);events=queue.Queue()
+ if a.extra_fusions:cmd+=['--extra-fusions']
+ if a.cublas_prefill:cmd+=['--cublas-prefill']
+ process=subprocess.Popen(cmd,stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True,bufsize=1,start_new_session=not a.inherit_process_group);events=queue.Queue()
  def reader():
   for line in process.stdout:
    try:events.put(json.loads(line))
@@ -52,7 +56,7 @@ def main():
   while receive(deadline).get('event')!='ready':pass
   if a.warmup:run(a.warmup,'warmup-')
   results,seconds=run(a.requests,'measure-')
-  report={'mode':a.mode,'cache_enabled':a.cache,'concurrency':a.concurrency,'prefill_chunk':a.prefill_chunk,'warmup':a.warmup,'input_tokens':req['input_ids']['shape'][0],
+  report={'extra_fusions':a.extra_fusions,'cublas_prefill':a.cublas_prefill,'mode':a.mode,'cache_enabled':a.cache,'concurrency':a.concurrency,'prefill_chunk':a.prefill_chunk,'warmup':a.warmup,'input_tokens':req['input_ids']['shape'][0],
           'max_new_tokens':req['max_new_tokens'],**summarize(results,seconds),'results':results,'note':'Resident engine; prepared inputs; no trace. Includes per-request Graph capture when enabled. Multirequest batches use eager decode.'}
   with open(a.out,'x',encoding='utf-8') as f:json.dump(report,f,indent=2)
   print(json.dumps({k:v for k,v in report.items() if k!='results'},indent=2))
@@ -60,7 +64,7 @@ def main():
   if process.returncode or report['successful']!=a.requests:raise RuntimeError('Worker or requests failed')
  finally:
   if process.poll() is None:
-   os.killpg(process.pid,signal.SIGTERM)
+   process.terminate() if a.inherit_process_group else os.killpg(process.pid,signal.SIGTERM)
    try:process.wait(timeout=10)
-   except subprocess.TimeoutExpired:os.killpg(process.pid,signal.SIGKILL);process.wait()
+   except subprocess.TimeoutExpired:process.kill() if a.inherit_process_group else os.killpg(process.pid,signal.SIGKILL);process.wait()
 if __name__=='__main__':main()

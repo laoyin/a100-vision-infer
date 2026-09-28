@@ -1,9 +1,13 @@
 #pragma once
 #include <ATen/ATen.h>
+#include <utility>
 namespace avi {
 at::Tensor fp8_linear(at::Tensor x,at::Tensor codes,at::Tensor scales);
 at::Tensor fused_rms(at::Tensor x,at::Tensor weight,double eps,bool one_center);
 at::Tensor fused_swiglu(at::Tensor gate_up);
+std::pair<at::Tensor,at::Tensor> fused_gdn_gates(at::Tensor a,at::Tensor b,at::Tensor log_decay,at::Tensor bias);
+at::Tensor fused_rms_gate(at::Tensor x,at::Tensor weight,at::Tensor gate,double eps);
+at::Tensor fused_sigmoid_gate(at::Tensor x,at::Tensor gate);
 at::Tensor fused_l2(at::Tensor x);
 at::Tensor fused_rope(at::Tensor x,at::Tensor positions,int rotary,double theta,int height_section,int width_section);
 at::Tensor conv_decode(at::Tensor x,at::Tensor weight,at::Tensor history);

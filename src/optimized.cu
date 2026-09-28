@@ -57,6 +57,10 @@ Tensor conv_decode(Tensor x,Tensor w,Tensor history){x=x.contiguous();TORCH_CHEC
 __global__ void append_kv(const bf* k,const bf* v,bf* keys,bf* vals,const int64_t* offset,int HK,int D){int i=blockIdx.x*256+threadIdx.x;if(i<HK*D){keys[offset[0]*HK*D+i]=k[i];vals[offset[0]*HK*D+i]=v[i];}}
 __global__ void attention_parts(const bf* q,const bf* keys,const bf* vals,const int64_t* offset,float* partial,float* stats,int H,int HK,int D,int P){
  int h=blockIdx.x,p=blockIdx.y,lane=threadIdx.x%32,warp=threadIdx.x/32,base=p*256,L=int(offset[0])+1,hk=h/(H/HK);__shared__ float scores[256];
+ // Graph launch dimensions use capacity; inactive parts need no dot products or reductions.
+ if(base>=L){if(!threadIdx.x){stats[(h*P+p)*2]=-INFINITY;stats[(h*P+p)*2+1]=0;}
+  for(int d=threadIdx.x;d<D;d+=256)partial[(h*P+p)*D+d]=0;return;}
+
  for(int i=warp;i<256;i+=8){float dot=0;if(base+i<L){for(int d=lane;d<D;d+=32)dot+=__bfloat162float(q[h*D+d])*__bfloat162float(keys[((base+i)*HK+hk)*D+d]);dot=warp_sum(dot)*rsqrtf(float(D));}else dot=-INFINITY;if(!lane)scores[i]=dot;}
  __syncthreads();float mx=block_max(scores[threadIdx.x]);float prob=isfinite(mx)?expf(scores[threadIdx.x]-mx):0;float sm=block_sum(prob);scores[threadIdx.x]=prob;__syncthreads();
  if(!threadIdx.x){stats[(h*P+p)*2]=mx;stats[(h*P+p)*2+1]=sm;}
@@ -80,4 +84,45 @@ template<int K> __global__ void register_scan(const bf* q,const bf* k,const bf* 
  for(int i=0;i<K;i++)state[(h*K+i)*V+j]=s[i];
 }
 Tensor delta_scan_fast(Tensor q,Tensor k,Tensor v,Tensor g,Tensor beta,Tensor state){TORCH_CHECK(q.is_contiguous()&&k.is_contiguous()&&v.is_contiguous()&&g.is_contiguous()&&beta.is_contiguous()&&state.is_contiguous()&&q.is_cuda()&&q.scalar_type()==at::kBFloat16&&state.scalar_type()==at::kFloat,"Invalid register GDN inputs");auto y=at::empty_like(v);int K=q.size(2),T=q.size(0),H=q.size(1),V=v.size(2);auto stream=at::cuda::getCurrentCUDAStream();if(K==128)register_scan<128><<<dim3(H,(V+31)/32),32,0,stream>>>(ptr(q),ptr(k),ptr(v),g.data_ptr<float>(),beta.data_ptr<float>(),state.data_ptr<float>(),outptr(y),T,H,V);else if(K==16)register_scan<16><<<dim3(H,(V+31)/32),32,0,stream>>>(ptr(q),ptr(k),ptr(v),g.data_ptr<float>(),beta.data_ptr<float>(),state.data_ptr<float>(),outptr(y),T,H,V);else { TORCH_CHECK(false,"Register GDN supports K=16 or 128"); }C10_CUDA_KERNEL_LAUNCH_CHECK();return y;}
+// Match both BF16 rounding boundaries of non-centered RMS before FP32 SiLU gating.
+__global__ void rms_gate(const bf* x,const bf* w,const bf* z,bf* y,int D,float eps){
+ int row=blockIdx.x;float sum=0;
+ for(int j=threadIdx.x;j<D;j+=256){float v=__bfloat162float(x[row*D+j]);sum+=v*v;}
+ float inv=rsqrtf(block_sum(sum)/D+eps);
+ for(int j=threadIdx.x;j<D;j+=256){int i=row*D+j;
+  float n=__bfloat162float(__float2bfloat16_rn(__bfloat162float(x[i])*inv));
+  n=__bfloat162float(__float2bfloat16_rn(n*__bfloat162float(w[j])));
+  float gate=__bfloat162float(z[i]);y[i]=__float2bfloat16_rn(n*(gate/(1.f+expf(-gate))));
+ }
+}
+Tensor fused_rms_gate(Tensor x,Tensor w,Tensor z,double eps){
+ x=x.contiguous();w=w.contiguous();z=z.contiguous();
+ TORCH_CHECK(x.is_cuda()&&w.device()==x.device()&&z.device()==x.device()&&x.scalar_type()==at::kBFloat16&&w.scalar_type()==at::kBFloat16&&z.scalar_type()==at::kBFloat16&&x.sizes()==z.sizes()&&w.numel()==x.size(-1),"Invalid RMS gate input");
+ auto y=at::empty_like(x);rms_gate<<<x.numel()/x.size(-1),256,0,at::cuda::getCurrentCUDAStream()>>>(ptr(x),ptr(w),ptr(z),outptr(y),x.size(-1),eps);C10_CUDA_KERNEL_LAUNCH_CHECK();return y;
+}
+__global__ void sigmoid_gate(const bf* x,const bf* z,bf* y,int64_t n){
+ for(int64_t i=int64_t(blockIdx.x)*256+threadIdx.x;i<n;i+=int64_t(gridDim.x)*256){
+  float gate=__bfloat162float(__float2bfloat16_rn(1.f/(1.f+expf(-__bfloat162float(z[i])))));
+  y[i]=__float2bfloat16_rn(__bfloat162float(x[i])*gate);
+ }
+}
+Tensor fused_sigmoid_gate(Tensor x,Tensor z){
+ x=x.contiguous();z=z.contiguous();TORCH_CHECK(x.is_cuda()&&z.device()==x.device()&&x.scalar_type()==at::kBFloat16&&z.scalar_type()==at::kBFloat16&&x.sizes()==z.sizes(),"Invalid sigmoid gate input");
+ auto y=at::empty_like(x);sigmoid_gate<<<std::min<int64_t>(65535,(x.numel()+255)/256),256,0,at::cuda::getCurrentCUDAStream()>>>(ptr(x),ptr(z),outptr(y),x.numel());C10_CUDA_KERNEL_LAUNCH_CHECK();return y;
+}
+
+__global__ void gdn_gates(const bf* a,const bf* b,const float* log_decay,const float* bias,float* g,float* beta,int64_t n,int H){
+ for(int64_t i=int64_t(blockIdx.x)*256+threadIdx.x;i<n;i+=int64_t(gridDim.x)*256){
+  float v=__bfloat162float(a[i])+bias[i%H];float sp=v>20.f?v:log1pf(expf(v));
+  g[i]=-expf(log_decay[i%H])*sp;
+  beta[i]=__bfloat162float(__float2bfloat16_rn(1.f/(1.f+expf(-__bfloat162float(b[i])))));
+ }
+}
+std::pair<Tensor,Tensor> fused_gdn_gates(Tensor a,Tensor b,Tensor log_decay,Tensor bias){
+ a=a.contiguous();b=b.contiguous();log_decay=log_decay.to(at::kFloat).contiguous();bias=bias.to(at::kFloat).contiguous();
+ TORCH_CHECK(a.is_cuda()&&b.device()==a.device()&&log_decay.device()==a.device()&&bias.device()==a.device()&&a.scalar_type()==at::kBFloat16&&b.scalar_type()==at::kBFloat16&&a.dim()==2&&a.sizes()==b.sizes()&&log_decay.numel()==a.size(1)&&bias.numel()==a.size(1),"Invalid GDN gates");
+ auto g=at::empty(a.sizes(),a.options().dtype(at::kFloat)),beta=at::empty_like(g);
+ gdn_gates<<<std::min<int64_t>(65535,(a.numel()+255)/256),256,0,at::cuda::getCurrentCUDAStream()>>>(ptr(a),ptr(b),log_decay.data_ptr<float>(),bias.data_ptr<float>(),g.data_ptr<float>(),beta.data_ptr<float>(),a.numel(),a.size(1));C10_CUDA_KERNEL_LAUNCH_CHECK();return {g,beta};
+}
+
 }
