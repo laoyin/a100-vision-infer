@@ -14,7 +14,7 @@ bash scripts/build.sh
 bash scripts/smoke-block-fp8.sh "$run/block-smoke"
 python tools/prepare_request.py --model "$HF_MODEL" --image "$TEST_IMAGE" \
   --prompt "Identify the equipment, counts and visible labels. Return JSON." \
-  --max-pixels "${MAX_PIXELS:-4000000}" --max-context 20480 --max-new-tokens 128 --out "$run/request"
+  --max-pixels "${MAX_PIXELS:-4000000}" --max-context 20480 --max-new-tokens "${MAX_NEW_TOKENS:-128}" --out "$run/request"
 python tools/import_fp8.py --model "$HF_MODEL" --out "$run/fp8-tp2" --tp 2
 python tools/preflight.py --model "$run/fp8-tp2" --tp 2
 for mode in baseline optimized graph; do

@@ -205,3 +205,17 @@ python tools/import_fp8.py --model /models/your-fp8-model --out /models/avi-impo
 ```
 
 A100 路径保留 FP8 权重、使用 BF16 激活计算；不模拟配置中的动态激活 FP8 量化，结果可能与原 W8A8 运行时不同。新的测试只检查原生执行路径一致性，不能替代业务准确率比较。未新增任何安装依赖步骤。未实现该格式的独立原始运行时逐层对照。
+
+## 复用已导入 FP8 权重进行性能对比
+
+混合 GDN 投影按连续且相同精度分组融合：常见 FP8 qkv/z + BF16 b/a 从四次投影变为两次，保持输出顺序，不能据此直接断言提速。新增 CUDA 回归检查分组投影的数值和拼接顺序。常驻贪心采样将最大值和 token ID 一次传回 CPU。
+
+```bash
+AVI_MODEL=model-test-20260928-151515/fp8-tp2 \
+AVI_REQUEST=model-test-20260928-151515/request \
+AVI_GPUS=2,3 bash scripts/benchmark-existing.sh
+```
+
+这个脚本不导入权重、不安装依赖，重新编译和执行算子测试后，比较 baseline/optimized/graph 并发1及 optimized 并发2。每个 worker 先热身，模型驻留测量；默认关闭图像和 prompt 缓存，无 trace。BENCH_REQUESTS 默认5，PREFILL_CHUNK 默认128，可显式改变。请求内容和输出上限沿用原 request，不改业务参数；Graph 当前按请求捕获，报告包含捕获成本。并发2结果是总吞吐，不能视作单请求提速倍数。summary.json 会同时报告是否与基线 token 完全相同，数值差异仍需要业务核对。
+
+若需要更长完整输出，test-model.sh 支持 MAX_NEW_TOKENS，但性能初次对照请沿用原请求，避免把 token 数变化当作速度变化。

@@ -70,7 +70,21 @@ void Engine::fuse_weights(const std::string& dest,const std::vector<std::string>
   std::vector<Tensor> data,scales;
   for(auto& name:source) {auto& w=weights_.at(name+".weight");data.push_back(w.data);if(w.scale.defined())scales.push_back(w.scale);}
   if(!scales.empty()&&(scales.size()!=data.size() || std::any_of(scales.begin(),scales.end(),[&](const Tensor& t){return t.dim()!=scales[0].dim() || (t.dim()==2&&t.size(1)!=scales[0].size(1));}))) {
-    mixed_projections_[dest]=source;return;
+    // Preserve projection order and FP8 codes. Fuse each contiguous compatible run.
+    // Qwen GDN commonly becomes [FP8 qkv+z] and [BF16 b+a]: two GEMMs, not four.
+    std::vector<std::vector<std::string>> groups;
+    auto compatible=[&](const std::string& a,const std::string& b){
+      const auto& x=weights_.at(a+".weight");const auto& y=weights_.at(b+".weight");
+      if(x.data.scalar_type()!=y.data.scalar_type()||x.scale.defined()!=y.scale.defined())return false;
+      return !x.scale.defined()||(x.scale.dim()==y.scale.dim()&&(x.scale.dim()==1||x.scale.size(1)==y.scale.size(1)));
+    };
+    for(const auto& name:source){if(groups.empty()||!compatible(groups.back().back(),name))groups.emplace_back();groups.back().push_back(name);}
+    std::vector<std::string> children;
+    for(size_t i=0;i<groups.size();i++){
+      if(groups[i].size()==1){children.push_back(groups[i][0]);continue;}
+      auto child=dest+".group"+std::to_string(i);fuse_weights(child,groups[i]);children.push_back(child);
+    }
+    mixed_projections_[dest]=std::move(children);return;
   }
   Weight combined;combined.data=at::cat(data,0);if(!scales.empty())combined.scale=at::cat(scales,0);
   weights_.emplace(dest+".weight",combined);for(auto& name:source)weights_.erase(name+".weight");

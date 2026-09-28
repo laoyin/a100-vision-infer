@@ -43,7 +43,10 @@ static int64_t sample(Job& job){
  }
 
  if(!constrained && job.options.value("temperature",0.0)==0.0 && job.options.value("repetition_penalty",1.0)==1.0) {
-  auto best=at::max(job.logits.reshape({-1}),0);TORCH_CHECK(std::isfinite(std::get<0>(best).item<float>()),"Nonfinite logits");return std::get<1>(best).item<int64_t>();
+  auto best=at::max(job.logits.reshape({-1}),0);
+  // Vocabulary IDs fit exactly in FP64. Transfer both scalars in one host synchronization.
+  auto pair=at::stack({std::get<0>(best).to(at::kDouble),std::get<1>(best).to(at::kDouble)}).to(at::kCPU);
+  auto values=pair.data_ptr<double>();TORCH_CHECK(std::isfinite(values[0]),"Nonfinite logits");return int64_t(values[1]);
  }
  auto cpu=job.logits.reshape({-1}).to(at::kCPU).to(at::kFloat).contiguous();auto data=cpu.data_ptr<float>();size_t count=cpu.numel();
  std::vector<std::pair<float,int64_t>> candidates;candidates.reserve(count);

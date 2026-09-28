@@ -21,6 +21,16 @@ void run_optimized_tests(){
   auto expected=at::matmul(x,decoded.t()).to(at::kFloat);
   TORCH_CHECK(at::allclose(avi::fp8_linear(x,codes,scales).to(at::kFloat),expected,0.025,0.05),"Block FP8 GEMV/WMMA mismatch");
  }
+ // GDN mixed precision fusion: preserve qkv/z/b/a order across two GEMMs.
+ for(int M:{1,17}) {
+  auto input=at::randn({M,256},opt).to(at::kBFloat16);
+  auto qkv=at::randint(0,126,{384,256},opt.dtype(at::kByte)),z=at::randint(0,126,{128,256},opt.dtype(at::kByte));
+  auto qs=at::rand({384,2},opt)*.01,zs=at::rand({128,2},opt)*.01;
+  auto b=at::randn({4,256},opt).to(at::kBFloat16),a=at::randn_like(b);
+  auto separate=at::cat({avi::fp8_linear(input,qkv,qs),avi::fp8_linear(input,z,zs),at::matmul(input,b.t()),at::matmul(input,a.t())},1);
+  auto grouped=at::cat({avi::fp8_linear(input,at::cat({qkv,z},0),at::cat({qs,zs},0)),at::matmul(input,at::cat({b,a},0).t())},1);
+  TORCH_CHECK(at::allclose(separate.to(at::kFloat),grouped.to(at::kFloat),.025,.05),"Mixed projection fusion order/numerics mismatch");
+ }
  auto x=at::randn({3,512},opt).to(at::kBFloat16),w=at::randn({512},opt).to(at::kBFloat16);
  auto f=x.to(at::kFloat);auto expected=(f*at::rsqrt((f*f).mean(-1,true)+1e-6)*(1+w.to(at::kFloat))).to(at::kBFloat16);
  TORCH_CHECK(at::allclose(avi::fused_rms(x,w,1e-6,true).to(at::kFloat),expected.to(at::kFloat),0.02,0.02),"Fused RMS mismatch");
