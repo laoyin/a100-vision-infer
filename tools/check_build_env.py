@@ -11,7 +11,7 @@ def main():
     compiler=os.environ.get('CUDACXX','nvcc')
     toolkit=cuda_release(subprocess.check_output([compiler,'--version'],text=True))
     if torch.version.cuda!=toolkit:
-        raise SystemExit(f'CUDA mismatch: nvcc={toolkit}, torch={torch.version.cuda}. Use the isolated project environment; do not change the server driver.')
+        raise SystemExit(f'CUDA mismatch: nvcc={toolkit}, torch={torch.version.cuda}. Select an already-installed matching Python environment or CUDA compiler. No packages or drivers were changed.')
     if torch.cuda.device_count()<2:raise SystemExit('Two visible GPUs required for TP2 acceptance')
     for i in range(torch.cuda.device_count()):
         if torch.cuda.get_device_capability(i)!=(8,0):raise SystemExit('Expected SM80 GPUs')

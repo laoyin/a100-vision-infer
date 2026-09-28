@@ -15,25 +15,25 @@
 
 Python 只用于转换、tokenizer/图片预处理、输出解码和独立验证。图像 encoder、语言模型和逐 token 生成都在 C++ 进程。LibTorch 是本版的 C++ 算子依赖，不是 Transformers 模型执行器。
 
-## 当前服务器快捷测试（CUDA Toolkit 12.8）
+## 当前服务器快捷测试（使用已有 Python 环境）
 
-适用于日志中 A100、nvcc 12.8、现有 PyTorch cu130 的服务器。保留系统驱动和 Toolkit，仅创建项目 `.venv-cu128`，安装 PyTorch 2.11.0+cu128 / torchvision 0.26.0+cu128。官方版本配对来源：https://pytorch.org/get-started/previous-versions/ 。不会安装系统包或修改现有训练环境。
+所有脚本直接使用当前 PATH 中的 `python`，不安装或升级依赖，不创建或自动激活虚拟环境。请先激活服务器已有、准备用于测试的 Python 环境。
 
 ```bash
 git pull --ff-only
-bash scripts/setup-cu128.sh
+which python
 AVI_GPUS=2,3 bash scripts/test-server.sh
 ```
 
-第一步需要联网下载依赖和足够磁盘空间；Python 必须支持 venv。缺少 OpenMPI/OpenSSL 开发包、CMake 或编译器时需要管理员先提供。测试脚本默认 GPU 2、3，应确认它们仍空闲；root 下自动设置 OpenMPI 所需环境变量。输出目录为带时间戳的 acceptance-*，保留 acceptance.log、pip-freeze.txt、commit.txt 和小模型结果。编译使用 --fresh 清除旧 CMake 配置，保留 build 目录文件。
+默认使用 GPU 2、3，需确认它们仍空闲；root 下自动设置 OpenMPI 环境变量。输出在 acceptance-* 目录，包含 acceptance.log、pip-freeze.txt、commit.txt 和小模型结果。构建前检查 nvcc 与 torch.version.cuda；如果仍为 12.8 与 13.0，会停止并报告差异，不修改环境。旧的 setup-cu128.sh 入口现仅做只读检查，不再安装任何包。
 
-小模型全部通过后，使用完整合并 BF16 模型测试真实图片：
+小模型通过后测试完整合并 BF16 模型：
 
 ```bash
 HF_MODEL=/models/your-merged-bf16 TEST_IMAGE=/data/test.png AVI_GPUS=2,3 bash scripts/test-model.sh
 ```
 
-这个步骤生成两份原生权重（BF16/FP8），需要充足磁盘空间；结果位于 model-test-*。参考模型对照默认单 GPU，极端图像可能超出其显存；此时保留日志，不要把 OOM 当作引擎数值通过。脚本只验收数值，业务字段仍需人工核对。
+会生成 BF16/FP8 两份原生权重，需充足磁盘空间。结果在 model-test-*。参考模型对照默认单 GPU，实际识图业务字段仍需人工核对。
 
 ## 服务器运行步骤
 
@@ -43,7 +43,6 @@ Ubuntu 的常用系统依赖（NCCL 包通常需 NVIDIA 软件源）：
 
 ```bash
 sudo apt-get install build-essential cmake libopenmpi-dev openmpi-bin libnccl-dev libssl-dev
-python -m pip install -r requirements-tools.txt
 python -c 'import torch; print(torch.__version__, torch.version.cuda, torch.utils.cmake_prefix_path)'
 nvcc --version
 nvidia-smi topo -m
@@ -146,7 +145,6 @@ python tools/compare_reference.py --model /models/your-merged-bf16 \
 启动服务（转换权重时需保留 tokenizer.json，旧包需重新转换以启用 JSON 语法）：
 
 ```bash
-python -m pip install -r requirements-test.txt
 CUDA_VISIBLE_DEVICES=0,1 python tools/serve.py \
   --model /models/avi-fp8-tp2 --hf-model /models/your-merged-bf16 \
   --tp 2 --max-concurrency 2 --max-context 20480 --prefill-chunk 128

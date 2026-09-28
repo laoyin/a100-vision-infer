@@ -3,7 +3,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 : "${HF_MODEL:?Set HF_MODEL to the merged BF16 checkpoint with processor/tokenizer}"
 : "${TEST_IMAGE:?Set TEST_IMAGE to the image file}"
-source "${AVI_VENV:-$PWD/.venv-cu128}/bin/activate"
+command -v python >/dev/null || { echo "Activate your existing Python environment first." >&2; exit 1; }
 export CUDA_VISIBLE_DEVICES="${AVI_GPUS:-2,3}"
 if [[ $(id -u) == 0 ]]; then export OMPI_ALLOW_RUN_AS_ROOT=1 OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1; fi
 run="${1:-model-test-$(date +%Y%m%d-%H%M%S)}"
