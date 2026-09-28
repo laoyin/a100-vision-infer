@@ -14,8 +14,8 @@ int main() {
   for(int b=0;b<256;b++) {
     int e=(b>>3)&15,m=b&7; float expected=e==0?std::ldexp(float(m),-9):std::ldexp(1.f+m/8.f,e-7);
     if(b&128) expected=-expected;
-    if(e==15 && m==7) TORCH_CHECK(std::isnan(data[b]),"NaN decoding mismatch");
-    else TORCH_CHECK(data[b]==expected,"FP8 decoding mismatch at ",b);
+    if(e==15 && m==7) { TORCH_CHECK(std::isnan(data[b]),"NaN decoding mismatch"); }
+    else { TORCH_CHECK(data[b]==expected,"FP8 decoding mismatch at ",b); }
   }
   at::manual_seed(42); int T=7,H=2,K=8,V=8;
   auto q=at::randn({T,H,K},opt).to(at::kBFloat16),k=at::randn({T,H,K},opt).to(at::kBFloat16);

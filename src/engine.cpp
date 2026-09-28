@@ -26,7 +26,7 @@ static Tensor raw(const std::string& dir,const json& d,int device) {
   std::string dtype=d.at("dtype"); at::ScalarType type;
   if(dtype=="BF16") type=at::kBFloat16; else if(dtype=="F32") type=at::kFloat;
   else if(dtype=="I64") type=at::kLong; else if(dtype=="U8") type=at::kByte;
-  else TORCH_CHECK(false,"Unsupported dtype ",dtype);
+  else { TORCH_CHECK(false,"Unsupported dtype ",dtype); }
   auto out=at::empty(shape,at::TensorOptions().dtype(type).device(at::kCPU));
   auto file=std::filesystem::path(dir)/relative;
   TORCH_CHECK(std::filesystem::file_size(file)==out.nbytes(),"Tensor byte count mismatch: ",file.string());

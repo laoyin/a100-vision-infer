@@ -34,7 +34,7 @@ int main(int argc,char** argv) {
       TORCH_CHECK(i+1<argc,"Missing argument for ",key); std::string value=argv[++i];
       if(key=="--model") model=value; else if(key=="--request") request=value;
       else if(key=="--output") output=value; else if(key=="--prefill-chunk") chunk=std::stoi(value);
-      else TORCH_CHECK(false,"Unknown option ",key);
+      else { TORCH_CHECK(false,"Unknown option ",key); }
     }
     TORCH_CHECK(!model.empty() && !request.empty() && !output.empty(),"Usage: avi-infer --model ARTIFACT --request REQUEST_DIR --output result.json [--prefill-chunk 128] [--trace]");
     TORCH_CHECK(world==1 || world==2 || world==4,"Use 1, 2 or 4 ranks on a single node");
@@ -46,7 +46,7 @@ int main(int argc,char** argv) {
     C10_CUDA_CHECK(cudaSetDevice(local)); cudaDeviceProp prop; C10_CUDA_CHECK(cudaGetDeviceProperties(&prop,local));
     TORCH_CHECK(prop.major==8 && prop.minor==0,"This build targets A100 SM80; got ",prop.name);
     if(world>1) {
-      ncclUniqueId id; if(rank==0) TORCH_CHECK(ncclGetUniqueId(&id)==ncclSuccess,"NCCL unique ID failed");
+      ncclUniqueId id; if(rank==0) { TORCH_CHECK(ncclGetUniqueId(&id)==ncclSuccess,"NCCL unique ID failed"); }
       MPI_Bcast(&id,sizeof(id),MPI_BYTE,0,MPI_COMM_WORLD);
       TORCH_CHECK(ncclCommInitRank(&comm,world,id,rank)==ncclSuccess,"NCCL initialization failed");
     }
@@ -71,7 +71,7 @@ int main(int argc,char** argv) {
       TORCH_CHECK(vision.size(0)==image_indices.numel(),"Image features/tokens mismatch");
       embedding.index_copy_(0,image_indices,vision);
       if(trace && rank==0) dump(output+".vision.f32",vision);
-    } else TORCH_CHECK(image_indices.numel()==0,"Image tokens without images");
+    } else { TORCH_CHECK(image_indices.numel()==0,"Image tokens without images"); }
     start=Clock::now(); at::Tensor last;
     for(int64_t i=0;i<ids.numel();i+=chunk) {
       auto n=std::min<int64_t>(chunk,ids.numel()-i);
