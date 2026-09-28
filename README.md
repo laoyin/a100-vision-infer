@@ -1,234 +1,105 @@
-# A100 Vision Infer — v0.3 实验版
+# A100 Vision Infer
 
-参考 ninfer 的固定模型、离线转换、显式状态管理思路，面向 **2 × A100 80GB、TP=2、Qwen3.8-27B 微调模型**。
+面向 **NVIDIA A100 80GB** 和 Qwen3.5/Qwen3.8 27B 视觉语言模型的独立 FP8 推理引擎。项目参考 [ninfer](https://github.com/Neroued/ninfer) 的固定模型、离线权重布局、算子融合与显式状态管理思路，针对 A100 SM80 和单机 TP=1/2/4 独立实现。
 
-**已有原生模型执行代码；尚未在 A100 上编译或运行验证。已加入优化内核和常驻服务，但性能、正确性仍待服务器验收。先跑小模型检查，再测实际模型。**
+当前主要验证配置为 2 × A100-SXM4-80GB、TP=2、E4M3FN block-FP8（128 × 128）。权重保持 FP8，激活及 Tensor Core 计算使用 BF16，Gated DeltaNet recurrent state 使用 FP32。
 
-## 本版实现
+## 优化目标
 
-- C++ 模型执行和生成循环；LibTorch C++/ATen 提供 CUDA 张量、BF16 矩阵乘法与 SDPA。没有调用 Python 模型 forward/generate，没有封装 vLLM/SGLang。
-- 原生视觉 patch projection、位置插值、视觉 Transformer 和 merger。
-- 原生 Gated Attention、mRoPE、KV cache；自写 CUDA Gated DeltaNet 递归扫描及卷积状态管理。
-- Attention/GDN 按 head 分片，MLP 列/行分片，NCCL 归约；TP=1/2/4，首要测试 TP=2。视觉塔、embedding 和输出头在各卡复制。
-- 自有格式 FP8 E4M3FN、每输出行 FP32 scale；融合 FP8 GEMV / WMMA BF16 GEMM；可用 --baseline 回退分块解码对照。视觉权重保留 BF16，递归状态 FP32。支持 BF16 转换以作对照。
-- 单图/多图、分块 prefill、常驻多请求调度、批量 decode、贪心/温度采样；离线 LoRA 合并、请求准备、文本解码工具。
+A100 没有新架构上的原生 FP8 Tensor Core 路径。本项目保留 FP8 压缩权重和 scale，按矩阵形状选择 BF16 Tensor Core、CUDA GEMV 或 cuBLAS，重点减少权重带宽、kernel launch、KV 复制和跨卡通信。
 
-Python 只用于转换、tokenizer/图片预处理、输出解码和独立验证。图像 encoder、语言模型和逐 token 生成都在 C++ 进程。LibTorch 是本版的 C++ 算子依赖，不是 Transformers 模型执行器。
+Prefill 优化视觉与长文本的大矩阵计算，目标是降低首 token 延迟；Decode 针对小 batch、单 token 计算，重点减少显存访问和 kernel launch。
 
-## 当前服务器快捷测试（使用已有 Python 环境）
+## 已实现的优化
 
-所有脚本直接使用当前 PATH 中的 `python`，不安装或升级依赖，不创建或自动激活虚拟环境。请先激活服务器已有、准备用于测试的 Python 环境。
+### FP8 权重与矩阵计算
+
+- 直接导入 E4M3FN block-FP8 checkpoint，保留原始 FP8 编码与二维 scale，不重新量化。
+- Attention、GDN 和 MLP 权重按 TP rank 预分片。
+- Decode 使用自定义 FP8 GEMV，直接读取压缩权重并在寄存器累加。
+- Prefill 提供自定义 BF16 WMMA，以及分块反量化后调用 cuBLAS 的可选路径。
+- 反量化按输出行分块，不生成完整 BF16 模型副本。
+- 视觉层及 GDN `a/b` 投影保留原 checkpoint 精度。
+
+### 投影与激活融合
+
+- 融合 Attention Q/K/V/gate 投影。
+- 融合 MLP gate/up 投影和 SwiGLU。
+- GDN 的 FP8 qkv/z 与 BF16 b/a 按精度分组，从四次投影减少为两次。
+- 融合 RMSNorm、L2 normalization、mRoPE、GDN decay/beta。
+- 融合 GDN RMSNorm + SiLU gate 和 Attention sigmoid gate。
+- Decode 卷积状态更新与 SiLU 在同一 CUDA kernel 完成。
+
+融合路径保留模型需要的 BF16 舍入边界，并通过 CUDA 数值测试与未融合路径比较。
+
+### Attention、GDN 与状态
+
+- GQA decode 直接使用共享 KV heads，不复制到全部 query heads。
+- Split-K attention 分段计算 KV，再合并 softmax 统计量。
+- CUDA Graph 使用固定容量 launch，空 KV 分段跳过计算。
+- GDN Q/K normalization 使用融合 kernel；key dimension 16/128 使用专用展开 kernel。
+- Decode state 按 value column 分块，在时间循环中保存在寄存器。
+- recurrent state 使用 FP32，卷积历史原地更新。
+- 每个请求独立保存 KV、卷积与 recurrent state；KV 容量按实际 token 预算分配。
+
+### Tensor Parallel 与 Decode
+
+- Attention/GDN 按 head 分片，MLP 使用 column/row parallel。
+- 只在 row-parallel 输出处执行 NCCL AllReduce。
+- TP ranks 共享采样结果，避免多卡状态分叉。
+- 单 token decode 使用 FP8 GEMV、融合 gate、GQA 和 GDN 专用 kernel。
+- 单请求支持 CUDA Graph replay；多请求可合并投影和 MLP 计算。
+- 贪心采样一次传回最大值与 token ID，减少 CPU/GPU 同步。
+
+## 当前 A100 实测
+
+输入 3913 tokens、1 张图片、生成 128 tokens，2 × A100 80GB、TP=2，缓存关闭：
+
+| 路径 | TTFT P50 | 请求延迟 P50 | 首 token 后解码速度 |
+| --- | ---: | ---: | ---: |
+| baseline | 8.74 s | 29.21 s | 6.21 token/s |
+| optimized | 22.13 s | 29.37 s | 17.53 token/s |
+| CUDA Graph | 22.12 s | 29.18 s | 17.99 token/s |
+
+Decode 相比 baseline 提升约 **2.8–2.9 倍**。当前自定义 WMMA prefill 使 TTFT 上升，抵消了解码收益，因此已加入 cuBLAS prefill 对照路径和完整优化矩阵。最终默认路径以 A100 实测为准。
+
+不同路径可能因 BF16/FP32 舍入顺序在后续 token 出现分歧。项目分别记录 CUDA 测试、trace cosine/RMSE 和 token 一致性；数值回归通过不等于识图业务准确率通过。
+
+## 一次性验证全部优化
+
+复用已导入 FP8 权重和请求，不安装依赖、不重新导入模型：
 
 ```bash
 git pull --ff-only
-which python
-AVI_GPUS=2,3 bash scripts/test-server.sh
-```
 
-默认使用 GPU 2、3，需确认它们仍空闲；root 下自动设置 OpenMPI 环境变量。输出在 acceptance-* 目录，包含 acceptance.log、pip-freeze.txt、commit.txt 和小模型结果。构建前检查 nvcc 与 torch.version.cuda；如果仍为 12.8 与 13.0，会停止并报告差异，不修改环境。旧的 setup-cu128.sh 入口现仅做只读检查，不再安装任何包。
-
-小模型通过后测试已有 block-FP8 模型（128×128 E4M3FN）：
-
-```bash
-HF_MODEL=/models/your-fp8-model TEST_IMAGE=/data/test.png AVI_GPUS=2,3 bash scripts/test-model.sh
-```
-
-只导入一份 FP8 原生权重；不生成 BF16 模型包、不重新量化已有 FP8。脚本先重编译并跑新格式小模型，再执行实际模型的基线/优化/Graph 一致性测试，结果在 model-test-*。这不是独立 W8A8 参考对照，实际识图业务字段仍需与原服务核对。
-
-## 服务器运行步骤
-
-在 Linux 服务器上传整个项目。需要 CUDA 版 PyTorch 及版本匹配的 torchvision（图片预处理使用）、匹配的 CUDA toolkit（包含 nvcc）、CMake >=3.18、G++、OpenMPI 开发包、NCCL 开发包。**驱动 580.126.09 不等于已经安装 CUDA 编译器。** 使用服务器现有 CUDA PyTorch 环境，或单独创建相同版本的环境。CPU-only PyTorch 不能构建。
-
-Ubuntu 的常用系统依赖（NCCL 包通常需 NVIDIA 软件源）：
-
-```bash
-sudo apt-get install build-essential cmake libopenmpi-dev openmpi-bin libnccl-dev libssl-dev
-python -c 'import torch; print(torch.__version__, torch.version.cuda, torch.utils.cmake_prefix_path)'
-nvcc --version
-nvidia-smi topo -m
-```
-
-不要为了匹配本文随意升级训练环境。记录现有 PyTorch/CUDA 版本，优先在独立环境构建。
-
-### 1. 编译与 CUDA 算子测试
-
-```bash
-bash scripts/build.sh
-```
-
-默认并行编译 2 个任务，避免头文件编译占满 CPU 内存。NCCL 在自定义位置时先设置 `NCCL_ROOT=/path/to/nccl`，目录下应有 include 与 lib/lib64。
-
-### 2. 先跑小模型端到端检查
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1 bash scripts/smoke.sh smoke-run-01
-```
-
-该脚本创建随机小型 Qwen3.5 同构模型和图片 patch 输入，运行 BF16/FP8、TP1/TP2、基线/优化/CUDA Graph 三种路径，并与 Transformers 的视觉特征和 prefill logits 比较。它不是准确率测试。任何检查失败都应先修复，不要直接跑 27B。输出目录必须是新目录。
-
-MPI 默认按本机 rank 选择 GPU；每个进程要看到同一组 GPU。脚本针对普通 Linux 用户，不自动绕过 root 限制。
-
-### 3. 合并你们的 LoRA（已有完整合并模型则跳过）
-
-```bash
-python tools/merge_lora.py \
-  --base /models/Qwen3.8-27B \
-  --adapter /models/your-adapter \
-  --out /models/your-merged-bf16
-```
-
-CPU 合并需要充足 RAM，建议准备至少约 100GB 可用主存并监控峰值。检查生成的 `merge_audit.json`：你们视觉侧未冻结，不能遗漏视觉/aligner 的适配器。使用训练时完全一致的基础模型 revision 和 processor。合并脚本不替代合并前后业务等价性验证。
-
-### 4. 转换原生权重
-
-先留一份 BF16 原生包用于定位数值问题，再生成 FP8：
-
-```bash
-python tools/convert.py --model /models/your-merged-bf16 \
-  --out /models/avi-bf16-tp2 --tp 2 --precision bf16
-
-python tools/convert.py --model /models/your-merged-bf16 \
-  --out /models/avi-fp8-tp2 --tp 2 --precision fp8
-```
-
-转换器逐张量工作，仍需几 GB 主存临时空间；磁盘要容纳按 rank 写出的模型包。输出目录不可已存在。只接受未量化的完整模型；不直接导入现有 W8A8/block-FP8 格式。视觉侧保留 BF16，MTP 显式跳过。
-
-### 5. 准备识图请求
-
-```bash
-python tools/prepare_request.py \
-  --model /models/your-merged-bf16 \
-  --image /data/test.png \
-  --prompt '请识别图片中的柜体、回路及关键字段，并输出 JSON。' \
-  --max-pixels 4000000 --max-context 20480 --max-new-tokens 256 \
-  --out /data/request-01
-```
-
-多图重复 `--image`。默认关闭 thinking 以便控制初始对照，可用 `--thinking` 打开。总预算包含图文输入和输出；不会把超过预算的内容静默截断。max_pixels 是预处理上限，不代表已验证的可用并发。
-
-### 6. 双卡原生推理
-
-先将下述模型路径换为 BF16 包跑对照，再用 FP8：
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1 mpirun -np 2 ./build/avi-infer \
-  --model /models/avi-fp8-tp2 \
-  --request /data/request-01 \
-  --output /data/result-01.json \
-  --prefill-chunk 128 --trace
-
-python tools/decode.py --model /models/your-merged-bf16 --result /data/result-01.json
-```
-
-输出必须是新文件。`--trace` 同时保存视觉特征和 prefill logits 的 FP32 二进制文件。仅限单机；TP4 需重新 `--tp 4` 转换并用 `mpirun -np 4` 启动。
-
-### 7. 实际模型参考对照
-
-```bash
-python tools/compare_reference.py --model /models/your-merged-bf16 \
-  --request /data/request-01 --native-output /data/result-01.json
-```
-
-参考对照默认单张 GPU 加载 BF16；大图/长序列可能需要更多显存或高效 FLA 依赖。先用小型真实图片检查，不修改正式业务的 400 万像素验收目标。当前阈值只是宽松数值 smoke 检查，不能证明计数、BOM、bbox 等业务质量，也不能替代逐 token/长序列验证。
-
-## v0.2 服务与性能实现
-
-- 融合 QKV、GDN 输入投影、MLP gate/up；融合 RMSNorm、SwiGLU、L2、mRoPE 和 decode 卷积。
-- FP8 小批量 GEMV 直接读取压缩权重；prefill 使用 BF16 WMMA 分块。A100 上没有原生 FP8 Tensor Core 计算。
-- GQA decode 使用 split-K 注意力，避免复制 GQA KV；GDN 扫描减少递归状态的全局显存访问。
-- 常驻 C++ worker 保存模型，多请求轮询 prefill、合并 decode 投影和 MLP。每个请求有独立 KV/GDN 状态。
-- 单请求 decode 可用 CUDA Graph；多请求使用批量执行路径。Graph 显式开启，默认不启用。
-- 图像特征和完整 prompt 状态采用有容量上限的 LRU 缓存，内容哈希作为键。不是任意公共前缀匹配。
-- 温度、top-k/top-p、重复惩罚、随机种子、取消、超时；主 rank 统一超时判定。
-- HTTP/SSE、base64 图片输入、API key、JSON object 语法掩码。Python 仅处理 HTTP、tokenizer 和图片预处理。
-
-启动服务（转换权重时需保留 tokenizer.json，旧包需重新转换以启用 JSON 语法）：
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1 python tools/serve.py \
-  --model /models/avi-fp8-tp2 --hf-model /models/your-merged-bf16 \
-  --tp 2 --max-concurrency 2 --max-context 20480 --prefill-chunk 128
-```
-
-默认仅监听 127.0.0.1；远程访问请显式设置 --host 和 AVI_API_KEY。接口为 `/v1/chat/completions`，图像使用 `image_url` 内容块中的 `data:image/png;base64,...`；支持 `stream: true` 和 `response_format: {"type":"json_object"}`。JSON 模式须关闭 thinking 和文本 stop。`avi_metrics.json_complete` 指示完成状态；达到长度上限或取消时可能只有 JSON 前缀，不能当作完整结果。语法不约束业务字段或值。
-
-服务器完整小模型验收：
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1 bash scripts/acceptance.sh acceptance-01
-```
-
-会保存环境、构建、数值检查、worker 集成测试日志。实际模型数值验收通过后，使用 `python tools/benchmark_http.py --help` 跑相同图片和 token 预算的并发压测。先固定并发 1/2；不能把训练 max_pixels 或显存容量直接换算成安全服务并发。
-
-生成压测请求并执行：
-
-```bash
-python tools/make_http_request.py --image /data/test.png --prompt '识别图中设备并输出 JSON 对象' --json-object --out request-body.json
-python tools/benchmark_http.py --body request-body.json --requests 20 --concurrency 2 --out benchmark-01.json
-```
-
-## v0.3 显存管理与验收补充
-
-- 常驻 worker 启动后读取所有 rank 的可用显存，采用最小值，扣除 GPU 缓存上限与 workspace 预留，建立统一准入账本。显存不足的请求排队，单请求超出总预算直接报错。
-- 每请求 KV 容量按输入 token + 最大输出 token 分配；GDN、输入驻留与 logits 也计入预算。取消、完成后释放额度。排队期间也执行超时与取消。
-- 默认 `--workspace-mib 8192`，用于视觉/算子临时内存和 Graph 等开销。它是保守预留参数，不能保证覆盖所有输入的峰值；不要未经测量直接调小。
-- 可用 `--host-prefix-cache-mib 4096` 开启每 rank 4 GiB 的锁页主存缓存。GPU 整段 prompt checkpoint 被淘汰时可转入主存，后续命中恢复 KV、卷积、GDN 和 logits。默认关闭；TP2 总锁页上限是每 rank 配置的两倍。没有异步重叠迁移和公共前缀匹配。
-- GPU checkpoint 必须先能放入 `--prefix-cache-mib` 才能保存或降级；过大的 checkpoint 会跳过，不能仅增大 Host 上限。
-- HTTP 启动会先检查模型文件是否缺失/截断。也可独立运行 `python tools/preflight.py --model /models/avi-fp8-tp2 --tp 2`，无需 GPU。文件长度检查不等于哈希或数值校验。
-- `--trace` 现在保存逐步 decode logits。参考工具默认以原生 token 做 teacher forcing，对照最多 8 步；`--decode-check 0` 可关闭。开启 trace 的计时含诊断开销，不应作为性能结果。
-- 小模型验收新增主存缓存命中恢复、错误请求拒绝后继续服务的检查。HTTP 本地测试使用替代 transport/tokenizer，仅检查协议与资源清理。
-
-首次服务器安装测试依赖后执行 `scripts/acceptance.sh`；仅完成构建检查不足以验收。日志保留在新建的运行目录中，真实模型对照仍单独执行。
-
-## 明确限制
-
-- 本机没有 CUDA/LibTorch；C++/CUDA 主引擎尚未编译、未进行 A100 数值或性能验证。优化代码存在不等于实测加速，首次服务器运行仍可能暴露构建或数值问题。
-- GDN 仍按时间顺序扫描，不是并行 chunk prefill 算法；视觉塔、embedding 和输出头仍各卡复制。没有请求抢占、paged KV、量化 KV、MTP、跨节点或多请求 CUDA Graph。
-- 静态图片输入，不支持视频、JSON Schema 或工具调用。JSON 首次语法掩码在 CPU 构造，可能影响首 token 延迟。
-- KV 按请求输入加输出预算分配；新增显存预算准入，但仍没有分页 KV。工作区是显式预留，不是精确峰值模型；极端图像、Graph 池和分配器碎片仍可能导致 OOM。
-- 所有模型配置、processor 和微调产物须核对；训练版本记录见 configs/training-provenance.json。尚未验收真实识图准确率、长上下文、TP4 或 LoRA 合并等价性。
-
-## 本地检查记录
-
-2026-09-28：15 项 Python 单元/HTTP 接口测试、工具 AST 检查及纯 C++ JSON grammar 和显存预算测试，结果见 docs/implementation-status.md。加载器预期的 1184 个非 MTP 权重名称此前已与官方索引核对。CUDA 内核测试和服务器集成脚本已提供，尚未执行。源码和参考许可见 NOTICE。
-
-构建兼容说明：不再调用 CMake 3.24 才提供的 `--fresh`，最低配置版本为 3.18（CUDA sm_80 支持）。构建前仅重置 build/CMakeCache.txt 和 build/CMakeFiles；不会删除测试日志或模型。旧 CMake 对新 CUDA Toolkit 的具体兼容性仍以服务器配置结果为准。
-
-## 已有 HF block-FP8 权重导入
-
-`tools/import_fp8.py` 支持 quant_method=fp8、fmt=e4m3、activation_scheme=dynamic、weight_block_size=[128,128]。逐张量检查实际 float8_e4m3fn dtype，并读取同模块 `.weight_scale_inv`（作为反量化乘数）。缩放矩阵须为 [ceil(N/128),ceil(K/128)]；名称或格式不符会停止，不会猜测缩放含义。仅配置符合不代表实际 checkpoint 已验证。
-
-FP8 编码原样保留，scale 只沿输出行展开以便 TP 分片和融合，不做再次量化。非量化视觉层和 GDN a/b 投影继续保留 BF16/FP32。混合投影分开计算后拼接，不强制重新量化。CUDA 解码、GEMV、WMMA 支持每行每 128 输入列一个 scale。当前格式仍使用 avi-v1 元数据，但二维 scale 要求本次新版运行时，不能交给旧二进制。
-
-```bash
-python tools/import_fp8.py --model /models/your-fp8-model --out /models/avi-import-fp8-tp2 --tp 2
-```
-
-A100 路径保留 FP8 权重、使用 BF16 激活计算；不模拟配置中的动态激活 FP8 量化，结果可能与原 W8A8 运行时不同。新的测试只检查原生执行路径一致性，不能替代业务准确率比较。未新增任何安装依赖步骤。未实现该格式的独立原始运行时逐层对照。
-
-## 复用已导入 FP8 权重进行性能对比
-
-混合 GDN 投影按连续且相同精度分组融合：常见 FP8 qkv/z + BF16 b/a 从四次投影变为两次，保持输出顺序，不能据此直接断言提速。新增 CUDA 回归检查分组投影的数值和拼接顺序。常驻贪心采样将最大值和 token ID 一次传回 CPU。
-
-```bash
-AVI_MODEL=model-test-20260928-151515/fp8-tp2 \
-AVI_REQUEST=model-test-20260928-151515/request \
-AVI_GPUS=2,3 bash scripts/benchmark-existing.sh
-```
-
-这个脚本不导入权重、不安装依赖，重新编译和执行算子测试后，比较 baseline/optimized/graph 并发1及 optimized 并发2。每个 worker 先热身，模型驻留测量；默认关闭图像和 prompt 缓存，无 trace。BENCH_REQUESTS 默认5，PREFILL_CHUNK 默认128，可显式改变。请求内容和输出上限沿用原 request，不改业务参数；Graph 当前按请求捕获，报告包含捕获成本。并发2结果是总吞吐，不能视作单请求提速倍数。summary.json 会同时报告是否与基线 token 完全相同，数值差异仍需要业务核对。
-
-若需要更长完整输出，test-model.sh 支持 MAX_NEW_TOKENS，但性能初次对照请沿用原请求，避免把 token 数变化当作速度变化。
-
-## A100 optimization matrix
-
-`--extra-fusions` enables fused GDN gates, RMSNorm/SiLU and attention gating. `--cublas-prefill` selects bounded FP8 dequantization + cuBLAS for larger matrices while retaining FP8 resident weights. New switches remain opt-in until server validation.
-
-```bash
-git pull --ff-only
 AVI_MODEL=model-test-20260928-151515/fp8-tp2 \
 AVI_REQUEST=model-test-20260928-151515/request \
 AVI_GPUS=2,3 bash scripts/test-optimizations.sh
 ```
 
-Builds once, runs GPU kernel tests and nine accuracy/performance profiles without installing dependencies or importing weights again. See [batch details](docs/optimization-batch.md). Results: `optimizations-*/matrix/summary.json`. CUDA compilation and performance require server validation.
+脚本编译一次，依次比较 baseline、现有 optimized、额外融合、cuBLAS prefill、融合 + cuBLAS、CUDA Graph、prefill chunk 128/256/512，以及单并发/并发 2。
+
+结果保存在 `optimizations-*/matrix/summary.json`，包括 TTFT、延迟、吞吐、trace 数值差异和 token 一致性。
+
+## 主要代码
+
+- `src/engine.cpp`：模型执行、TP、Attention/GDN 状态和算子选择。
+- `src/optimized.cu`：FP8 GEMV/WMMA、融合归一化、RoPE、GQA、GDN 和门控 kernel。
+- `src/kernels.cu`：FP8 解码与基线 CUDA 实现。
+- `tools/import_fp8.py`：block-FP8 checkpoint 校验、分片和导入。
+- `tools/optimization_matrix.py`：正确性与性能矩阵。
+- `tests/optimized_test.cpp`：CUDA kernel 数值回归。
+
+## 尚未实现
+
+- Gated DeltaNet chunk-parallel prefill。
+- Paged KV cache 与公共前缀分页复用。
+- MTP/speculative decoding。
+- 多请求 CUDA Graph capture。
+- KV cache 量化和跨节点 Tensor Parallel。
+
+这些优化需要新的状态布局或独立数值验收，在没有 A100 实测数据前不会标记为已完成。
+
+## 说明
+
+项目针对固定模型结构和固定硬件优化，不以兼容全部 Transformers 模型为目标。Python 只用于 checkpoint 导入、请求预处理、结果解码和测试；视觉编码、语言模型 forward 与逐 token 生成均在 C++/CUDA 进程执行。
