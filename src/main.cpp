@@ -50,6 +50,7 @@ int main(int argc,char** argv) {
       MPI_Bcast(&id,sizeof(id),MPI_BYTE,0,MPI_COMM_WORLD);
       TORCH_CHECK(ncclCommInitRank(&comm,world,id,rank)==ncclSuccess,"NCCL initialization failed");
     }
+    { // Engine and captured graphs must die before their NCCL communicator.
     c10::InferenceMode inference_guard; at::set_num_threads(1);
     auto req=avi::read_json(request+"/request.json"); TORCH_CHECK(req.at("format")=="avi-request-v1","Unsupported request format");
     int capacity=req.at("max_context"), max_new=req.at("max_new_tokens");
@@ -103,7 +104,12 @@ int main(int argc,char** argv) {
       std::ofstream f(output); f<<result.dump(2)<<"\n"; TORCH_CHECK(f.good(),"Cannot write output");
       std::cerr<<"Finished "<<generated.size()<<" tokens; output "<<output<<"\n";
     }
-    if(comm) ncclCommDestroy(comm); MPI_Comm_free(&local_comm); MPI_Finalize(); return 0;
+    std::cerr<<"Rank "<<rank<<": releasing engine and CUDA graphs\n";
+    }
+    std::cerr<<"Rank "<<rank<<": destroying NCCL communicator\n";
+    if(comm) { TORCH_CHECK(ncclCommDestroy(comm)==ncclSuccess,"NCCL destroy failed"); }
+    std::cerr<<"Rank "<<rank<<": finalizing MPI\n";
+    MPI_Comm_free(&local_comm); MPI_Finalize(); return 0;
   } catch(const std::exception& e) {
     std::cerr<<"Rank "<<rank<<": "<<e.what()<<"\n";
     MPI_Abort(MPI_COMM_WORLD,1); return 1;

@@ -75,6 +75,7 @@ int main(int argc,char** argv){
   cudaDeviceProp prop;C10_CUDA_CHECK(cudaGetDeviceProperties(&prop,local));TORCH_CHECK(prop.major==8&&prop.minor==0,"Requires SM80");
   if(world>1){ncclUniqueId id;if(!rank){ TORCH_CHECK(ncclGetUniqueId(&id)==ncclSuccess,"NCCL id failed"); }MPI_Bcast(&id,sizeof(id),MPI_BYTE,0,MPI_COMM_WORLD);TORCH_CHECK(ncclCommInitRank(&comm,world,id,rank)==ncclSuccess,"NCCL init failed");}
   TORCH_CHECK(!std::filesystem::exists(model+"/INCOMPLETE"),"Incomplete model export");
+  { // Scope engine/graphs inside the lifetime of comm.
   c10::InferenceMode guard;at::set_num_threads(1);avi::Engine engine(model,rank,world,local,comm,capacity,options);
   // Reclaim load-time temporary allocator blocks before measuring device headroom.
   C10_CUDA_CHECK(cudaDeviceSynchronize());c10::cuda::CUDACachingAllocator::emptyCache();
@@ -171,6 +172,10 @@ int main(int argc,char** argv){
     engine.drop(it->first);memory.release(it->first);ids.erase(j.id);it=active.erase(it);
    }
   }
-  emit(rank,{{"event","stopped"}});if(comm)ncclCommDestroy(comm);MPI_Comm_free(&host);MPI_Finalize();return 0;
+  std::cerr<<"Rank "<<rank<<": releasing engine and CUDA graphs\n";
+  }
+  std::cerr<<"Rank "<<rank<<": destroying NCCL communicator\n";
+  if(comm) { TORCH_CHECK(ncclCommDestroy(comm)==ncclSuccess,"NCCL destroy failed"); }
+  emit(rank,{{"event","stopped"}});MPI_Comm_free(&host);MPI_Finalize();return 0;
  }catch(const std::exception& e){emit(rank,{{"event","fatal"},{"message",e.what()}});std::cerr<<"Rank "<<rank<<": "<<e.what()<<"\n";MPI_Abort(MPI_COMM_WORLD,1);return 1;}
 }

@@ -266,8 +266,12 @@ Tensor Engine::vision(const std::string& dir,const json& request) {
   return at::cat(outputs,0);
 }
 
-struct DecodeGraph {std::unique_ptr<at::cuda::CUDAGraph> graph;Tensor ids,positions,output;};
-Engine::~Engine()=default;
+struct DecodeGraph {std::unique_ptr<at::cuda::CUDAGraph> graph;Tensor ids,positions,output;~DecodeGraph(){graph.reset();}};
+Engine::~Engine(){
+  // NCCL capture retains communicator resources until graph destruction.
+  // The owning executable keeps the communicator alive through this destructor.
+  cudaDeviceSynchronize();graphs_.clear();
+}
 int Engine::session_capacity() const {
     auto it=session_capacities_.find(active_);return it==session_capacities_.end()?capacity_:it->second;
   }
