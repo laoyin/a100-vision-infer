@@ -15,6 +15,26 @@
 
 Python 只用于转换、tokenizer/图片预处理、输出解码和独立验证。图像 encoder、语言模型和逐 token 生成都在 C++ 进程。LibTorch 是本版的 C++ 算子依赖，不是 Transformers 模型执行器。
 
+## 当前服务器快捷测试（CUDA Toolkit 12.8）
+
+适用于日志中 A100、nvcc 12.8、现有 PyTorch cu130 的服务器。保留系统驱动和 Toolkit，仅创建项目 `.venv-cu128`，安装 PyTorch 2.11.0+cu128 / torchvision 0.26.0+cu128。官方版本配对来源：https://pytorch.org/get-started/previous-versions/ 。不会安装系统包或修改现有训练环境。
+
+```bash
+git pull --ff-only
+bash scripts/setup-cu128.sh
+AVI_GPUS=2,3 bash scripts/test-server.sh
+```
+
+第一步需要联网下载依赖和足够磁盘空间；Python 必须支持 venv。缺少 OpenMPI/OpenSSL 开发包、CMake 或编译器时需要管理员先提供。测试脚本默认 GPU 2、3，应确认它们仍空闲；root 下自动设置 OpenMPI 所需环境变量。输出目录为带时间戳的 acceptance-*，保留 acceptance.log、pip-freeze.txt、commit.txt 和小模型结果。编译使用 --fresh 清除旧 CMake 配置，保留 build 目录文件。
+
+小模型全部通过后，使用完整合并 BF16 模型测试真实图片：
+
+```bash
+HF_MODEL=/models/your-merged-bf16 TEST_IMAGE=/data/test.png AVI_GPUS=2,3 bash scripts/test-model.sh
+```
+
+这个步骤生成两份原生权重（BF16/FP8），需要充足磁盘空间；结果位于 model-test-*。参考模型对照默认单 GPU，极端图像可能超出其显存；此时保留日志，不要把 OOM 当作引擎数值通过。脚本只验收数值，业务字段仍需人工核对。
+
 ## 服务器运行步骤
 
 在 Linux 服务器上传整个项目。需要 CUDA 版 PyTorch 及版本匹配的 torchvision（图片预处理使用）、匹配的 CUDA toolkit（包含 nvcc）、CMake >=3.24、G++、OpenMPI 开发包、NCCL 开发包。**驱动 580.126.09 不等于已经安装 CUDA 编译器。** 使用服务器现有 CUDA PyTorch 环境，或单独创建相同版本的环境。CPU-only PyTorch 不能构建。

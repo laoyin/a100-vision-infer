@@ -4,6 +4,10 @@ cd "$(dirname "$0")/.."
 run="${1:-acceptance-$(date +%Y%m%d-%H%M%S)}"
 mkdir "$run"
 exec > >(tee "$run/acceptance.log") 2>&1
+trap 'status=$?; printf "Exit status: %s\n" "$status"; if [[ $status != 0 ]]; then echo "FAILED: retain this directory and build/CMakeFiles diagnostics."; fi' EXIT
+python -m pip freeze > "$run/pip-freeze.txt"
+git rev-parse HEAD > "$run/commit.txt"
+python tools/check_build_env.py
 nvidia-smi
 nvidia-smi topo -m
 nvcc --version
