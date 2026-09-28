@@ -11,7 +11,8 @@ exec > >(tee "$run/test.log") 2>&1
 git rev-parse HEAD
 python -m unittest discover -s tests -p 'test_*.py'
 bash scripts/build.sh
+if [[ "${OPT_SUITE:-standard}" == deep ]]; then bash scripts/smoke-deep.sh "$run/small-model"; fi
 python tools/preflight.py --model "$AVI_MODEL" --tp 2
 python tools/optimization_matrix.py --model "$AVI_MODEL" --request "$AVI_REQUEST" --out "$run/matrix" \
- --requests "${BENCH_REQUESTS:-3}" --timeout "${PROFILE_TIMEOUT:-1800}"
+ --requests "${BENCH_REQUESTS:-3}" --timeout "${PROFILE_TIMEOUT:-1800}" --suite "${OPT_SUITE:-standard}"
 echo "Completed: $run/matrix/summary.json"

@@ -12,7 +12,7 @@ using json = nlohmann::json;
 Tensor fp8_decode(Tensor codes, Tensor scales);
 Tensor delta_scan(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, Tensor state);
 struct Weight { Tensor data, scale; };
-struct EngineOptions { bool optimized=true; bool extra_fusions=false; bool cublas_prefill=false; bool cuda_graph=false; size_t image_cache_bytes=256ULL<<20; size_t prefix_cache_bytes=512ULL<<20; size_t host_prefix_cache_bytes=0; };
+struct EngineOptions { bool optimized=true; bool extra_fusions=false; bool cublas_prefill=false; bool cuda_graph=false; bool tp_lm_head=false; bool reference_prefill=false; bool vector_gemv=false; size_t image_cache_bytes=256ULL<<20; size_t prefix_cache_bytes=512ULL<<20; size_t host_prefix_cache_bytes=0; };
 struct DecodeGraph;
 class Engine {
  public:
@@ -28,6 +28,7 @@ class Engine {
   json cache_stats() const;
   Tensor vision(const std::string& request_dir, const json& request);
   Tensor step(Tensor embeddings, Tensor positions);
+  void set_trace_prefix(const std::string& prefix) { trace_prefix_=prefix; }
   Tensor embed(Tensor ids);
   Tensor logits(Tensor hidden);
   Tensor read_input(const std::string& dir, const json& desc);
@@ -49,6 +50,8 @@ class Engine {
   ncclComm_t comm_;
   double eps_;
   EngineOptions options_;
+  std::string trace_prefix_;
+  void trace_layer(Tensor hidden,int layer);
   bool decode_mode_=false;
   int active_=0;
   std::unordered_map<int,int> session_capacities_;

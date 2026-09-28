@@ -2,7 +2,7 @@
 #include <ATen/ATen.h>
 #include <utility>
 namespace avi {
-at::Tensor fp8_linear(at::Tensor x,at::Tensor codes,at::Tensor scales);
+at::Tensor fp8_linear(at::Tensor x,at::Tensor codes,at::Tensor scales,bool vector_gemv=false);
 at::Tensor fused_rms(at::Tensor x,at::Tensor weight,double eps,bool one_center);
 at::Tensor fused_swiglu(at::Tensor gate_up);
 std::pair<at::Tensor,at::Tensor> fused_gdn_gates(at::Tensor a,at::Tensor b,at::Tensor log_decay,at::Tensor bias);

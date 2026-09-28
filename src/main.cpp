@@ -25,13 +25,17 @@ int main(int argc,char** argv) {
   ncclComm_t comm=nullptr;
   try {
     std::string model,request,output; int chunk=128;
-    bool trace=false; avi::EngineOptions options;
+    bool trace=false,layer_trace=false; avi::EngineOptions options;
     for(int i=1;i<argc;i++) {
       std::string key=argv[i];
       if(key=="--baseline"){options.optimized=false;continue;}
       if(key=="--cuda-graph"){options.cuda_graph=true;continue;}
       if(key=="--extra-fusions"){options.extra_fusions=true;continue;}
       if(key=="--cublas-prefill"){options.cublas_prefill=true;continue;}
+      if(key=="--tp-lm-head"){options.tp_lm_head=true;continue;}
+      if(key=="--reference-prefill"){options.reference_prefill=true;continue;}
+      if(key=="--vector-gemv"){options.vector_gemv=true;continue;}
+      if(key=="--layer-trace"){layer_trace=true;continue;}
       if(key=="--trace") { trace=true; continue; }
       TORCH_CHECK(i+1<argc,"Missing argument for ",key); std::string value=argv[++i];
       if(key=="--model") model=value; else if(key=="--request") request=value;
@@ -42,6 +46,7 @@ int main(int argc,char** argv) {
     TORCH_CHECK(world==1 || world==2 || world==4,"Use 1, 2 or 4 ranks on a single node");
     int local_world; MPI_Comm_size(local_comm,&local_world); TORCH_CHECK(local_world==world,"Multi-node is not implemented");
     TORCH_CHECK(chunk>0,"Prefill chunk must be positive");
+    TORCH_CHECK(!layer_trace||!options.cuda_graph,"Layer trace requires eager execution; use a separate untraced Graph benchmark");
     TORCH_CHECK(!std::filesystem::exists(output),"Refusing to overwrite output ",output);
     TORCH_CHECK(!std::filesystem::exists(model+"/INCOMPLETE"),"Incomplete model conversion");
     int count; C10_CUDA_CHECK(cudaGetDeviceCount(&count)); TORCH_CHECK(count>=world,"Each rank must see all requested GPUs");
@@ -78,7 +83,9 @@ int main(int argc,char** argv) {
     start=Clock::now(); at::Tensor last;
     for(int64_t i=0;i<ids.numel();i+=chunk) {
       auto n=std::min<int64_t>(chunk,ids.numel()-i);
+      if(layer_trace&&i+n==ids.numel())engine.set_trace_prefix(output+".prefill_layers");
       last=engine.step(embedding.narrow(0,i,n),pos.narrow(1,i,n));
+      engine.set_trace_prefix("");
       if(rank==0) std::cerr<<"Prefill "<<i+n<<"/"<<ids.numel()<<"\n";
     }
     auto logits=engine.logits(last.narrow(0,last.size(0)-1,1));
@@ -94,14 +101,16 @@ int main(int argc,char** argv) {
       MPI_Bcast(&token,1,MPI_INT64_T,0,MPI_COMM_WORLD); generated.push_back(token);
       if(eos.count(token)) { reason="eos"; break; }
       if(i+1==max_new) break;
+      if(layer_trace&&i+1==74)engine.set_trace_prefix(output+".decode74_layers");
       logits=engine.decode(token,next++,ids.numel()+i);
+      engine.set_trace_prefix("");
       if(trace && rank==0) dump(output+".decode_"+std::to_string(i+1)+".f32",logits);
     }
     C10_CUDA_CHECK(cudaDeviceSynchronize()); double decode_time=seconds(start);
     if(rank==0) {
       avi::json result={{"format","avi-result-v1"},{"generated_ids",generated},{"finish_reason",reason},
                         {"input_tokens",ids.numel()},{"tp",world},{"backend","native-libtorch-cuda"},
-                        {"optimized",options.optimized},{"cuda_graph",options.cuda_graph},{"load_seconds",load_time},{"vision_seconds",vision_time},{"prefill_seconds",prefill_time},
+                        {"optimized",options.optimized},{"cuda_graph",options.cuda_graph},{"tp_lm_head",options.tp_lm_head},{"reference_prefill",options.reference_prefill},{"layer_trace",layer_trace},{"load_seconds",load_time},{"vision_seconds",vision_time},{"prefill_seconds",prefill_time},
                         {"decode_loop_seconds",decode_time},{"note","First generated token comes from prefill; timings exclude Python preprocessing. Experimental, not benchmark-certified."}};
       std::ofstream f(output); f<<result.dump(2)<<"\n"; TORCH_CHECK(f.good(),"Cannot write output");
       std::cerr<<"Finished "<<generated.size()<<" tokens; output "<<output<<"\n";

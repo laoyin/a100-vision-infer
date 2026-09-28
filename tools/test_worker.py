@@ -4,11 +4,14 @@ from pathlib import Path
 
 def main():
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--model',required=True);p.add_argument('--request',required=True)
-    p.add_argument('--host-cache',action='store_true');p.add_argument('--worker',default='build/avi-worker');p.add_argument('--tp',type=int,default=2);p.add_argument('--cuda-graph',action='store_true');a=p.parse_args()
+    p.add_argument('--host-cache',action='store_true');p.add_argument('--worker',default='build/avi-worker');p.add_argument('--tp',type=int,default=2);p.add_argument('--cuda-graph',action='store_true')
+    p.add_argument('--tp-lm-head',action='store_true');p.add_argument('--vector-gemv',action='store_true');a=p.parse_args()
     req=json.loads((Path(a.request)/'request.json').read_text())
     cmd=['mpirun','-np',str(a.tp),a.worker,'--model',a.model,'--max-context',str(req['max_context']),
          '--max-concurrency','2','--prefill-chunk','4']+(['--cuda-graph'] if a.cuda_graph else [])
     temp=tempfile.TemporaryDirectory(prefix='avi-worker-test-')
+    if a.tp_lm_head:cmd+=['--tp-lm-head']
+    if a.vector_gemv:cmd+=['--vector-gemv']
     variants=Path(temp.name)
     if a.host_cache:
         config=json.loads((Path(a.model)/'manifest.json').read_text())['config']['text_config'];tp=a.tp

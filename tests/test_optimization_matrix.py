@@ -36,5 +36,13 @@ class MatrixTests(unittest.TestCase):
         self.assertTrue(any(p[2] == "graph" for p in profiles))
         self.assertTrue(any(p[3] == 2 for p in profiles))
 
+    def test_deep_suite_preserves_diagnostic_and_fast_controls(self):
+        profiles = matrix.profiles('deep')
+        self.assertEqual(len({p[0] for p in profiles}), len(profiles))
+        self.assertTrue(any(p[1] == ['--reference-prefill'] for p in profiles))
+        self.assertTrue(any('--tp-lm-head' in p[1] and '--vector-gemv' not in p[1] for p in profiles))
+        self.assertTrue(any('--vector-gemv' in p[1] and '--tp-lm-head' not in p[1] for p in profiles))
+        self.assertTrue(all(p[4] == 512 for p in profiles if p[3] == 2))
+
 if __name__ == "__main__":
     unittest.main()

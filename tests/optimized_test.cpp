@@ -3,6 +3,28 @@
 #include <iostream>
 void run_optimized_tests(){
  auto opt=at::TensorOptions().device(at::kCUDA).dtype(at::kFloat);at::manual_seed(17);
+ // Packed GEMV: signed/subnormal FP8, block boundaries, batch and scalar fallback.
+ for(int M:{1,2,8})for(int K:{4,128,132,257,5120}){
+  int N=19;auto input=at::randn({M,K},opt).to(at::kBFloat16);
+  auto codes=(at::randint(0,127,{N,K},opt.dtype(at::kLong))+128*at::randint(0,2,{N,K},opt.dtype(at::kLong))).to(at::kByte);
+  auto scales=at::rand({N,(K+127)/128},opt)*.01+.001;
+  auto reference=at::matmul(input,avi::fp8_decode(codes,scales).t()).to(at::kFloat);
+  TORCH_CHECK(at::allclose(avi::fp8_linear(input,codes,scales,true).to(at::kFloat),reference,.025,.05),"Vector FP8 GEMV mismatch");
+ }
+ // Contiguous views can still be unaligned: they must use the scalar fallback.
+ {
+  auto input=at::randn({133},opt).to(at::kBFloat16).narrow(0,1,132).reshape({1,132});
+  auto codes=at::randint(0,126,{19,132},opt.dtype(at::kByte));auto scales=at::ones({19},opt)*.01;
+  TORCH_CHECK(at::equal(avi::fp8_linear(input,codes,scales,true),avi::fp8_linear(input,codes,scales)),"Unaligned GEMV fallback mismatch");
+ }
+ // AllGather layout must concatenate vocabulary, never request rows.
+ for(int B:{1,2,3})for(int TP:{2,4}){
+  auto input=at::randn({B,32},opt).to(at::kBFloat16),weight=at::randn({128,32},opt).to(at::kBFloat16);
+  std::vector<at::Tensor> shards;
+  for(int rank=0;rank<TP;rank++)shards.push_back(at::matmul(input,weight.narrow(0,rank*(128/TP),128/TP).t()).to(at::kFloat));
+  auto gathered=at::stack(shards,0).permute({1,0,2}).reshape({B,128});
+  TORCH_CHECK(at::allclose(gathered,at::matmul(input,weight.t()).to(at::kFloat),.02,.02),"TP output head gather layout mismatch");
+ }
  for(int M:{1,4,17,33})for(int K:{32,70}){
   int N=79;auto x=at::randn({M,K},opt).to(at::kBFloat16);
   auto codes=at::randint(0,126,{N,K},opt.dtype(at::kByte));auto scales=at::rand({N},opt)*0.01;

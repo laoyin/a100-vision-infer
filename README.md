@@ -50,6 +50,8 @@ Prefill 优化视觉与长文本的大矩阵计算，目标是降低首 token �
 - 单 token decode 使用 FP8 GEMV、融合 gate、GQA 和 GDN 专用 kernel。
 - 单请求支持 CUDA Graph replay；多请求可合并投影和 MLP 计算。
 - 贪心采样一次传回最大值与 token ID，减少 CPU/GPU 同步。
+- 可选词表输出头 TP 分片，各卡只计算部分词表，再汇总 logits，减少重复计算与权重驻留。
+- 可选向量化 FP8 GEMV，每个线程一次加载四组权重和激活，减少加载指令与循环次数。
 
 ## 当前 A100 实测
 
@@ -61,7 +63,9 @@ Prefill 优化视觉与长文本的大矩阵计算，目标是降低首 token �
 | optimized | 22.13 s | 29.37 s | 17.53 token/s |
 | CUDA Graph | 22.12 s | 29.18 s | 17.99 token/s |
 
-Decode 相比 baseline 提升约 **2.8–2.9 倍**。当前自定义 WMMA prefill 使 TTFT 上升，抵消了解码收益，因此已加入 cuBLAS prefill 对照路径和完整优化矩阵。最终默认路径以 A100 实测为准。
+Decode 相比 baseline 提升约 **2.8–2.9 倍**，但该轮首字阶段变慢，整次请求没有提速。首字阶段包含视觉处理和预填充，不能仅凭汇总计时确定某个算子是唯一原因。
+
+后续同一请求的 cuBLAS + 融合 + chunk512 实测 TTFT 为 **2.73 秒**、请求延迟 **9.75 秒**，通过现有数值阈值；chunk128 在 decode 第 74 步超限。新加入的词表分片与向量化 GEMV 尚待服务器实测，不计入上述收益。
 
 不同路径可能因 BF16/FP32 舍入顺序在后续 token 出现分歧。项目分别记录 CUDA 测试、trace cosine/RMSE 和 token 一致性；数值回归通过不等于识图业务准确率通过。
 
@@ -80,6 +84,8 @@ AVI_GPUS=2,3 bash scripts/test-optimizations.sh
 脚本编译一次，依次比较 baseline、现有 optimized、额外融合、cuBLAS prefill、融合 + cuBLAS、CUDA Graph、prefill chunk 128/256/512，以及单并发/并发 2。
 
 结果保存在 `optimizations-*/matrix/summary.json`，包括 TTFT、延迟、吞吐、trace 数值差异和 token 一致性。
+
+设置 `OPT_SUITE=deep` 可运行新一轮深度优化矩阵，包含词表分片、向量化 GEMV、chunk512/1024，以及基线预填充和逐层状态诊断。见 [测试说明](docs/deep-optimization.md)。
 
 ## 主要代码
 

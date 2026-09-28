@@ -19,6 +19,8 @@ def main():
  p.add_argument('--mode',choices=['baseline','optimized','graph'],default='optimized');p.add_argument('--prefill-chunk',type=int,default=128);p.add_argument('--cache',action='store_true')
  p.add_argument('--inherit-process-group',action='store_true',help=argparse.SUPPRESS)
  p.add_argument('--extra-fusions',action='store_true');p.add_argument('--cublas-prefill',action='store_true')
+ p.add_argument('--tp-lm-head',action='store_true');p.add_argument('--reference-prefill',action='store_true')
+ p.add_argument('--vector-gemv',action='store_true')
  a=p.parse_args()
  if a.requests<1 or a.warmup<0 or not 1<=a.concurrency<=8 or a.timeout<=0:p.error('Invalid benchmark limits')
  if Path(a.out).exists():p.error('Output exists')
@@ -29,6 +31,9 @@ def main():
  if a.mode=='graph':cmd+=['--cuda-graph']
  if a.extra_fusions:cmd+=['--extra-fusions']
  if a.cublas_prefill:cmd+=['--cublas-prefill']
+ if a.tp_lm_head:cmd+=['--tp-lm-head']
+ if a.reference_prefill:cmd+=['--reference-prefill']
+ if a.vector_gemv:cmd+=['--vector-gemv']
  process=subprocess.Popen(cmd,stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True,bufsize=1,start_new_session=not a.inherit_process_group);events=queue.Queue()
  def reader():
   for line in process.stdout:
@@ -56,8 +61,9 @@ def main():
   while receive(deadline).get('event')!='ready':pass
   if a.warmup:run(a.warmup,'warmup-')
   results,seconds=run(a.requests,'measure-')
-  report={'extra_fusions':a.extra_fusions,'cublas_prefill':a.cublas_prefill,'mode':a.mode,'cache_enabled':a.cache,'concurrency':a.concurrency,'prefill_chunk':a.prefill_chunk,'warmup':a.warmup,'input_tokens':req['input_ids']['shape'][0],
+  report={'tp_lm_head':a.tp_lm_head,'reference_prefill':a.reference_prefill,'extra_fusions':a.extra_fusions,'cublas_prefill':a.cublas_prefill,'mode':a.mode,'cache_enabled':a.cache,'concurrency':a.concurrency,'prefill_chunk':a.prefill_chunk,'warmup':a.warmup,'input_tokens':req['input_ids']['shape'][0],
           'max_new_tokens':req['max_new_tokens'],**summarize(results,seconds),'results':results,'note':'Resident engine; prepared inputs; no trace. Includes per-request Graph capture when enabled. Multirequest batches use eager decode.'}
+  report['vector_gemv']=a.vector_gemv
   with open(a.out,'x',encoding='utf-8') as f:json.dump(report,f,indent=2)
   print(json.dumps({k:v for k,v in report.items() if k!='results'},indent=2))
   send({'op':'shutdown'});process.stdin.close();process.wait(timeout=30)

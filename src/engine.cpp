@@ -55,6 +55,15 @@ Engine::Engine(const std::string& dir,int rank,int world,int device,ncclComm_t c
     if(rank==0 && ++loaded%100==0) std::cerr<<"Loaded "<<loaded<<" tensors\n";
   }
   decode_offset_=at::zeros({1},at::TensorOptions().device(at::Device(at::kCUDA,device)).dtype(at::kLong));
+  if(options_.tp_lm_head && world_>1) {
+    auto& head=weights_.at("lm_head.weight");int64_t vocab=text_.at("vocab_size");
+    TORCH_CHECK(vocab%world_==0 && head.data.size(0)==vocab,"LM head vocabulary must divide TP size");
+    int64_t rows=vocab/world_,begin=rank_*rows;
+    head.data=head.data.narrow(0,begin,rows).clone();
+    if(head.scale.defined())head.scale=head.scale.narrow(0,begin,rows).clone();
+    auto bias=weights_.find("lm_head.bias");
+    if(bias!=weights_.end())bias->second.data=bias->second.data.narrow(0,begin,rows).clone();
+  }
   if(options_.optimized) {
     for(size_t i=0;i<states_.size();i++) {
       auto p="model.language_model.layers."+std::to_string(i);
@@ -87,7 +96,15 @@ void Engine::fuse_weights(const std::string& dest,const std::vector<std::string>
     mixed_projections_[dest]=std::move(children);return;
   }
   Weight combined;combined.data=at::cat(data,0);if(!scales.empty())combined.scale=at::cat(scales,0);
-  weights_.emplace(dest+".weight",combined);for(auto& name:source)weights_.erase(name+".weight");
+  weights_.emplace(dest+".weight",combined);
+  int64_t offset=0;
+  for(auto& name:source){
+    auto& original=weights_.at(name+".weight");auto rows=original.data.size(0);
+    // Keep unfused views for reference prefill without a second weight allocation.
+    if(options_.reference_prefill){original.data=combined.data.narrow(0,offset,rows);if(combined.scale.defined())original.scale=combined.scale.narrow(0,offset,rows);}
+    else weights_.erase(name+".weight");
+    offset+=rows;
+  }
 }
 Tensor Engine::tensor(const std::string& name) {
   auto it=weights_.find(name); TORCH_CHECK(it!=weights_.end(),"Missing tensor ",name);
@@ -107,7 +124,7 @@ Tensor Engine::linear(Tensor x,const std::string& name,bool reduce) {
   auto& w=it->second; Tensor y;
   TORCH_CHECK(w.data.dim()>=2,"Invalid matrix ",name);
   if(w.scale.defined() && options_.optimized && !(options_.cublas_prefill && x.numel()/x.size(-1)>8)) {
-    y=fp8_linear(x.reshape({-1,x.size(-1)}).contiguous(),w.data,w.scale);
+    y=fp8_linear(x.reshape({-1,x.size(-1)}).contiguous(),w.data,w.scale,options_.vector_gemv);
     auto shape=x.sizes().vec();shape.back()=w.data.size(0);y=y.reshape(shape);
   } else if(w.scale.defined()) {
     TORCH_CHECK(w.data.dim()==2 && x.size(-1)==w.data.size(1),"FP8 dimensions mismatch ",name);
@@ -146,7 +163,15 @@ Tensor Engine::embed(Tensor ids) {
   auto selected=w.data.index_select(0,ids.reshape({-1}));
   return w.scale.defined()?fp8_decode(selected.contiguous(),w.scale.index_select(0,ids.reshape({-1})).contiguous()):selected;
 }
-Tensor Engine::logits(Tensor x) { return linear(norm(x,"model.language_model.norm"),"lm_head").to(at::kFloat); }
+Tensor Engine::logits(Tensor x) {
+  auto local=linear(norm(x,"model.language_model.norm"),"lm_head").to(at::kFloat).contiguous();
+  if(!options_.tp_lm_head || world_==1)return local;
+  auto gathered=at::empty({world_,local.size(0),local.size(1)},local.options());
+  auto status=ncclAllGather(local.data_ptr(),gathered.data_ptr(),local.numel(),ncclFloat,comm_,at::cuda::getCurrentCUDAStream());
+  TORCH_CHECK(status==ncclSuccess,ncclGetErrorString(status));
+  // NCCL gives [rank,batch,local_vocab]; preserve batch rows when assembling vocabulary.
+  return gathered.permute({1,0,2}).reshape({local.size(0),world_*local.size(1)});
+}
 Tensor Engine::full_attention(Tensor x,Tensor positions,int layer,const std::string& p,Tensor projected,bool finish) {
   auto T=x.size(0); int H=text_.at("num_attention_heads").get<int>()/world_;
   int HK=text_.at("num_key_value_heads").get<int>()/world_, D=text_.at("head_dim");
@@ -227,6 +252,8 @@ Tensor Engine::delta_attention(Tensor x,int layer,const std::string& p,Tensor pr
   result=result.reshape({T,H*V});return finish?linear(result,p+".out_proj",true):result;
 }
 Tensor Engine::step(Tensor x,Tensor positions) {
+  struct Restore {bool& value;bool saved;~Restore(){value=saved;}} restore{options_.optimized,options_.optimized};
+  if(options_.reference_prefill&&!decode_mode_)options_.optimized=false;
   TORCH_CHECK(x.dim()==2 && positions.dim()==2 && positions.size(0)==3 && positions.size(1)==x.size(0),"Invalid text input shape");
   for(size_t i=0;i<states_.size();i++) {
     std::string p="model.language_model.layers."+std::to_string(i);
@@ -236,8 +263,26 @@ Tensor Engine::step(Tensor x,Tensor positions) {
     n=norm(x,p+".post_attention_layernorm");
     auto gated=options_.optimized?fused_swiglu(linear(n,p+".mlp.gate_up")):at::silu(linear(n,p+".mlp.gate_proj"))*linear(n,p+".mlp.up_proj");
     x=x+linear(gated,p+".mlp.down_proj",true);
+    if(!trace_prefix_.empty())trace_layer(x,int(i));
   }
   return x;
+}
+void Engine::trace_layer(Tensor hidden,int layer) {
+  auto write=[&](const std::string& kind,Tensor value){
+    if(!value.defined())return;
+    auto path=trace_prefix_+".rank"+std::to_string(rank_)+".layer"+std::to_string(layer)+"."+kind+".f32";
+    TORCH_CHECK(!std::filesystem::exists(path),"Trace already exists: ",path);
+    value=value.to(at::kFloat).to(at::kCPU).contiguous();
+    std::ofstream file(path,std::ios::binary);file.write(static_cast<const char*>(value.data_ptr()),value.nbytes());
+    TORCH_CHECK(file.good(),"Cannot write layer trace: ",path);
+  };
+  write("hidden",hidden.narrow(0,hidden.size(0)-1,1));
+  auto& state=states_.at(layer);
+  if(state.recurrent.defined()){
+    auto flat=state.recurrent.reshape({-1});auto stride=std::max<int64_t>(1,(flat.numel()+4095)/4096);
+    write("recurrent_sample",flat.slice(0,0,flat.numel(),stride));
+  }
+  if(state.conv.defined())write("conv",state.conv);
 }
 Tensor Engine::vision(const std::string& dir,const json& request) {
   if(!request.contains("images") || request.at("images").empty()) return {};

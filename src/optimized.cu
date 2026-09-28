@@ -5,6 +5,7 @@
 #include <mma.h>
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 namespace avi {
 using at::Tensor; using bf=__nv_bfloat16;
 static const bf* ptr(const Tensor& x){return reinterpret_cast<const bf*>(x.data_ptr<at::BFloat16>());}
@@ -35,12 +36,35 @@ __global__ void gemm(const bf* x,const unsigned char* w,const float* scale,bf* y
  wmma::store_matrix_sync(c+warp*256,acc,16,wmma::mem_row_major);__syncthreads();
  for(int i=threadIdx.x;i<1024;i+=128){int tile=i/256,r=(i%256)/16,col=i%16;if(mi+r<M&&ni+tile*16+col<N)y[(mi+r)*N+ni+tile*16+col]=__float2bfloat16_rn(c[i]);}
 }
-Tensor fp8_linear(Tensor x,Tensor w,Tensor s){
+// Four adjacent codes and activations per lane: one scale per 128-column warp tile.
+__global__ void gemv_vector(const bf* x,const unsigned char* w,const float* scale,bf* y,int N,int K,int S){
+ int row=blockIdx.x*8+threadIdx.x/32,lane=threadIdx.x%32,batch=blockIdx.y;float sum=0;
+ if(row<N){
+  for(int k=lane*4;k<K;k+=128){
+   unsigned packed=*reinterpret_cast<const unsigned*>(w+int64_t(row)*K+k);
+   uint2 activations=*reinterpret_cast<const uint2*>(x+int64_t(batch)*K+k);
+   float s=scale[row*S+(S==1?0:k/128)];
+   #pragma unroll
+   for(int j=0;j<4;j++){
+    unsigned code=(packed>>(8*j))&255,exp=(code>>3)&15,mant=code&7;
+    float decoded=exp?__uint_as_float(((code&128)<<24)|((exp+120)<<23)|(mant<<20)):ldexpf(float(mant),-9)*(code&128?-1.f:1.f);
+    if(exp==15&&mant==7)decoded=__uint_as_float(0x7fffffff);
+    float weight=__bfloat162float(__float2bfloat16_rn(decoded*s));
+    unsigned bits=j<2?activations.x:activations.y;
+    float value=__bfloat162float(__ushort_as_bfloat16((bits>>(16*(j%2)))&65535));
+    sum+=value*weight;
+   }
+  }
+  sum=warp_sum(sum);if(!lane)y[batch*N+row]=__float2bfloat16_rn(sum);
+ }
+}
+Tensor fp8_linear(Tensor x,Tensor w,Tensor s,bool vector_gemv){
  TORCH_CHECK(x.is_cuda()&&x.scalar_type()==at::kBFloat16&&x.dim()==2&&x.is_contiguous(),"FP8 linear expects CUDA BF16 [M,K]");
  TORCH_CHECK(w.is_cuda()&&w.device()==x.device()&&w.scalar_type()==at::kByte&&w.dim()==2&&w.is_contiguous()&&x.size(1)==w.size(1),"Invalid FP8 weights");
  TORCH_CHECK(s.is_cuda()&&s.device()==x.device()&&s.scalar_type()==at::kFloat&&s.is_contiguous()&&(s.dim()==1?s.numel()==w.size(0):(s.dim()==2&&s.size(0)==w.size(0)&&s.size(1)==(w.size(1)+127)/128)),"Invalid FP8 scales");
  int M=x.size(0),N=w.size(0),K=w.size(1);TORCH_CHECK(M>0&&N>0&&K>0,"Empty GEMM");auto y=at::empty({M,N},x.options());auto stream=at::cuda::getCurrentCUDAStream();
- if(M<=8)gemv<<<dim3((N+7)/8,M),256,0,stream>>>(ptr(x),w.data_ptr<unsigned char>(),s.data_ptr<float>(),outptr(y),N,K,s.dim()==1?1:s.size(1));
+ if(M<=8&&vector_gemv&&K%4==0&&reinterpret_cast<std::uintptr_t>(x.data_ptr())%8==0&&reinterpret_cast<std::uintptr_t>(w.data_ptr())%4==0)gemv_vector<<<dim3((N+7)/8,M),256,0,stream>>>(ptr(x),w.data_ptr<unsigned char>(),s.data_ptr<float>(),outptr(y),N,K,s.dim()==1?1:s.size(1));
+ else if(M<=8)gemv<<<dim3((N+7)/8,M),256,0,stream>>>(ptr(x),w.data_ptr<unsigned char>(),s.data_ptr<float>(),outptr(y),N,K,s.dim()==1?1:s.size(1));
  else gemm<<<dim3((N+63)/64,(M+15)/16),128,0,stream>>>(ptr(x),w.data_ptr<unsigned char>(),s.data_ptr<float>(),outptr(y),M,N,K,s.dim()==1?1:s.size(1));
  C10_CUDA_KERNEL_LAUNCH_CHECK();return y;
 }
