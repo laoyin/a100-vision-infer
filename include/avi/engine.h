@@ -43,6 +43,7 @@ class Engine {
   struct State { Tensor key, value, conv, recurrent; int length=0; };
   std::vector<State> states_;
   std::unordered_map<std::string,Weight> weights_;
+  std::unordered_map<std::string,std::vector<std::string>> mixed_projections_;
   json config_, text_, vision_;
   int rank_, world_, device_, capacity_;
   ncclComm_t comm_;

@@ -13,17 +13,17 @@ __device__ float decode_e4m3(unsigned char b) {
   if(e==15 && m==7) v=NAN;
   return (b&128) ? -v : v;
 }
-__global__ void dequant(const unsigned char* q,const float* s,__nv_bfloat16* y,long n,int cols) {
+__global__ void dequant(const unsigned char* q,const float* s,__nv_bfloat16* y,long n,int cols,int scale_cols) {
   for(long i=blockIdx.x*blockDim.x+threadIdx.x;i<n;i+=long(blockDim.x)*gridDim.x)
-    y[i]=__float2bfloat16_rn(decode_e4m3(q[i])*s[i/cols]);
+    y[i]=__float2bfloat16_rn(decode_e4m3(q[i])*s[(i/cols)*scale_cols+(scale_cols==1?0:(i%cols)/128)]);
 }
 Tensor fp8_decode(Tensor q, Tensor s) {
   TORCH_CHECK(q.is_cuda() && q.scalar_type()==at::kByte && q.dim()==2 && q.is_contiguous(),"FP8 codes must be contiguous CUDA uint8 matrix");
-  TORCH_CHECK(s.is_cuda() && s.device()==q.device() && s.scalar_type()==at::kFloat && s.numel()==q.size(0) && s.is_contiguous(),"Invalid FP8 row scales");
+  TORCH_CHECK(s.is_cuda() && s.device()==q.device() && s.scalar_type()==at::kFloat && (s.dim()==1?s.numel()==q.size(0):(s.dim()==2&&s.size(0)==q.size(0)&&s.size(1)==(q.size(1)+127)/128)) && s.is_contiguous(),"Invalid FP8 row scales");
   c10::cuda::CUDAGuard guard(q.device());
   auto y=at::empty(q.sizes(),q.options().dtype(at::kBFloat16));
   if(q.numel()) {
-    dequant<<<std::min<int64_t>(65535,(q.numel()+255)/256),256,0,at::cuda::getCurrentCUDAStream()>>>(q.data_ptr<unsigned char>(),s.data_ptr<float>(),reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()),q.numel(),q.size(1));
+    dequant<<<std::min<int64_t>(65535,(q.numel()+255)/256),256,0,at::cuda::getCurrentCUDAStream()>>>(q.data_ptr<unsigned char>(),s.data_ptr<float>(),reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()),q.numel(),q.size(1),s.dim()==1?1:s.size(1));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
   return y;

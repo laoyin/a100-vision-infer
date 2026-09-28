@@ -6,7 +6,7 @@ import numpy as np
 from format_utils import image_geometry, rope_positions
 
 def main():
-    p=argparse.ArgumentParser(description=__doc__); p.add_argument('--out',type=Path,required=True); a=p.parse_args()
+    p=argparse.ArgumentParser(description=__doc__); p.add_argument('--out',type=Path,required=True); p.add_argument('--block-fp8',action='store_true'); a=p.parse_args()
     import torch
     from transformers import Qwen3_5Config,Qwen3_5ForConditionalGeneration
     torch.manual_seed(42)
@@ -24,9 +24,30 @@ def main():
                        'deepstack_visual_indexes':[]},
         image_token_id=250,video_token_id=249,vision_start_token_id=251,vision_end_token_id=252,
         tie_word_embeddings=False)
+    if a.block_fp8:
+        cfg.text_config.hidden_size=256;cfg.text_config.intermediate_size=512
+        cfg.text_config.head_dim=128;cfg.text_config.linear_key_head_dim=128;cfg.text_config.linear_value_head_dim=128
+        cfg.vision_config.out_hidden_size=256
     a.out.mkdir(parents=True,exist_ok=False)
     model=Qwen3_5ForConditionalGeneration(cfg).to(torch.bfloat16).eval()
     model.save_pretrained(a.out/'model',safe_serialization=True)
+    if a.block_fp8:
+        from safetensors.torch import save_file
+        state=model.state_dict();converted={};excluded=[]
+        for name,tensor in state.items():
+            quantize=name.startswith('model.language_model.layers.') and tensor.ndim==2 and name.endswith('.weight') and not name.endswith(('.in_proj_a.weight','.in_proj_b.weight'))
+            if not quantize:
+                converted[name]=tensor.contiguous()
+                if name.endswith('.weight'):excluded.append(name[:-7])
+                continue
+            n,k=tensor.shape;scales=torch.empty(((n+127)//128,(k+127)//128),dtype=torch.float32);codes=torch.empty_like(tensor,dtype=torch.float8_e4m3fn)
+            for row in range(0,n,128):
+                for col in range(0,k,128):
+                    block=tensor[row:row+128,col:col+128].float();scale=block.abs().max().clamp_min(1e-12)/448
+                    scales[row//128,col//128]=scale;codes[row:row+128,col:col+128]=(block/scale).to(torch.float8_e4m3fn)
+            converted[name]=codes;converted[name[:-7]+'.weight_scale_inv']=scales
+        save_file(converted,a.out/'model/model.safetensors',metadata={'format':'pt'})
+        cp=a.out/'model/config.json';config=json.loads(cp.read_text());config['quantization_config']={'quant_method':'fp8','fmt':'e4m3','weight_block_size':[128,128],'activation_scheme':'dynamic','modules_to_not_convert':excluded};cp.write_text(json.dumps(config,indent=2))
     request_dir=a.out/'request'; request_dir.mkdir()
     def write(name,x,dtype):
         (request_dir/(name+'.bin')).write_bytes(x.tobytes())

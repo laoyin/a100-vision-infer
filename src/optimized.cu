@@ -14,19 +14,19 @@ __device__ float warp_sum(float x){for(int d=16;d;d/=2)x+=__shfl_down_sync(0xfff
 __device__ float warp_max(float x){for(int d=16;d;d/=2)x=fmaxf(x,__shfl_down_sync(0xffffffff,x,d));return x;}
 __device__ float block_sum(float x){__shared__ float buf[8];int lane=threadIdx.x%32,w=threadIdx.x/32;x=warp_sum(x);if(!lane)buf[w]=x;__syncthreads();x=threadIdx.x<8?buf[lane]:0;x=warp_sum(x);if(!threadIdx.x)buf[0]=x;__syncthreads();return buf[0];}
 __device__ float block_max(float x){__shared__ float buf[8];int lane=threadIdx.x%32,w=threadIdx.x/32;x=warp_max(x);if(!lane)buf[w]=x;__syncthreads();x=threadIdx.x<8?buf[lane]:-INFINITY;x=warp_max(x);if(!threadIdx.x)buf[0]=x;__syncthreads();return buf[0];}
-__global__ void gemv(const bf* x,const unsigned char* w,const float* scale,bf* y,int N,int K){
+__global__ void gemv(const bf* x,const unsigned char* w,const float* scale,bf* y,int N,int K,int S){
  int row=blockIdx.x*8+threadIdx.x/32,lane=threadIdx.x%32,batch=blockIdx.y;float sum=0;
- if(row<N){for(int k=lane;k<K;k+=32){float weight=__bfloat162float(__float2bfloat16_rn(fp8(w[row*K+k])*scale[row]));sum+=__bfloat162float(x[batch*K+k])*weight;}sum=warp_sum(sum);if(!lane)y[batch*N+row]=__float2bfloat16_rn(sum);}
+ if(row<N){for(int k=lane;k<K;k+=32){float weight=__bfloat162float(__float2bfloat16_rn(fp8(w[row*K+k])*scale[row*S+(S==1?0:k/128)]));sum+=__bfloat162float(x[batch*K+k])*weight;}sum=warp_sum(sum);if(!lane)y[batch*N+row]=__float2bfloat16_rn(sum);}
 }
 // Four warps compute [16,64] output. FP8 is decoded only into shared BF16 tiles.
-__global__ void gemm(const bf* x,const unsigned char* w,const float* scale,bf* y,int M,int N,int K){
+__global__ void gemm(const bf* x,const unsigned char* w,const float* scale,bf* y,int M,int N,int K,int S){
  using namespace nvcuda;
  __shared__ __align__(32) bf a[16*16];__shared__ __align__(32) bf b[64*16];__shared__ __align__(32) float c[4*16*16];
  int warp=threadIdx.x/32,mi=blockIdx.y*16,ni=blockIdx.x*64;
  wmma::fragment<wmma::accumulator,16,16,16,float> acc;wmma::fill_fragment(acc,0.f);
  for(int base=0;base<K;base+=16){
   for(int i=threadIdx.x;i<256;i+=128){int r=i/16,k=i%16;a[i]=(mi+r<M&&base+k<K)?x[(mi+r)*K+base+k]:__float2bfloat16_rn(0);}
-  for(int i=threadIdx.x;i<1024;i+=128){int n=i/16,k=i%16;b[i]=(ni+n<N&&base+k<K)?__float2bfloat16_rn(fp8(w[(ni+n)*K+base+k])*scale[ni+n]):__float2bfloat16_rn(0);}
+  for(int i=threadIdx.x;i<1024;i+=128){int n=i/16,k=i%16;b[i]=(ni+n<N&&base+k<K)?__float2bfloat16_rn(fp8(w[(ni+n)*K+base+k])*scale[(ni+n)*S+(S==1?0:(base+k)/128)]):__float2bfloat16_rn(0);}
   __syncthreads();
   wmma::fragment<wmma::matrix_a,16,16,16,bf,wmma::row_major> af;
   wmma::fragment<wmma::matrix_b,16,16,16,bf,wmma::col_major> bfmat;
@@ -38,10 +38,10 @@ __global__ void gemm(const bf* x,const unsigned char* w,const float* scale,bf* y
 Tensor fp8_linear(Tensor x,Tensor w,Tensor s){
  TORCH_CHECK(x.is_cuda()&&x.scalar_type()==at::kBFloat16&&x.dim()==2&&x.is_contiguous(),"FP8 linear expects CUDA BF16 [M,K]");
  TORCH_CHECK(w.is_cuda()&&w.device()==x.device()&&w.scalar_type()==at::kByte&&w.dim()==2&&w.is_contiguous()&&x.size(1)==w.size(1),"Invalid FP8 weights");
- TORCH_CHECK(s.is_cuda()&&s.device()==x.device()&&s.scalar_type()==at::kFloat&&s.is_contiguous()&&s.numel()==w.size(0),"Invalid FP8 scales");
+ TORCH_CHECK(s.is_cuda()&&s.device()==x.device()&&s.scalar_type()==at::kFloat&&s.is_contiguous()&&(s.dim()==1?s.numel()==w.size(0):(s.dim()==2&&s.size(0)==w.size(0)&&s.size(1)==(w.size(1)+127)/128)),"Invalid FP8 scales");
  int M=x.size(0),N=w.size(0),K=w.size(1);TORCH_CHECK(M>0&&N>0&&K>0,"Empty GEMM");auto y=at::empty({M,N},x.options());auto stream=at::cuda::getCurrentCUDAStream();
- if(M<=8)gemv<<<dim3((N+7)/8,M),256,0,stream>>>(ptr(x),w.data_ptr<unsigned char>(),s.data_ptr<float>(),outptr(y),N,K);
- else gemm<<<dim3((N+63)/64,(M+15)/16),128,0,stream>>>(ptr(x),w.data_ptr<unsigned char>(),s.data_ptr<float>(),outptr(y),M,N,K);
+ if(M<=8)gemv<<<dim3((N+7)/8,M),256,0,stream>>>(ptr(x),w.data_ptr<unsigned char>(),s.data_ptr<float>(),outptr(y),N,K,s.dim()==1?1:s.size(1));
+ else gemm<<<dim3((N+63)/64,(M+15)/16),128,0,stream>>>(ptr(x),w.data_ptr<unsigned char>(),s.data_ptr<float>(),outptr(y),M,N,K,s.dim()==1?1:s.size(1));
  C10_CUDA_KERNEL_LAUNCH_CHECK();return y;
 }
 __global__ void rms(const bf* x,const bf* w,bf* y,int D,float eps,bool centered){int r=blockIdx.x;float s=0;for(int i=threadIdx.x;i<D;i+=256){float v=__bfloat162float(x[r*D+i]);s+=v*v;}float inv=rsqrtf(block_sum(s)/D+eps);for(int i=threadIdx.x;i<D;i+=256){float v=__bfloat162float(x[r*D+i])*inv,weight=__bfloat162float(w[i]);if(!centered)v=__bfloat162float(__float2bfloat16_rn(v));y[r*D+i]=__float2bfloat16_rn(v*(weight+(centered?1.f:0.f)));}}

@@ -27,13 +27,13 @@ AVI_GPUS=2,3 bash scripts/test-server.sh
 
 默认使用 GPU 2、3，需确认它们仍空闲；root 下自动设置 OpenMPI 环境变量。输出在 acceptance-* 目录，包含 acceptance.log、pip-freeze.txt、commit.txt 和小模型结果。构建前检查 nvcc 与 torch.version.cuda；如果仍为 12.8 与 13.0，会停止并报告差异，不修改环境。旧的 setup-cu128.sh 入口现仅做只读检查，不再安装任何包。
 
-小模型通过后测试完整合并 BF16 模型：
+小模型通过后测试已有 block-FP8 模型（128×128 E4M3FN）：
 
 ```bash
-HF_MODEL=/models/your-merged-bf16 TEST_IMAGE=/data/test.png AVI_GPUS=2,3 bash scripts/test-model.sh
+HF_MODEL=/models/your-fp8-model TEST_IMAGE=/data/test.png AVI_GPUS=2,3 bash scripts/test-model.sh
 ```
 
-会生成 BF16/FP8 两份原生权重，需充足磁盘空间。结果在 model-test-*。参考模型对照默认单 GPU，实际识图业务字段仍需人工核对。
+只导入一份 FP8 原生权重；不生成 BF16 模型包、不重新量化已有 FP8。脚本先重编译并跑新格式小模型，再执行实际模型的基线/优化/Graph 一致性测试，结果在 model-test-*。这不是独立 W8A8 参考对照，实际识图业务字段仍需与原服务核对。
 
 ## 服务器运行步骤
 
@@ -193,3 +193,15 @@ python tools/benchmark_http.py --body request-body.json --requests 20 --concurre
 2026-09-28：15 项 Python 单元/HTTP 接口测试、工具 AST 检查及纯 C++ JSON grammar 和显存预算测试，结果见 docs/implementation-status.md。加载器预期的 1184 个非 MTP 权重名称此前已与官方索引核对。CUDA 内核测试和服务器集成脚本已提供，尚未执行。源码和参考许可见 NOTICE。
 
 构建兼容说明：不再调用 CMake 3.24 才提供的 `--fresh`，最低配置版本为 3.18（CUDA sm_80 支持）。构建前仅重置 build/CMakeCache.txt 和 build/CMakeFiles；不会删除测试日志或模型。旧 CMake 对新 CUDA Toolkit 的具体兼容性仍以服务器配置结果为准。
+
+## 已有 HF block-FP8 权重导入
+
+`tools/import_fp8.py` 支持 quant_method=fp8、fmt=e4m3、activation_scheme=dynamic、weight_block_size=[128,128]。逐张量检查实际 float8_e4m3fn dtype，并读取同模块 `.weight_scale_inv`（作为反量化乘数）。缩放矩阵须为 [ceil(N/128),ceil(K/128)]；名称或格式不符会停止，不会猜测缩放含义。仅配置符合不代表实际 checkpoint 已验证。
+
+FP8 编码原样保留，scale 只沿输出行展开以便 TP 分片和融合，不做再次量化。非量化视觉层和 GDN a/b 投影继续保留 BF16/FP32。混合投影分开计算后拼接，不强制重新量化。CUDA 解码、GEMV、WMMA 支持每行每 128 输入列一个 scale。当前格式仍使用 avi-v1 元数据，但二维 scale 要求本次新版运行时，不能交给旧二进制。
+
+```bash
+python tools/import_fp8.py --model /models/your-fp8-model --out /models/avi-import-fp8-tp2 --tp 2
+```
+
+A100 路径保留 FP8 权重、使用 BF16 激活计算；不模拟配置中的动态激活 FP8 量化，结果可能与原 W8A8 运行时不同。新的测试只检查原生执行路径一致性，不能替代业务准确率比较。未新增任何安装依赖步骤。未实现该格式的独立原始运行时逐层对照。

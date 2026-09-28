@@ -15,7 +15,7 @@ def descriptor(root, desc):
     expected=math.prod(shape)*sizes[desc['dtype']]
     if not path.is_file() or path.stat().st_size!=expected:raise ValueError(f'Missing/truncated tensor: {relative}')
     if 'scale' in desc:
-        if desc['dtype']!='U8' or len(shape)!=2 or desc['scale']['shape']!=[shape[0]] or desc['scale']['dtype']!='F32':raise ValueError('Invalid quantization scale')
+        if desc['dtype']!='U8' or len(shape)!=2 or desc['scale']['shape'] not in ([shape[0]],[shape[0],(shape[1]+127)//128]) or desc['scale']['dtype']!='F32':raise ValueError('Invalid quantization scale')
         expected+=descriptor(root,desc['scale'])
     return expected
 

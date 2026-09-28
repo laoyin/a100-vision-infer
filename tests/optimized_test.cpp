@@ -10,6 +10,17 @@ void run_optimized_tests(){
   auto actual=avi::fp8_linear(x,codes,scales).to(at::kFloat);
   TORCH_CHECK(at::allclose(reference,actual,0.025,0.05),"FP8 GEMV/WMMA mismatch: M=",M," K=",K);
  }
+ // Original block-FP8 codes: independent per-column-block scale reference.
+ for(int M:{1,4,17}) {
+  int N=137,K=257;auto x=at::randn({M,K},opt).to(at::kBFloat16);
+  auto codes=at::randint(0,126,{N,K},opt.dtype(at::kByte));auto scales=at::rand({N,3},opt)*0.01+0.001;
+  auto unit=avi::fp8_decode(codes,at::ones({N},opt)).to(at::kFloat);
+  auto expanded=scales.repeat_interleave(128,1).narrow(1,0,K);
+  auto decoded=(unit*expanded).to(at::kBFloat16);
+  TORCH_CHECK(at::equal(avi::fp8_decode(codes,scales),decoded),"Block FP8 dequant mismatch");
+  auto expected=at::matmul(x,decoded.t()).to(at::kFloat);
+  TORCH_CHECK(at::allclose(avi::fp8_linear(x,codes,scales).to(at::kFloat),expected,0.025,0.05),"Block FP8 GEMV/WMMA mismatch");
+ }
  auto x=at::randn({3,512},opt).to(at::kBFloat16),w=at::randn({512},opt).to(at::kBFloat16);
  auto f=x.to(at::kFloat);auto expected=(f*at::rsqrt((f*f).mean(-1,true)+1e-6)*(1+w.to(at::kFloat))).to(at::kBFloat16);
  TORCH_CHECK(at::allclose(avi::fused_rms(x,w,1e-6,true).to(at::kFloat),expected.to(at::kFloat),0.02,0.02),"Fused RMS mismatch");

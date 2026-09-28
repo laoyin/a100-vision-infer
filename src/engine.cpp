@@ -69,7 +69,9 @@ Engine::Engine(const std::string& dir,int rank,int world,int device,ncclComm_t c
 void Engine::fuse_weights(const std::string& dest,const std::vector<std::string>& source) {
   std::vector<Tensor> data,scales;
   for(auto& name:source) {auto& w=weights_.at(name+".weight");data.push_back(w.data);if(w.scale.defined())scales.push_back(w.scale);}
-  TORCH_CHECK(scales.empty()||scales.size()==data.size(),"Cannot fuse mixed representations");
+  if(!scales.empty()&&(scales.size()!=data.size() || std::any_of(scales.begin(),scales.end(),[&](const Tensor& t){return t.dim()!=scales[0].dim() || (t.dim()==2&&t.size(1)!=scales[0].size(1));}))) {
+    mixed_projections_[dest]=source;return;
+  }
   Weight combined;combined.data=at::cat(data,0);if(!scales.empty())combined.scale=at::cat(scales,0);
   weights_.emplace(dest+".weight",combined);for(auto& name:source)weights_.erase(name+".weight");
 }
@@ -85,6 +87,8 @@ Tensor Engine::sum(Tensor x) {
   TORCH_CHECK(r==ncclSuccess,ncclGetErrorString(r)); return f.to(x.scalar_type());
 }
 Tensor Engine::linear(Tensor x,const std::string& name,bool reduce) {
+  auto mixed=mixed_projections_.find(name);
+  if(mixed!=mixed_projections_.end()){std::vector<Tensor> parts;for(auto& source:mixed->second)parts.push_back(linear(x,source,false));auto out=at::cat(parts,-1);return reduce?sum(out):out;}
   auto it=weights_.find(name+".weight"); TORCH_CHECK(it!=weights_.end(),"Missing linear ",name);
   auto& w=it->second; Tensor y;
   TORCH_CHECK(w.data.dim()>=2,"Invalid matrix ",name);

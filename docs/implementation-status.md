@@ -11,3 +11,5 @@
 剩余主要功能：分页共享 KV、量化 KV、多请求 CUDA Graph、增量公共前缀、多卡通信重叠、并行 GDN prefill、MTP、JSON Schema。视频/MoE/Responses/Anthropic 接口不在当前已实现范围。
 
 没有 CUDA 主引擎编译通过记录，也没有任何实测加速或显存峰值数据。准入预算的 workspace 参数必须结合服务器实测，不能作为永不 OOM 保证。主存恢复为阻塞复制，尚未优化传输重叠。
+
+用户服务器已通过旧格式小模型验收（包括 TP2、Graph 和主存缓存）。本次新增 HF 128×128 block-FP8 导入、块缩放 CUDA 和混合投影：本地 NumPy TP 分片测试通过；尚未在服务器验证新格式。test-model.sh 已改为仅处理已有 FP8，不再生成 BF16 模型包。
