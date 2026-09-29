@@ -4,6 +4,9 @@
 
 当前主要验证配置为 2 × A100-SXM4-80GB、TP=2、E4M3FN block-FP8（128 × 128）。权重保持 FP8，激活及 Tensor Core 计算使用 BF16，Gated DeltaNet recurrent state 使用 FP32。
 
+> 📘 **交互式学习站点（GitHub Pages）**：<https://laoyin.github.io/a100-vision-infer/>
+> 10 个可在浏览器直接打开的交互可视化页面，逐课讲透本引擎的核心机制；源码位于 [`learning/`](learning/)，推送后由 GitHub Actions 自动部署。
+
 ## 优化目标
 
 A100 没有新架构上的原生 FP8 Tensor Core 路径。本项目保留 FP8 压缩权重和 scale，按矩阵形状选择 BF16 Tensor Core、CUDA GEMV 或 cuBLAS，重点减少权重带宽、kernel launch、KV 复制和跨卡通信。
@@ -108,6 +111,23 @@ AVI_GPUS=2,3 bash scripts/test-optimizations.sh
 - KV cache 量化和跨节点 Tensor Parallel。
 
 这些优化需要新的状态布局或独立数值验收，在没有 A100 实测数据前不会标记为已完成。
+
+## 交互式学习站点
+
+配套的可交互教学站点已部署到 GitHub Pages：<https://laoyin.github.io/a100-vision-infer/>。共 10 课，全部为自包含静态 HTML，无需服务器或联网；也可在本地直接打开 [`learning/index.html`](learning/index.html)：
+
+1. [数据流](https://laoyin.github.io/a100-vision-infer/01-transformer-flow.html) —— 一次请求如何变成一串 token
+2. [注意力](https://laoyin.github.io/a100-vision-infer/02-attention.html) —— QKV、softmax 与因果掩码
+3. [KV Cache](https://laoyin.github.io/a100-vision-infer/03-kv-cache.html) —— 为什么 decode 是访存瓶颈
+4. [RoPE / mRoPE](https://laoyin.github.io/a100-vision-infer/04-rope.html) —— 旋转位置编码与多模态扩展
+5. [推理与采样](https://laoyin.github.io/a100-vision-infer/05-inference.html) —— prefill / decode 与贪心、温度采样
+6. [张量并行](https://laoyin.github.io/a100-vision-infer/06-tensor-parallel.html) —— head 分片与 NCCL AllReduce
+7. [FP8 量化](https://laoyin.github.io/a100-vision-infer/07-quantization.html) —— E4M3FN block-FP8 与 scale
+8. [算子优化](https://laoyin.github.io/a100-vision-infer/08-optimized-cu.html) —— GEMV / WMMA / 融合 kernel
+9. [混合注意力](https://laoyin.github.io/a100-vision-infer/09-hybrid-attention.html) —— Gated DeltaNet 线性注意力 + full attention
+10. [投机解码](https://laoyin.github.io/a100-vision-infer/10-speculative.html) —— MTP 草稿、贪心验证与状态回滚
+
+修改 `learning/` 下任意文件并推送到 `main`，[.github/workflows/pages.yml](.github/workflows/pages.yml) 会自动重新发布站点。
 
 ## 说明
 
