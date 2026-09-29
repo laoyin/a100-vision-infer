@@ -98,6 +98,8 @@ AVI_GPUS=2,3 bash scripts/test-optimizations.sh
 
 ## 尚未实现
 
+已增加复用现有 vLLM 的 MTP A/B 实验入口，检查原始 checkpoint 的 MTP 权重并对比关闭/MTP1/MTP2/MTP3。见 [开源复用与测试](docs/speculative-reuse.md)。该入口直接运行上游实现，尚未接入本项目原生 C++ 引擎。
+
 - Gated DeltaNet chunk-parallel prefill。
 - Paged KV cache 与公共前缀分页复用。
 - MTP/speculative decoding。
