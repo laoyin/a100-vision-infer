@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>⑩ 投机解码 · AVI 学习地图</title>
+<link rel="stylesheet" href="assets/style.css">
+<style>
+  .cmp{display:flex;flex-direction:column;gap:8px;margin:10px 0}
+  .cmp .ln{display:grid;grid-template-columns:104px 1fr 120px;gap:10px;align-items:center;font-size:12.5px}
+  .cmp .nm{color:var(--muted);font-family:var(--mono);text-align:right}
+  .cmp .track2{height:22px;border-radius:6px;background:#0a0f1e;border:1px solid var(--border);overflow:hidden}
+  .cmp .track2 i{display:block;height:100%;transition:width .25s}
+  .cmp .track2 i.f{background:linear-gradient(90deg,#b388ff,#6a52a0)}
+  .cmp .track2 i.l{background:linear-gradient(90deg,#4ade80,#2c6b52)}
+  .cmp .vv{font-family:var(--mono);color:#9fd8ff}
+  .tokrow{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0;min-height:30px;align-items:center}
+  .tokrow .lab{width:96px;font-family:var(--mono);font-size:11.5px;color:var(--muted);text-align:right}
+  .tok{font-family:var(--mono);font-size:11px;border:1px solid var(--border);border-radius:7px;padding:4px 8px;background:#0a0f1e;color:#cfe9ff;transition:.2s}
+  .tok.match{background:#0f2a1c;border-color:#2c6b52;color:#8fe0b0}
+  .tok.miss{background:#2a1414;border-color:#7a3030;color:#ff9b9b}
+  .tok.bonus{background:#2a2333;border-color:#6a52a0;color:#d8c8ff}
+  .tok.muted{opacity:.42}
+  .pipe2{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0}
+  .stp{flex:1 1 116px;background:#0d1426;border:1px solid var(--border);border-radius:10px;padding:9px 10px;cursor:pointer;transition:.15s}
+  .stp:hover{border-color:var(--accent)}
+  .stp.on{border-color:var(--accent);background:#12233f;box-shadow:0 0 0 1px var(--accent) inset}
+  .stp .no{font-family:var(--mono);font-size:10px;color:var(--accent)}
+  .stp .nm2{font-size:12.5px;color:#cfe9ff;margin-top:3px}
+  .stat{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:8px 0}
+  @media(max-width:820px){.stat{grid-template-columns:repeat(2,1fr)}}
+  .stat .b{background:#0d1426;border:1px solid var(--border);border-radius:10px;padding:8px 10px}
+  .stat .b .k{font-size:11px;color:var(--muted)}
+  .stat .b .v{font-family:var(--mono);font-size:18px;color:#cfe9ff}
+  .band{background:#0d1426;border:1px solid var(--border);border-radius:10px;padding:10px 12px;margin:10px 0;font-size:13.5px}
+  .log{font-family:var(--mono);font-size:12px;background:#0a0f1e;border:1px solid var(--border);border-radius:8px;padding:8px 10px;color:#9fd8ff;margin:8px 0;line-height:1.8}
+  .log .hl{color:var(--accent2)}
+</style>
+</head>
+<body>
+<nav class="top"><div class="inner">
+  <span class="brand">AVI 学习地图</span>
+  <a href="index.html">总览</a>
+  <a href="01-transformer-flow.html">① 数据流</a>
+  <a href="02-attention.html">② 注意力</a>
+  <a href="03-kv-cache.html">③ KV Cache</a>
+  <a href="04-rope.html">④ RoPE</a>
+  <a href="05-inference.html">⑤ 推理与采样</a>
+  <a href="06-tensor-parallel.html">⑥ 张量并行</a>
+  <a href="07-quantization.html">⑦ 量化</a>
+  <a href="08-optimized-cu.html">⑧ 算子</a>
+  <a href="09-hybrid-attention.html">⑨ 混合注意力</a>
+  <a class="active" href="10-speculative.html">⑩ 投机解码</a>
+</div></nav>
+
+<div class="wrap">
+  <h1>⑩ 投机解码：让一次前向，吐出好几个 token</h1>
+  <p class="lead">Decode 阶段每个 token 都要把<b>整份权重读一遍</b>，典型“访存受限”。投机解码（Speculative Decoding）的思路是：先用一个<b>又小又快</b>的草稿模型一次猜出好几个 token，再让<b>目标模型一趟并行验证</b>——猜对的全收，白赚的那一个也收下。本项目的草稿模型就是 <b>MTP（Multi-Token Prediction）单层头</b>。</p>
+
+  <h2>为什么能加速？</h2>
+  <p>普通 decode：<code>1 次前向 = 1 个 token</code>。投机查询：<code>1 次前向 = 最多 K+1 个 token</code>。因为读权重只读了一遍，多算几个 token 的边际成本很低。拖动下面的“窗口 K”看差距（假设全部命中）：</p>
+  <div class="card">
+    <div class="ctrl" style="display:flex;align-items:center;gap:12px;margin:8px 0;flex-wrap:wrap">
+      <label style="margin:0;width:auto;color:var(--text);font-size:13px">投机窗口 K</label>
+      <input type="range" id="kEl2" min="1" max="5" step="1" value="3" style="flex:1;min-width:160px;max-width:320px">
+      <span class="pill acc" id="kVal2" style="font-family:var(--mono)">3</span>
+    </div>
+    <div class="cmp">
+      <div class="ln"><div class="nm">朴素 decode</div><div class="track2"><i class="f" id="barN"></i></div><div class="vv" id="cN">—</div></div>
+      <div class="ln"><div class="nm">投机一轮</div><div class="track2"><i class="l" id="barS"></i></div><div class="vv" id="cS">—</div></div>
+    </div>
+    <p class="muted" id="kNote" style="margin:4px 0"></p>
+    <div class="filetip">要产出 <b>K+1</b> 个 token，朴素 decode 需要 <b>K+1</b> 次前向；投机只需 <b>1</b> 次（外加 K 次单层 MTP）。窗口上限由 <code>--mtp-tokens</code> 控制，取值 <b>0..5</b>；<code>0</code> 即关闭。</div>
+  </div>
+
+  <h2>一轮到底发生什么（可交互仿真）</h2>
+  <p>下面严格按 <code>speculative.cpp</code> 的贪心验证逻辑演练一轮：草稿先猜 K 个，目标模型一趟算出各自的“真值”，然后<b>从前往后逐位比对，第一个不一致处就停</b>，并且额外把那个“让步 token”也收下。点“演练一轮”：</p>
+  <div class="card">
+    <div class="ctrl" style="display:flex;align-items:center;gap:14px;margin:8px 0;flex-wrap:wrap">
+      <label style="margin:0;width:auto;color:var(--text);font-size:13px">窗口 K</label>
+      <input type="range" id="kEl" min="1" max="5" step="1" value="3" style="width:150px">
+      <span class="pill acc" id="kVal" style="font-family:var(--mono)">3</span>
+      <label style="margin:0;width:auto;color:var(--text);font-size:13px">命中率 p</label>
+      <input type="range" id="pEl" min="0" max="1" step="0.05" value="0.7" style="width:150px">
+      <span class="pill acc" id="pVal" style="font-family:var(--mono)">0.70</span>
+    </div>
+    <div class="row">
+      <button id="runBtn" class="primary small">演练一轮 ▶</button>
+      <button id="autoBtn" class="small">▶ 自动</button>
+      <button id="resetBtn" class="small">↺ 重置统计</button>
+      <span class="pill" id="roundPill">第 0 轮</span>
+    </div>
+
+    <div class="tokrow"><span class="lab">草稿提案</span><span id="propRow"></span></div>
+    <div class="tokrow"><span class="lab">目标真值</span><span id="tgtRow"></span></div>
+    <p class="muted" id="roundNote" style="margin:6px 0;font-size:12.5px">点“演练一轮”开始。绿=命中，红=首个失配（被拒），紫=白赚的让步 token，灰=未轮到。</p>
+
+    <div class="stat">
+      <div class="b"><div class="k">轮数 rounds</div><div class="v" id="sRounds">0</div></div>
+      <div class="b"><div class="k">草稿提案 proposed</div><div class="v" id="sProp">0</div></div>
+      <div class="b"><div class="k">命中 accepted</div><div class="v" id="sAcc">0</div></div>
+      <div class="b"><div class="k">平均 token/前向</div><div class="v" id="sTpf">—</div></div>
+    </div>
+    <div class="log" id="logEl">每轮：<code>committed = accepted + 1</code>。这个 +1 就是“无论草稿对不对，目标模型那一步总会多给出一个正确 token”。</div>
+    <div class="filetip">这就是 <code>include/avi/speculative.h · GreedyVerification::committed_inputs()</code> 返回的 <code>accepted+1</code>；命中率 = <code>accepted / proposed</code>，也是 worker 里 <code>mtp_stats</code> 事件上报的 <code>accepted/proposed</code>。</div>
+  </div>
+
+  <h2>关键点 1：草稿模型长什么样</h2>
+  <p>草稿不是另训一个大模型，而是目标模型自带的 <b>MTP 头</b>（配置 <code>mtp_num_hidden_layers=1</code>、共享 embedding）。它把“<b>下一个 token 的 embedding</b>”和“<b>上一层已验证的 hidden</b>”拼起来，过一层 full_attention + SwiGLU，就猜出下一个 token：</p>
+  <div class="card tight">
+    <pre><code>// src/speculative.cpp · mtp_step()
+auto x = linear(at::cat({ norm(embeddings, "mtp.pre_fc_norm_embedding"),
+                          norm(hidden,      "mtp.pre_fc_norm_hidden") }, -1),
+                "mtp.fc");                                    // 拼接 + 融合投影
+x = x + full_attention(norm(x, "mtp.layers.0.input_layernorm"),
+                       positions, 0, "mtp.layers.0.self_attn", {}, true,
+                       &drafts_[active_].state);               // 单层注意力
+auto n = norm(x, "mtp.layers.0.post_attention_layernorm");
+x = x + linear(at::silu(gate) * up, "mtp.layers.0.mlp.down_proj", true); // SwiGLU
+return norm(x, "mtp.norm");</code></pre>
+    <div class="filetip">因为它只有 <b>1 层</b>，非常轻，所以适合用 <b>CUDA Graph</b> 固化：<code>--mtp-draft-graph</code> 会先热身 2 次再 capture，之后每步 <code>replay()</code>。前提是窗口 <code>--mtp-tokens&gt;0</code>。</div>
+  </div>
+
+  <h2>关键点 2：目标模型怎么“一趟验证”</h2>
+  <p>把「草稿已确认的前缀 + 全部提案」拼成一段（长度 <code>1+count</code>），让目标模型<b>一次前向</b>算完，再逐位比对：</p>
+  <div class="card tight">
+    <pre><code>// src/speculative.cpp · speculate()（核心几行）
+int count = std::min(options_.mtp_tokens, budget - 1);   // 最多猜几个
+std::vector&lt;int64_t&gt; inputs{pending}, proposals;
+auto hidden = previous;
+for (int i = 0; i &lt; count; ++i) {
+  hidden = draft_one(inputs.back(), position + i, hidden);        // 单层 MTP 猜一个
+  int64_t token = gather_candidates(local_candidates(hidden))[0];
+  proposals.push_back(token); inputs.push_back(token);
+  if (命中 eos) break;
+}
+verifying_ = true;
+auto target_hidden = step(embeddings, positions);                 // ← 目标模型一趟并行验证
+GreedyVerification decision(proposals, budget, eos);
+for (int i = 0; !decision.done; ++i)
+  decision.observe(select ? select(values.narrow(0, i, 1))
+                          : choices.at(i));
+int committed = decision.committed_inputs();                      // = 命中数 + 1</code></pre>
+    <div class="filetip">验证是<b>贪心</b>的：<code>verifying.h</code> 里 <code>observe()</code> 只要发现 <code>target != proposals[i]</code> 就 <code>done=true</code> 立刻停。<b>因此要求 <code>temperature=0</code></b>——需要随机采样时 worker 会直接报错，改用非 MTP 的 worker。</div>
+  </div>
+
+  <h2>关键点 3：猜错了怎么“回滚”</h2>
+  <p>验证时目标模型把 <code>1+count</code> 个位置都算了一遍，KV Cache 和线性注意力的递归状态里混进了<b>“尚未确认的未来”</b>。一旦某位被拒，必须把状态回退到“已确认前缀”：</p>
+  <div class="card tight">
+    <pre><code>// src/speculative.cpp · 回滚被拒绝的未来
+for (size_t layer = 0; layer &lt; states_.size(); ++layer) {
+  auto&amp; state = states_[layer];
+  if (state.key.defined())                                        // 全注意力层：
+    state.length = consumed + committed;                          //   把 KV 截断到已确认长度
+  if (state.recurrent.defined()) {                                // 线性注意力层（Gated DeltaNet）：
+    state.recurrent.copy_(verify_recurrent_[layer].select(0, committed - 1));
+    state.conv.copy_(verify_conv_[layer].narrow(-1, committed, state.conv.size(-1)));
+  }
+}
+draft.state.length = draft_old;   // 丢弃草稿的“假设 KV”，用已验证的 hidden 重建</code></pre>
+    <div class="filetip">线性注意力层没有 KV 可以“截断”，只能靠验证时同步保存的 <code>verify_recurrent_ / verify_conv_</code> 快照恢复到第 <code>committed</code> 步。这套“投机 + GDN 回滚”在 <a href="08-optimized-cu.html">第 8 课</a>对应的 <code>optimized_test.cpp</code> 里有专门断言（<code>GDN accepted-prefix state</code>）。</div>
+  </div>
+
+  <h2>把它串起来：一轮的六步</h2>
+  <p>点每一步看它做了什么：</p>
+  <div class="card">
+    <div class="pipe2" id="pipe2"></div>
+    <div class="band" id="stInfo">点上面任意一步查看它做了什么。</div>
+  </div>
+
+  <h2>工程约束与开关</h2>
+  <div class="grid g2">
+    <div class="card tight">
+      <h3>必须满足的前置条件</h3>
+      <p class="muted">需 <code>--optimized</code>；产物要用 <code>--include-mtp</code> 导入；<code>mtp_num_hidden_layers=1</code> 且共享 embedding；开启投机时 <b>前缀缓存被强制关闭</b>（<code>prefix_cache_bytes=0</code>）；与 <code>--cuda-graph</code>（目标图）互斥。</p>
+      <div class="filetip">src/engine.cpp · 启动校验</div>
+    </div>
+    <div class="card tight">
+      <h3>常用命令行开关</h3>
+      <p class="muted"><code>--mtp-tokens N</code>（窗口 0..5）、<code>--mtp-draft-graph</code>（草稿用 CUDA Graph）、<code>--tp-lm-head</code>（把输出头按 TP 分片，验证时 <b>AllGather 求全局 argmax</b>）。</p>
+      <div class="filetip">tools/serve.py · src/worker.cpp</div>
+    </div>
+    <div class="card tight">
+      <h3>只支持贪心</h3>
+      <p class="muted">原生 MTP 只做贪心验证。若请求带温度（<code>temperature≠0</code>），worker 直接返回错误，提示改用非 MTP worker 做随机采样。</p>
+      <div class="filetip">src/worker.cpp</div>
+    </div>
+    <div class="card tight">
+      <h3>怎么看效果</h3>
+      <p class="muted">worker 每轮结束发 <code>mtp_stats</code> 事件：<code>window / rounds / proposed / accepted</code>。命中率 <code>accepted/proposed</code> 越高，收益越大。</p>
+      <div class="filetip">src/worker.cpp · emit(mtp_stats)</div>
+    </div>
+  </div>
+
+  <div class="note"><b>一句话抓住：</b>投机解码 = “<b>用小模型批量猜，用大模型一趟判</b>”。本项目的特别之处在于：草稿是目标模型自带的 <b>单层 MTP</b>；验证时一定要把被拒的未来从 <b>KV Cache 与线性注意力递归状态</b>里干净地回滚掉——这也是它与普通 Transformer 投机解码最大的不同。项目本身仍是实验版，收益以实测为准。</div>
+</div>
+
+<script>
+// ================= §1 窗口收益对比 =================
+const kEl2=document.getElementById("kEl2");
+function speedup(){
+  const K=+kEl2.value;
+  document.getElementById("kVal2").textContent=K;
+  const naive=K+1, spec=1;                 // 产出 K+1 个 token
+  const mx=Math.max(naive,spec);
+  document.getElementById("barN").style.width=(naive/mx*100)+"%";
+  document.getElementById("barS").style.width=(spec/mx*100)+"%";
+  document.getElementById("cN").textContent=naive+" 次前向";
+  document.getElementById("cS").textContent=spec+" 次前向";
+  document.getElementById("kNote").innerHTML=
+    `理想情况下，产出 <b style="color:#fbbf24">${K+1}</b> 个 token，前向次数从 <b>${naive}</b> 降到 <b style="color:#4ade80">1</b>（外加快捷的 ${K} 次单层草稿）。`;
+}
+kEl2.oninput=speedup;
+
+// ================= §2 一轮仿真（复刻 GreedyVerification） =================
+const kEl=document.getElementById("kEl"), pEl=document.getElementById("pEl");
+const kVal=document.getElementById("kVal"), pVal=document.getElementById("pVal");
+const propRow=document.getElementById("propRow"), tgtRow=document.getElementById("tgtRow");
+const roundNote=document.getElementById("roundNote"), roundPill=document.getElementById("roundPill");
+const logEl=document.getElementById("logEl");
+const sRounds=document.getElementById("sRounds"), sProp=document.getElementById("sProp"),
+      sAcc=document.getElementById("sAcc"), sTpf=document.getElementById("sTpf");
+let agg={rounds:0,proposed:0,accepted:0,committed:0};
+function syncLabels(){ kVal.textContent=kEl.value; pVal.textContent=(+pEl.value).toFixed(2); }
+function randTok(){ return 1+Math.floor(Math.random()*9000); }
+function chip(txt,cls){ const s=document.createElement("span"); s.className="tok "+(cls||""); s.textContent=txt; return s; }
+function renderStats(){
+  sRounds.textContent=agg.rounds; sProp.textContent=agg.proposed; sAcc.textContent=agg.accepted;
+  sTpf.textContent=agg.rounds?(agg.committed/agg.rounds).toFixed(2):"—";
+}
+function oneRound(){
+  syncLabels();
+  const K=+kEl.value, p=+pEl.value;
+  const proposals=[]; for(let i=0;i<K;i++) proposals.push(randTok());
+  // 命中的前缀长度 m：逐位以概率 p 命中，直到首次失配
+  let m=0; for(let i=0;i<K;i++){ if(Math.random()<p) m++; else break; }
+  const target=[]; for(let i=0;i<m;i++) target.push(proposals[i]);
+  if(m<K){ let t; do{ t=randTok(); }while(t===proposals[m]); target.push(t); }
+  else { target.push(randTok()); }        // 全命中：多一个“让步 token”
+  const accepted=m, committed=m+1;
+  agg.rounds++; agg.proposed+=K; agg.accepted+=accepted; agg.committed+=committed;
+  renderStats();
+  roundPill.textContent="第 "+agg.rounds+" 轮";
+  // 渲染两行对齐
+  propRow.innerHTML=""; tgtRow.innerHTML="";
+  const cols=Math.max(K, committed);
+  for(let i=0;i<cols;i++){
+    const pv=i<K?proposals[i]:null, tv=i<target.length?target[i]:null;
+    let pCls="", tCls="";
+    if(i<m){ pCls="match"; tCls="match"; }
+    else if(i===m){ if(m<K){ pCls="miss"; tCls="miss"; } else { pCls="muted"; tCls="bonus"; } }
+    else { pCls="muted"; tCls="muted"; }
+    propRow.appendChild(pv==null?chip("·","muted"):chip("#"+pv,pCls));
+    tgtRow.appendChild(tv==null?chip("·","muted"):chip("#"+tv,tCls));
+  }
+  roundNote.innerHTML=`本轮窗口 <b>K=${K}</b>，草稿猜了 ${K} 个；命中 <b style="color:#4ade80">${accepted}</b> 个。`
+    + (m<K?`第 ${m} 位被拒（红）。`:`全部命中，末位是白赚的让步 token（紫）。`)
+    + ` → committed = accepted + 1 = <b style="color:#cfe9ff">${committed}</b> 个 token。`;
+  let lines=[];
+  for(let i=0;i<m;i++) lines.push(`observe(草稿 #${i}) → <span class="hl">命中</span> ✓　accepted=${i+1}`);
+  if(m<K) lines.push(`observe(位置 ${m}) → <span style="color:#ff9b9b">失配</span> ✗　done = true`);
+  else lines.push(`observe(位置 ${m}) → <span class="hl">BONUS</span>（草稿没猜，目标白送）`);
+  lines.push(`committed_inputs() = accepted + 1 = <span class="hl">${committed}</span>　→ 本轮输出 ${committed} 个 token`);
+  logEl.innerHTML=lines.join("<br>");
+}
+let autoTimer=null;
+document.getElementById("runBtn").onclick=oneRound;
+document.getElementById("resetBtn").onclick=()=>{
+  clearInterval(autoTimer); autoTimer=null; document.getElementById("autoBtn").textContent="▶ 自动";
+  agg={rounds:0,proposed:0,accepted:0,committed:0}; renderStats();
+  propRow.innerHTML=""; tgtRow.innerHTML=""; roundPill.textContent="第 0 轮";
+  roundNote.textContent="统计已重置。点“演练一轮”重新开始。";
+  logEl.innerHTML="committed = accepted + 1。";
+};
+document.getElementById("autoBtn").onclick=function(){
+  if(autoTimer){ clearInterval(autoTimer); autoTimer=null; this.textContent="▶ 自动"; return; }
+  this.textContent="⏸ 暂停";
+  autoTimer=setInterval(oneRound,1000);
+};
+kEl.oninput=syncLabels; pEl.oninput=syncLabels;
+
+// ================= §3 六步流水线 =================
+const STEPS=[
+  {nm:"草稿 draft_one", d:"用单层 MTP 连猜 <code>count = min(mtp_tokens, budget-1)</code> 个 token；每一步都可以用 CUDA Graph 固化成一次 <code>replay()</code>。"},
+  {nm:"取候选 gather",  d:"对草稿 hidden 过 <code>lm_head</code> 取 argmax。开了 <code>--tp-lm-head</code> 时，各 rank 只算自己那片词表，再用 <b>NCCL AllGather</b> 拼出全局最大，保证与目标一致。"},
+  {nm:"目标验证 step",  d:"把 <code>[pending] + proposals</code> 拼成 <code>1+count</code> 个位置，目标模型<b>一次前向</b>全算完（mRoPE 位置按 3 轴重复）。"},
+  {nm:"贪心比对 observe", d:"<code>GreedyVerification</code> 逐位比较：<code>target==proposals[i]</code> 记一次 accepted，首个不等即 <code>done</code>。"},
+  {nm:"回滚 rollback",  d:"全注意力层把 KV 截断到 <code>consumed+committed</code>；线性注意力层用验证时保存的快照恢复递归状态。"},
+  {nm:"重建草稿 state", d:"丢弃草稿的“假设 KV”（<code>draft.state.length=draft_old</code>），用<b>已验证</b>的目标 hidden 走一步 MTP，作为下一轮的起点。"}
+];
+function buildPipe(){
+  const p=document.getElementById("pipe2"); p.innerHTML="";
+  STEPS.forEach((s,i)=>{
+    const d=document.createElement("div"); d.className="stp";
+    d.innerHTML=`<div class="no">STEP ${i+1}</div><div class="nm2">${s.nm}</div>`;
+    d.onclick=()=>{ document.querySelectorAll("#pipe2 .stp").forEach((e,k)=>e.classList.toggle("on",k===i));
+      document.getElementById("stInfo").innerHTML=`<b>${i+1}. ${s.nm}</b>　—— ${s.d}`; };
+    p.appendChild(d);
+  });
+}
+
+speedup(); syncLabels(); renderStats(); buildPipe(); oneRound();
+</script>
+</body>
+</html>

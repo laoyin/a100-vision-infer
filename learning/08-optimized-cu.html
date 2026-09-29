@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>⑧ 算子优化 · AVI 学习地图</title>
+<link rel="stylesheet" href="assets/style.css">
+<style>
+  .pipe{display:flex;flex-wrap:wrap;gap:8px;align-items:stretch;margin:12px 0}
+  .op{flex:1 1 150px;background:#0d1426;border:1px solid var(--border);border-radius:10px;padding:10px 12px}
+  .op .nm{font-family:var(--mono);font-size:13px;color:#cfe9ff}
+  .op .sub{font-size:11.5px;color:var(--muted);margin-top:6px}
+  .sub .stepk{display:block;color:#8fa8d0;font-family:var(--mono);font-size:11px;margin:2px 0;padding:2px 6px;
+    border:1px dashed var(--border);border-radius:6px}
+  .op.fused{border-color:#2c6b52;background:#0f2a1f}
+  .op.fused .nm{color:#8fe0b0}
+  .op.fused .sub{color:#9fe0b8}
+  .mem{display:flex;gap:10px;flex-wrap:wrap;margin:8px 0}
+  .memc{flex:1 1 130px;background:#0d1426;border:1px solid var(--border);border-radius:10px;padding:8px 12px}
+  .memc .n{font-size:20px;font-family:var(--mono);color:var(--accent)}
+  .memc .l{font-size:12px;color:var(--muted)}
+  .gvrow{display:grid;grid-template-columns:78px 1fr;gap:8px;align-items:center;margin:5px 0;font-size:11px;font-family:var(--mono)}
+  .gvrow .lab{color:var(--muted);text-align:right}
+  .gvbar{height:16px;border-radius:4px;border:1px solid var(--border);overflow:hidden;display:flex;background:#0a0f1e}
+  .gvbar i{flex:1;border-right:1px solid rgba(255,255,255,.06)} .gvbar i:last-child{border-right:none}
+  .gvbar.w0 i{background:linear-gradient(180deg,#1e3a63,#12233f);color:#bfe0ff}
+  .gvbar i.on{background:#2a4b7a}
+  .tile{display:grid;gap:1px;margin-top:8px}
+  .tile i{height:7px;border-radius:1px;background:#0a0f1e}
+  .tile i.w0{background:#1e3a63} .tile i.w1{background:#4a3a7a} .tile i.w2{background:#1e5a44} .tile i.w3{background:#6a521e}
+  .legend b.w0{background:#1e3a63} .legend b.w1{background:#4a3a7a} .legend b.w2{background:#1e5a44} .legend b.w3{background:#6a521e}
+  .state{display:flex;gap:5px;flex-wrap:wrap;margin:10px 0}
+  .cell{width:52px;border:1px solid var(--border);border-radius:8px;background:#0a0f1e;padding:6px 2px;text-align:center;transition:.25s}
+  .cell .v{font-family:var(--mono);font-size:12.5px;color:#9fd8ff}
+  .cell .k{font-size:9.5px;color:var(--muted);font-family:var(--mono)}
+  .cell.chg{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent) inset}
+  .steps{font-family:var(--mono);font-size:12px;background:#0a0f1e;border:1px solid var(--border);
+    border-radius:8px;padding:8px 10px;color:#9fd8ff;line-height:1.9;margin:8px 0}
+  .steps .hl{color:var(--accent2)}
+  button.sel{border-color:var(--accent);color:#fff;background:#12233f}
+</style>
+</head>
+<body>
+<nav class="top"><div class="inner">
+  <span class="brand">AVI 学习地图</span>
+  <a href="index.html">总览</a>
+  <a href="01-transformer-flow.html">① 数据流</a>
+  <a href="02-attention.html">② 注意力</a>
+  <a href="03-kv-cache.html">③ KV Cache</a>
+  <a href="04-rope.html">④ RoPE</a>
+  <a href="05-inference.html">⑤ 推理与采样</a>
+  <a href="06-tensor-parallel.html">⑥ 张量并行</a>
+  <a href="07-quantization.html">⑦ 量化</a>
+  <a class="active" href="08-optimized-cu.html">⑧ 算子</a>
+  <a href="09-hybrid-attention.html">⑨ 混合注意力</a>
+  <a href="10-speculative.html">⑩ 投机解码</a>
+</div></nav>
+
+<div class="wrap">
+  <h1>⑧ 算子优化：让 GPU 少跑空路</h1>
+  <p class="lead">前七课讲的是“算什么”。这一课讲“<b>怎么算得快</b>”。<code>src/optimized.cu</code> 里有三招：<b>算子融合</b>（一个 kernel 干完几步，省显存往返）、<b>GEMM 分派</b>（小 batch 用 <code>gemv</code>、大 batch 用 WMMA <code>gemm</code>）、<b>寄存器递归</b>（Gated DeltaNet 的状态全程留在寄存器里）。逐节点、逐节看。</p>
+
+  <h2>第一招 · 算子融合：省掉“写回显存再读出来”</h2>
+  <p>如果一个张量要连过好几步（求平方和 → 归一化 → 乘权重），每步都单独启动一个 kernel，就要把结果<b>写回显存再读出来</b>一遍。融合就是把这几步塞进<b>同一个 kernel</b>，中间结果只活在寄存器/共享内存里。切换下面开关，看 kernel 数量和显存往返怎么变：</p>
+  <div class="card">
+    <div class="row">
+      <button id="fusOn" class="small sel">融合 ON</button>
+      <button id="fusOff" class="small">融合 OFF</button>
+      <span class="pill" id="fusNote"></span>
+    </div>
+    <div class="pipe" id="pipe"></div>
+    <div class="mem">
+      <div class="memc"><div class="n" id="mk">—</div><div class="l">每个元素经历的 kernel 启动次数</div></div>
+      <div class="memc"><div class="n" id="mt">—</div><div class="l">显存往返（读+写）次数</div></div>
+      <div class="memc"><div class="n" id="ms">—</div><div class="l">可省下的比例</div></div>
+    </div>
+    <div class="filetip">对照函数：<code>fused_rms</code>（归一化+乘 weight）、<code>fused_swiglu</code>（silu(gate)×up）、<code>fused_rope</code>（cos/sin+配对旋转一次算完）、<code>conv_decode</code>（卷积+SiLU 一起做）。它们都在 <code>optimized.cu</code> 中。</div>
+  </div>
+
+  <h2>第二招 · GEMM 分派：按 batch 大小换算法</h2>
+  <p>同样一个“矩阵乘向量/矩阵”，decode 时只有 <b>1 行</b>，prefill 时却有<b>几百行</b>。二者最优的实现完全不同，所以 <code>fp8_linear</code> 里有一句分派：<code>if(M&lt;=8) gemv else gemm</code>。拖动下面的 M，看它切到哪个 kernel：</p>
+  <div class="card">
+    <div class="ctrl" style="display:flex;align-items:center;gap:12px;margin:8px 0;flex-wrap:wrap">
+      <label style="margin:0;width:auto;color:var(--text);font-size:13px">M（一次算多少行输出）</label>
+      <input type="range" id="mEl" min="1" max="64" step="1" value="1" style="flex:1;min-width:180px;max-width:360px">
+      <span class="pill" id="mPick" style="font-family:var(--mono)"></span>
+    </div>
+    <p class="muted" style="font-size:12.5px">分派规则来自 <code>optimized.cu · fp8_linear()</code>：<code>if(M&lt;=8) gemv&lt;&lt;&lt;dim3((N+7)/8,M)&gt;&gt;&gt; ... else gemm&lt;&lt;&lt;dim3((N+63)/64,(M+15)/16)&gt;&gt;&gt;</code></p>
+    <div class="grid g2">
+      <div class="card tight" id="vGemv">
+        <h3>gemv <span class="tag">M ≤ 8</span></h3>
+        <p class="muted" style="font-size:12.5px">一个 <b>warp（32 lane）负责一整行输出</b>：lane 按 stride 32 扫过 K，再用 <code>warp_sum</code> 归约成该行的结果。下图是一个 block 的 8 行。</p>
+        <div id="gemvRows"></div>
+      </div>
+      <div class="card tight" id="vGemm">
+        <h3>gemm <span class="tag f">M > 8</span></h3>
+        <p class="muted" style="font-size:12.5px">用 <b>WMMA</b>：一个 block 产出 <b>[16,64]</b> 结果，<b>4 个 warp 各算 [16,16]</b>。FP8 权重只在写入共享内存时解码一次。</p>
+        <div class="tile" id="gemmGrid"></div>
+        <div class="legend">
+          <span><b class="w0"></b>warp0</span><span><b class="w1"></b>warp1</span>
+          <span><b class="w2"></b>warp2</span><span><b class="w3"></b>warp3</span>
+        </div>
+      </div>
+    </div>
+    <div class="filetip"><code>gemv</code> 网格：<code>dim3((N+7)/8, M)</code>，256 线程 = 8 warp → 每个 block 覆盖 8 行。FP8 权重在乘加时被解码：<code>fp8(w[row*K+k]) * scale[...]</code>（回顾 <a href="07-quantization.html">第 7 课</a>）。</div>
+  </div>
+
+  <h2>第三招 · 寄存器递归：Gated DeltaNet 的状态不出寄存器</h2>
+  <p>本项目的混合注意力里，3/4 的层是 <b>Gated DeltaNet</b>（线性注意力），它靠一个递归状态 <code>state[H,K,V]</code> 逐 token 更新。<code>kernels.cu · scan</code> 是“正确优先”版：状态放在<b>显存</b>里（<code>st[i*V]</code>），每步都要读写显存。<code>optimized.cu · register_scan</code> 把整列 K 个状态<b>塞进寄存器数组 <code>float s[K]</code></b>，一个线程只负责一个 value 列 j，于是每个时间步都不碰显存。点“下一步”，看状态怎么随 token 演化：</p>
+  <div class="card">
+    <div class="row">
+      <button id="scStep" class="primary small">下一步 ▶</button>
+      <button id="scAuto" class="small">▶ 自动</button>
+      <button id="scReset" class="small">↺ 重置</button>
+      <span class="pill" id="scNote">t = 0 / 6 步</span>
+    </div>
+    <div class="state" id="state"></div>
+    <div class="steps" id="scSteps">点“下一步”开始：每一拍都会先 <span class="hl">衰减</span>、算 <span class="hl">memory</span>、算 <span class="hl">delta</span>、更新状态、最后输出。</div>
+    <div class="filetip">核心循环（<code>register_scan&lt;K&gt;</code> 里，K=128 或 16）：<code>s[i]*=decay</code> → <code>memory+=s[i]*k[i]</code> → <code>delta=(v-memory)*beta</code> → <code>s[i]+=k[i]*delta</code> → <code>out=Σ s[i]*q[i]*rsqrt(K)</code>。状态 <code>s[K]</code> 全程在寄存器，只有头尾各读写一次显存。</div>
+  </div>
+
+  <div class="card">
+    <pre><code>// optimized.cu · register_scan（递归状态留在寄存器）
+float s[K];                                  // ← K 个状态全在寄存器
+for(int i=0;i&lt;K;i++) s[i]=state[(h*K+i)*V+j];// 进入时读一次
+for(int t=0;t&lt;T;t++){
+  float decay=expf(g[t*H+h]), memory=0;
+  for(int i=0;i&lt;K;i++){ s[i]*=decay; memory+=s[i]*k[base+i]; }
+  float delta=(v[t][j]-memory)*beta[t*H+h];
+  for(int i=0;i&lt;K;i++){ s[i]+=k[base+i]*delta; result+=s[i]*q[base+i]; }
+  out[t]=result*rsqrtf(float(K));            // 每个 token 输出，不碰状态显存
+}
+for(int i=0;i&lt;K;i++) state[(h*K+i)*V+j]=s[i];// 退出时写一次</code></pre>
+    <div class="filetip"><b>为什么值分块？</b>K 个状态若全在一个线程里，寄存器压力大；所以按 value 列 j 切给不同线程（<code>blockIdx.y*32+threadIdx.x</code> 覆盖 V 列），每个线程只持自己那列的 K 个状态。</div>
+  </div>
+
+  <div class="note"><b>一句话抓住：</b><code>optimized.cu</code> 的优化就三件事——<b>融合</b>（少读写显存）、<b>分派</b>（小 M 用 gemv、大 M 用 WMMA gemm）、<b>寄存器化</b>（递归状态不放显存）。判断一个 kernel 快不快，先看它“被迫”读写了多少遍显存。</div>
+</div>
+
+<script>
+// ================= 第一招：算子融合 =================
+const OPS=[
+  {nm:"fused_rms", raw:["求平方和 (归约)","归一化 x·rsqrt","乘 weight"], note:"RMSNorm + 乘权重"},
+  {nm:"fused_swiglu", raw:["silu(gate) = g·σ(g)","乘 up"], note:"SwiGLU 激活门"},
+  {nm:"fused_rope", raw:["算 cos/sin","配对 (d, d+R/2) 旋转"], note:"RoPE 位置旋转"},
+  {nm:"conv_decode", raw:["卷积滑动求和","SiLU 激活"], note:"线性注意力卷积"}
+];
+let fused=true;
+function renderPipe(){
+  const p=document.getElementById("pipe"); p.innerHTML="";
+  OPS.forEach(o=>{
+    const d=document.createElement("div");
+    d.className="op"+(fused?" fused":"");
+    let sub="";
+    if(fused){ sub=`<div class="sub">一个 kernel 全包 <span style="color:#7be0a8">✓</span></div>`; }
+    else { sub=o.raw.map((s,i)=>`<span class="stepk">${i+1}. ${s}</span>`).join(""); }
+    d.innerHTML=`<div class="nm">${o.nm}</div><div class="sub">${o.note}</div>${sub}`;
+    p.appendChild(d);
+  });
+  const kPer = fused?1:3;                 // 演示用：未融合时平均 3 步
+  const kTotal = fused?OPS.length*1:OPS.length*3;
+  const tTotal = kTotal*2;                // 每步一次读 + 一次写
+  document.getElementById("mk").textContent = kTotal;
+  document.getElementById("mt").textContent = tTotal;
+  document.getElementById("ms").textContent = fused? ((1-1/3)*100).toFixed(0)+"%" : "0%";
+  document.getElementById("fusNote").textContent = fused? "融合：4 个算子 4 个 kernel" : "未融合：拆成 12 个 kernel";
+  document.getElementById("fusNote").className = "pill "+(fused?"ok":"warn");
+}
+document.getElementById("fusOn").onclick=()=>{fused=true;document.getElementById("fusOn").classList.add("sel");document.getElementById("fusOff").classList.remove("sel");renderPipe();};
+document.getElementById("fusOff").onclick=()=>{fused=false;document.getElementById("fusOff").classList.add("sel");document.getElementById("fusOn").classList.remove("sel");renderPipe();};
+
+// ================= 第二招：gemv / gemm 分派 =================
+function buildGemv(){
+  const g=document.getElementById("gemvRows"); g.innerHTML="";
+  for(let r=0;r<8;r++){
+    const row=document.createElement("div"); row.className="gvrow";
+    const lab=document.createElement("div"); lab.className="lab"; lab.textContent="out"+r;
+    const bar=document.createElement("div"); bar.className="gvbar w0";
+    for(let l=0;l<32;l++){ const i=document.createElement("i"); bar.appendChild(i); }
+    row.append(lab,bar); g.appendChild(row);
+  }
+}
+function buildGemm(){
+  const g=document.getElementById("gemmGrid");
+  g.style.gridTemplateColumns="repeat(64,1fr)";
+  g.innerHTML="";
+  for(let r=0;r<16;r++)for(let c=0;c<64;c++){
+    const i=document.createElement("i"); i.className="w"+Math.floor(c/16); g.appendChild(i);
+  }
+}
+const mEl=document.getElementById("mEl");
+function pick(){
+  const M=+mEl.value;
+  const isGemv = M<=8;
+  document.getElementById("mPick").textContent = "M="+M+"  →  "+(isGemv?"gemv":"gemm")+"   (阈值 8)";
+  document.getElementById("mPick").className = "pill "+(isGemv?"acc":"ok");
+  document.getElementById("vGemv").style.opacity = isGemv?1:.42;
+  document.getElementById("vGemm").style.opacity = isGemv?.42:1;
+}
+mEl.oninput=pick;
+buildGemv(); buildGemm(); pick();
+
+// ================= 第三招：寄存器递归扫描 =================
+const K=8, T=6, H=1, V=1;
+let data, s, t;
+function gen(){
+  let seed=20260928;
+  const rnd=()=>{ seed=(seed*1103515245+12345)&0x7fffffff; return seed/0x7fffffff; };
+  const q=[],k=[],v=[],g=[],b=[],s0=[];
+  for(let i=0;i<K;i++) s0.push(+(rnd()*0.8-0.4).toFixed(2));
+  for(let i=0;i<T;i++){
+    q.push(Array.from({length:K},()=> +(rnd()*2-1).toFixed(2)));
+    k.push(Array.from({length:K},()=> +(rnd()*2-1).toFixed(2)));
+    v.push(+((rnd()*2-1)).toFixed(2));
+    g.push(+(-0.6*rnd()).toFixed(2));      // 衰减系数 < 0
+    b.push(+(rnd()*0.9+0.1).toFixed(2));   // beta ∈ (0,1)
+  }
+  return {q,k,v,g,b,s0};
+}
+function renderState(changed){
+  const box=document.getElementById("state"); box.innerHTML="";
+  s.forEach((val,i)=>{
+    const c=document.createElement("div"); c.className="cell"+(changed?" chg":"");
+    c.innerHTML=`<div class="v">${val.toFixed(2)}</div><div class="k">s[${i}]</div>`;
+    box.appendChild(c);
+  });
+}
+function resetScan(){
+  data=gen();
+  s=data.s0.slice();
+  t=0;
+  document.getElementById("scNote").textContent = "已重置 · 初始状态写入寄存器（s[K]）";
+  document.getElementById("scNote").className="pill";
+  document.getElementById("scSteps").innerHTML = "点“下一步”开始：每一拍都会先 <span class='hl'>衰减</span>、算 <span class='hl'>memory</span>、算 <span class='hl'>delta</span>、更新状态、最后输出。";
+  renderState(false);
+}
+function stepScan(){
+  if(t>=T){ document.getElementById("scNote").textContent="已跑完 T=6 个 token"; document.getElementById("scNote").className="pill ok"; return false; }
+  const decay=Math.exp(data.g[t]);
+  let memory=0;
+  const sn=s.map(x=>x*decay);                       // 先衰减
+  for(let i=0;i<K;i++) memory+=sn[i]*data.k[t][i];
+  const delta=(data.v[t]-memory)*data.b[t];
+  const so=sn.slice();
+  for(let i=0;i<K;i++) so[i]+=data.k[t][i]*delta;   // 再写入
+  let result=0;
+  for(let i=0;i<K;i++) result+=so[i]*data.q[t][i];
+  const out=result*Math.sqrt(1/K);
+  s=so; renderState(true);
+  document.getElementById("scSteps").innerHTML =
+    `t=${t} ─  decay=<span class="hl">${decay.toFixed(3)}</span>　` +
+    `memory=Σ s[i]·k[i]=<span class="hl">${memory.toFixed(3)}</span>　` +
+    `delta=(v-memory)·β=(${data.v[t].toFixed(2)}−${memory.toFixed(3)})·${data.b[t].toFixed(2)}=<span class="hl">${delta.toFixed(3)}</span><br>` +
+    `s[i] ← s[i]·decay + k[i]·delta　→　输出 out[t]=Σ s[i]·q[i]·rsqrt(K)=<span class="hl">${out.toFixed(3)}</span>　<span style="color:#93a1bd">(全程状态在寄存器，未读写显存)</span>`;
+  t++;
+  document.getElementById("scNote").textContent = `t = ${t} / ${T} 步`;
+  document.getElementById("scNote").className = "pill "+(t>=T?"ok":"");
+  return true;
+}
+let scTimer=null;
+document.getElementById("scStep").onclick=stepScan;
+document.getElementById("scReset").onclick=()=>{clearInterval(scTimer);scTimer=null;document.getElementById("scAuto").textContent="▶ 自动";resetScan();};
+document.getElementById("scAuto").onclick=function(){
+  if(scTimer){clearInterval(scTimer);scTimer=null;this.textContent="▶ 自动";return;}
+  this.textContent="⏸ 暂停";
+  scTimer=setInterval(()=>{ if(!stepScan()){clearInterval(scTimer);scTimer=null;document.getElementById("scAuto").textContent="▶ 自动";} },900);
+};
+renderPipe(); resetScan();
+</script>
+</body>
+</html>

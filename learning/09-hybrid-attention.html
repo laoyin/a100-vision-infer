@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>⑨ 混合注意力 · AVI 学习地图</title>
+<link rel="stylesheet" href="assets/style.css">
+<style>
+  .layers{display:flex;flex-wrap:wrap;gap:4px;margin:10px 0}
+  .lblk{width:30px;height:26px;border-radius:6px;border:1px solid var(--border);cursor:pointer;
+    display:flex;align-items:center;justify-content:center;font-size:10px;font-family:var(--mono);transition:.15s}
+  .lblk.lin{background:#123a2a;border-color:#2c6b52;color:#8fe0b0}
+  .lblk.full{background:#2b2348;border-color:#6a52a0;color:#e0d0ff}
+  .lblk:hover{transform:translateY(-2px)}
+  .lblk.on{outline:2px solid var(--accent);transform:translateY(-2px)}
+  .lblk.off{opacity:.16}
+  .band{background:#0d1426;border:1px solid var(--border);border-radius:10px;padding:10px 12px;margin:10px 0;font-size:13.5px}
+  .cmp{display:flex;flex-direction:column;gap:8px;margin:10px 0}
+  .cmp .ln{display:grid;grid-template-columns:96px 1fr 120px;gap:10px;align-items:center;font-size:12.5px}
+  .cmp .nm{color:var(--muted);font-family:var(--mono);text-align:right}
+  .cmp .track2{height:22px;border-radius:6px;background:#0a0f1e;border:1px solid var(--border);overflow:hidden}
+  .cmp .track2 i{display:block;height:100%;transition:width .25s}
+  .cmp .track2 i.f{background:linear-gradient(90deg,#b388ff,#6a52a0)}
+  .cmp .track2 i.l{background:linear-gradient(90deg,#4ade80,#2c6b52)}
+  .cmp .vv{font-family:var(--mono);color:#9fd8ff}
+  .pipe2{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0}
+  .stp{flex:1 1 128px;background:#0d1426;border:1px solid var(--border);border-radius:10px;padding:9px 10px;cursor:pointer;transition:.15s}
+  .stp:hover{border-color:var(--accent)}
+  .stp.on{border-color:var(--accent);background:#12233f;box-shadow:0 0 0 1px var(--accent) inset}
+  .stp .no{font-family:var(--mono);font-size:10px;color:var(--accent)}
+  .stp .nm{font-size:12.5px;color:#cfe9ff;margin-top:3px}
+  .gwrap{display:grid;grid-template-columns:1fr auto;gap:16px;align-items:start}
+  @media(max-width:820px){.gwrap{grid-template-columns:1fr}}
+  .mgrid{display:grid;gap:3px;margin-top:8px}
+  .mcell2{aspect-ratio:1;border-radius:4px;display:flex;align-items:center;justify-content:center;
+    font-size:9px;font-family:var(--mono);color:#e7ecf5;transition:background .3s}
+  .vecs{display:flex;flex-direction:column;gap:8px}
+  .vbox{background:#0d1426;border:1px solid var(--border);border-radius:10px;padding:8px 10px}
+  .vbox .t{font-size:11px;color:var(--muted);font-family:var(--mono);margin-bottom:5px}
+  .vbox .rowv{display:flex;gap:4px;flex-wrap:wrap}
+  .vbox .rowv b{font-family:var(--mono);font-size:11px;font-weight:400;background:#0a0f1e;border:1px solid var(--border);
+    border-radius:5px;padding:2px 6px;color:#cfe9ff}
+  .log{font-family:var(--mono);font-size:12px;background:#0a0f1e;border:1px solid var(--border);border-radius:8px;
+    padding:8px 10px;color:#9fd8ff;margin:8px 0;line-height:1.8}
+  .log .hl{color:var(--accent2)}
+  button.sel{border-color:var(--accent);color:#fff;background:#12233f}
+</style>
+</head>
+<body>
+<nav class="top"><div class="inner">
+  <span class="brand">AVI 学习地图</span>
+  <a href="index.html">总览</a>
+  <a href="01-transformer-flow.html">① 数据流</a>
+  <a href="02-attention.html">② 注意力</a>
+  <a href="03-kv-cache.html">③ KV Cache</a>
+  <a href="04-rope.html">④ RoPE</a>
+  <a href="05-inference.html">⑤ 推理与采样</a>
+  <a href="06-tensor-parallel.html">⑥ 张量并行</a>
+  <a href="07-quantization.html">⑦ 量化</a>
+  <a href="08-optimized-cu.html">⑧ 算子</a>
+  <a class="active" href="09-hybrid-attention.html">⑨ 混合注意力</a>
+  <a href="10-speculative.html">⑩ 投机解码</a>
+</div></nav>
+
+<div class="wrap">
+  <h1>⑨ 混合注意力：64 层里，只有 16 层用"真"注意力</h1>
+  <p class="lead">这是本项目<strong>最独特的架构</strong>。标准 Transformer 每层都是全注意力（开销随序列长度<b>平方</b>增长）。这里做了混合：<b>每 4 层里，3 层用轻量的线性注意力（Gated DeltaNet），第 4 层才用全注意力</b>。下面逐块拆开看。</p>
+
+  <h2>为什么不全都用全注意力？</h2>
+  <p>全注意力要让每个 token 和<b>之前所有</b> token 两两比较，代价 \(\propto T^2\)；线性注意力只维护一个<b>固定大小</b>的状态，代价 \(\propto T\)。序列越长，差距越夸张。拖动下面的 T 看差距：</p>
+  <div class="card">
+    <div class="ctrl" style="display:flex;align-items:center;gap:12px;margin:8px 0;flex-wrap:wrap">
+      <label style="margin:0;width:auto;color:var(--text);font-size:13px">序列长度 T</label>
+      <input type="range" id="tEl" min="7" max="15" step="0.25" value="7" style="flex:1;min-width:180px;max-width:360px">
+      <span class="pill acc" id="tV" style="font-family:var(--mono)">128</span>
+    </div>
+    <div class="cmp">
+      <div class="ln"><div class="nm">全注意力 T²</div><div class="track2"><i class="f" id="barFull"></i></div><div class="vv" id="cFull">—</div></div>
+      <div class="ln"><div class="nm">线性 T·K</div><div class="track2"><i class="l" id="barLin"></i></div><div class="vv" id="cLin">—</div></div>
+    </div>
+    <p class="muted" id="ratioNote" style="margin:4px 0"></p>
+    <div class="filetip">这里的 K 是递归状态维度（<code>linear_key_head_dim=128</code>）。序列越短，全注意力反而越省；大约在 <b>T≈256</b> 两者打平，之后线性注意力一路领先。</div>
+  </div>
+
+  <h2>64 层的排布：3 绿 + 1 紫，循环 16 次</h2>
+  <p>配置里 <code>full_attention_interval=4</code>，<code>layer_types</code> 就是 <code>lin,lin,lin,full</code> 重复。点任意一层看它是什么：</p>
+  <div class="card">
+    <div class="row">
+      <span class="pill ok">■ 线性注意力</span><span class="pill acc">■ 全注意力</span>
+      <span class="muted" style="font-size:12px" id="cnt"></span>
+    </div>
+    <div class="layers" id="layers"></div>
+    <div class="band" id="lInfo">点上面任意一层查看它的职责与对应函数。</div>
+    <div class="filetip">模型共 <b>64 层</b>：<b>48 层</b> linear_attention + <b>16 层</b> full_attention。分派在 <code>engine.cpp · step()</code>：<code>if(layer_types[i]=="full_attention") full_attention(...) else delta_attention(...)</code>。</div>
+  </div>
+
+  <h2>Gated DeltaNet 内部：一次 forward 走了哪几步</h2>
+  <p>线性注意力层不是"不算注意力"，而是换了一套机制。点每一步看说明：</p>
+  <div class="card">
+    <div class="pipe2" id="pipe2"></div>
+    <div class="band" id="stInfo">点上面任意一步查看它做了什么。</div>
+    <pre><code>// engine.cpp · delta_attention()（核心几行）
+int K=linear_key_head_dim, V=linear_value_head_dim;     // 128, 128
+int HK=linear_num_key_heads/world, H=linear_num_value_heads/world; // 16/…, 48/…
+int kernel=linear_conv_kernel_dim;                      // 4
+
+auto mixed = projected.narrow(-1,0,C);                  // 融合权重一次性投影出 q,k,v,z,b,a
+conv = conv_decode(...) | silu(conv1d(...));            // 深度可分离卷积(kernel=4) + SiLU
+q = fused_l2(q).repeat_interleave(H/HK,1);              // q,k 逐头 L2 归一化，再扩到 48 头
+k = fused_l2(k).repeat_interleave(H/HK,1);
+g    = -exp(A_log) * softplus(a + dt_bias);             // 衰减门（负值）
+beta = sigmoid(b);                                      // 写入强度 ∈ (0,1)
+result = delta_scan_fast(q,k,v,g,beta, s.recurrent);    // ← 递归状态更新（下一节）
+result = norm(result) * silu(z);                        // 输出门控 + RMSNorm
+return linear(result, out_proj, true);                  // 行并行 → AllReduce</code></pre>
+    <div class="filetip">注意：<code>g</code> 是<b>负数</b>，作用在状态上相当于"按 token 衰减记忆"；<code>beta</code> 控制这一步写入多少。<code>z</code> 是一条输出门控（swish），和全注意力里的 <code>gate.sigmoid()</code> 异曲同工。</div>
+  </div>
+
+  <h2>核心：delta 规则，一个"会遗忘的记忆矩阵"</h2>
+  <p>状态 <code>state[H,K,V]</code> 里每个头都有一个 <b>K×V 的矩阵</b>（真实是 128×128）。每来一个 token，就做四件事：<b>先衰减 → 用 key 去读记忆 → 算出和目标值的差 delta → 把 delta 写回记忆</b>。下面用 6×6 的缩小版演示（点"下一个 token"）：</p>
+  <div class="card">
+    <div class="row">
+      <button id="dStep" class="primary small">下一个 token ▶</button>
+      <button id="dAuto" class="small">▶ 自动</button>
+      <button id="dReset" class="small">↺ 重置</button>
+      <span class="pill" id="dNote">t = 0 / 4</span>
+    </div>
+    <div class="gwrap">
+      <div>
+        <div class="muted" style="font-size:12px">状态矩阵 state[K=6, V=6]（颜色：绿=正，红=负，越深越大）</div>
+        <div class="mgrid" id="mgrid" style="grid-template-columns:repeat(6,1fr)"></div>
+      </div>
+      <div class="vecs">
+        <div class="vbox"><div class="t">当前 key k[i]（读记忆用）</div><div class="rowv" id="vk"></div></div>
+        <div class="vbox"><div class="t">目标值 v[j]（token 想记住的内容）</div><div class="rowv" id="vv2"></div></div>
+        <div class="vbox"><div class="t">decay / beta</div><div class="rowv" id="vg"></div></div>
+      </div>
+    </div>
+    <div class="log" id="dLog">点"下一个 token"开始。每一拍：state ×= decay → 用 k 读出 memory → delta=(v−memory)·β → state += k⊗delta。</div>
+    <div class="filetip">对应 <code>kernels.cu · scan</code>（正确优先）与 <code>optimized.cu · register_scan&lt;128&gt;</code>（状态留在寄存器）。状态是 <b>FP32</b> 的，因为递归会累积误差；输入 q/k/v 是 BF16。</div>
+  </div>
+
+  <div class="note"><b>一句话抓住：</b>混合注意力 = "<b>便宜的多用、贵的少用</b>"。48 层线性注意力负责日常信息流（省显存、省算力、不存 KV Cache），16 层全注意力定期"全局对齐"一次。两者交替，兼顾长序列效率与建模能力。</div>
+</div>
+
+<script>
+// ================= §1 复杂度对比 =================
+const tEl=document.getElementById("tEl");
+function fmtBig(x){
+  if(x>=1e8) return (x/1e8).toFixed(2)+" 亿";
+  if(x>=1e4) return (x/1e4).toFixed(1)+" 万";
+  return Math.round(x).toString();
+}
+function complexity(){
+  const T=Math.round(Math.pow(2,+tEl.value));
+  document.getElementById("tV").textContent=T.toLocaleString();
+  const full=T*T/2, lin=T*128;
+  const mx=Math.max(full,lin);
+  document.getElementById("barFull").style.width=(full/mx*100)+"%";
+  document.getElementById("barLin").style.width=(lin/mx*100)+"%";
+  document.getElementById("cFull").textContent=fmtBig(full);
+  document.getElementById("cLin").textContent=fmtBig(lin);
+  const r=full/lin;
+  document.getElementById("ratioNote").innerHTML = r>=1
+    ? `此刻全注意力的相对开销是线性注意力的 <b style="color:#fbbf24">${r.toFixed(1)} 倍</b>。T 越大，倍数越大。`
+    : `此刻 T 还很短，全注意力反而更省（线性仅为它的 ${(1/r).toFixed(2)} 倍）。约 T≈256 处二者打平。`;
+}
+tEl.oninput=complexity;
+
+// ================= §2 层排布 =================
+const NL=64;
+const isFull=i=> ((i+1)%4===0);
+function buildLayers(){
+  const box=document.getElementById("layers"); box.innerHTML="";
+  for(let i=0;i<NL;i++){
+    const d=document.createElement("div");
+    d.className="lblk "+(isFull(i)?"full":"lin");
+    d.textContent=i;
+    d.title=`第 ${i} 层：${isFull(i)?"full_attention":"linear_attention"}`;
+    d.onclick=()=>pickLayer(i);
+    box.appendChild(d);
+  }
+  document.getElementById("cnt").innerHTML=`共 64 层：<b style="color:#4ade80">48</b> 层线性 + <b style="color:#b388ff">16</b> 层全注意力`;
+}
+function pickLayer(i){
+  document.querySelectorAll("#layers .lblk").forEach((e,k)=>e.classList.toggle("on",k===i));
+  const f=isFull(i);
+  document.getElementById("lInfo").innerHTML = f
+    ? `<b style="color:#d0b8ff">第 ${i} 层 · full_attention</b>　每 4 层出现 1 次（<code>full_attention_interval=4</code>）。<br>标准注意力：Q/K/V 投影 + mRoPE + KV Cache，<b>24</b> 个 query 头对 <b>4</b> 个 KV 头（GQA）。开销随 T <b style="color:#fbbf24">平方</b>增长。调用 <code>engine.cpp · full_attention()</code>（见 <a href="02-attention.html">第 2 课</a>）。`
+    : `<b style="color:#8fe0b0">第 ${i} 层 · linear_attention（Gated DeltaNet）</b>　3/4 的层都是它。<br>不用 KV Cache，只维护固定大小的递归状态 <code>state[H,K,V]</code>；开销随 T <b style="color:#4ade80">线性</b>增长。调用 <code>engine.cpp · delta_attention()</code>。`;
+}
+
+// ================= §3 流水线步骤 =================
+const STEPS=[
+  {nm:"hidden x",       d:"上一层传来的隐藏状态，形状 [T, 5120]。"},
+  {nm:"in_proj_all",    d:"一个融合权重一次性投影出 6 组量：q,k,v（2·HK·K + H·V 列）以及 z,b,a。省去多次 kernel 启动。"},
+  {nm:"conv1d + SiLU",  d:"深度可分离卷积，kernel=4：让相邻 4 个 token 先“混”一下，再过一个 SiLU。decode 时用 <code>conv_decode</code> 把卷积+激活融成一个 kernel。"},
+  {nm:"L2 norm q,k",    d:"把 q、k 逐头做 L2 归一化（<code>fused_l2</code>），再做 repeat_interleave 扩到 48 个值头，与 v 对齐。"},
+  {nm:"门控 g / beta",  d:"decay <code>g = −exp(A_log)·softplus(a+dt_bias)</code>（负值，控制遗忘速度）；<code>beta = sigmoid(b)</code>（∈0~1，控制写入强度）。"},
+  {nm:"递归 state",     d:"核心：用 delta 规则更新 <code>state[H,K,V]</code>（FP32）。T 个 token 顺序扫过，状态全程复用——这就是它能 O(T) 的原因。"},
+  {nm:"输出门控 + 投影", d:"<code>result ⊙ silu(z)</code> → RMSNorm → <code>out_proj</code>（行并行，reduce=true，会触发 <a href='06-tensor-parallel.html'>AllReduce</a>）。"}
+];
+let stSel=-1;
+function buildSteps(){
+  const p=document.getElementById("pipe2"); p.innerHTML="";
+  STEPS.forEach((s,i)=>{
+    const d=document.createElement("div"); d.className="stp";
+    d.innerHTML=`<div class="no">STEP ${i+1}</div><div class="nm">${s.nm}</div>`;
+    d.onclick=()=>{stSel=i;document.querySelectorAll("#pipe2 .stp").forEach((e,k)=>e.classList.toggle("on",k===i));
+      document.getElementById("stInfo").innerHTML=`<b>${i+1}. ${s.nm}</b>　—— ${s.d}`;};
+    p.appendChild(d);
+  });
+}
+
+// ================= §4 delta 规则演示 =================
+const GK=6, GV=6, GT=4;
+let S,kv,vv,gg,bb,gt,seed;
+function rnd(){ seed=(seed*1103515245+12345)&0x7fffffff; return seed/0x7fffffff; }
+function initDelta(){
+  seed=20260928;
+  kv=[],vv=[],gg=[],bb=[];
+  for(let t=0;t<GT;t++){
+    kv.push(Array.from({length:GK},()=>+(rnd()*1.4-0.7).toFixed(2)));
+    vv.push(Array.from({length:GV},()=>+(rnd()*1.4-0.7).toFixed(2)));
+    gg.push(+(-0.6*rnd()).toFixed(2));
+    bb.push(+(rnd()*0.8+0.2).toFixed(2));
+  }
+  restartDelta();
+}
+function restartDelta(){
+  S=Array.from({length:GK},()=>new Array(GV).fill(0));
+  gt=0; renderDelta(null,null);
+  document.getElementById("dNote").textContent="t = 0 / "+GT;
+  document.getElementById("dNote").className="pill";
+  document.getElementById("dLog").innerHTML="回到初始：状态全 0。点“下一个 token”开始。";
+}
+function cellCol(v){
+  const a=Math.min(1,Math.abs(v)/1.2);
+  return v>=0? `rgba(74,222,128,${(0.12+0.72*a).toFixed(2)})` : `rgba(248,113,113,${(0.12+0.72*a).toFixed(2)})`;
+}
+function renderDelta(){
+  const g=document.getElementById("mgrid"); g.innerHTML="";
+  for(let i=0;i<GK;i++)for(let j=0;j<GV;j++){
+    const c=document.createElement("div"); c.className="mcell2";
+    c.style.background=cellCol(S[i][j]);
+    c.textContent=S[i][j].toFixed(1);
+    c.title=`state[${i}][${j}] = ${S[i][j].toFixed(3)}`;
+    g.appendChild(c);
+  }
+  const t=Math.min(gt,GT-1);
+  const fill=(id,arr,fmt)=>{ const b=document.getElementById(id); b.innerHTML="";
+    arr.forEach((x,i)=>{ const e=document.createElement("b"); e.textContent=fmt?fmt(x):x; b.appendChild(e); }); };
+  fill("vk",kv[t]);
+  fill("vv2",vv[t]);
+  const gb=document.getElementById("vg"); gb.innerHTML=
+    `<b style="color:#fbbf24">decay=${Math.exp(gg[t]).toFixed(2)}</b><b style="color:#8fe0b0">β=${bb[t].toFixed(2)}</b>`;
+}
+function stepDelta(){
+  if(gt>=GT){ document.getElementById("dNote").textContent="已跑完 4 个 token"; document.getElementById("dNote").className="pill ok"; return false; }
+  const decay=Math.exp(gg[gt]);
+  for(let i=0;i<GK;i++)for(let j=0;j<GV;j++) S[i][j]*=decay;         // 1) 衰减
+  const mem=new Array(GV).fill(0);
+  for(let j=0;j<GV;j++)for(let i=0;i<GK;i++) mem[j]+=S[i][j]*kv[gt][i]; // 2) 读记忆
+  const delta=new Array(GV);
+  for(let j=0;j<GV;j++) delta[j]=(vv[gt][j]-mem[j])*bb[gt];           // 3) 算 delta
+  for(let j=0;j<GV;j++)for(let i=0;i<GK;i++) S[i][j]+=kv[gt][i]*delta[j]; // 4) 写回
+  renderDelta();
+  const m0=mem[0].toFixed(2), d0=delta[0].toFixed(2);
+  document.getElementById("dLog").innerHTML=
+    `t=${gt}　decay=<span class="hl">${decay.toFixed(2)}</span>，β=<span class="hl">${bb[gt].toFixed(2)}</span><br>`+
+    `① 记忆衰减：state ×= decay<br>`+
+    `② 读出：memory[0]=Σᵢ state[i][0]·k[i]=<span class="hl">${m0}</span>（其余列同理）<br>`+
+    `③ 修正量：delta[0]=(v[0]−memory[0])·β=(${vv[gt][0]}−${m0})·${bb[gt].toFixed(2)}=<span class="hl">${d0}</span><br>`+
+    `④ 写回：state[i][j] += k[i]·delta[j]　<span style="color:#93a1bd">→ 矩阵颜色已更新</span>`;
+  gt++;
+  document.getElementById("dNote").textContent="t = "+gt+" / "+GT;
+  document.getElementById("dNote").className="pill "+(gt>=GT?"ok":"");
+  return true;
+}
+let dTimer=null;
+document.getElementById("dStep").onclick=stepDelta;
+document.getElementById("dReset").onclick=()=>{clearInterval(dTimer);dTimer=null;document.getElementById("dAuto").textContent="▶ 自动";restartDelta();};
+document.getElementById("dAuto").onclick=function(){
+  if(dTimer){clearInterval(dTimer);dTimer=null;this.textContent="▶ 自动";return;}
+  this.textContent="⏸ 暂停";
+  dTimer=setInterval(()=>{ if(!stepDelta()){clearInterval(dTimer);dTimer=null;document.getElementById("dAuto").textContent="▶ 自动";} },1000);
+};
+
+complexity(); buildLayers(); buildSteps(); initDelta();
+</script>
+</body>
+</html>

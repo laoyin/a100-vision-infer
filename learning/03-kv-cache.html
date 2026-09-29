@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>③ KV Cache · AVI 学习地图</title>
+<link rel="stylesheet" href="assets/style.css">
+<style>
+  .tokrow{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0}
+  .tk{border-radius:8px;padding:6px 12px;font-size:13px;border:1px solid var(--border);font-family:var(--mono)}
+  .tk.prompt{background:#12233f;border-color:#3a5c8a;color:#bfe0ff}
+  .tk.new{background:#2b2348;border-color:#6a52a0;color:#e0d0ff;animation:pop .4s}
+  @keyframes pop{from{transform:scale(.4);opacity:0}to{transform:scale(1);opacity:1}}
+  .kvwrap{display:grid;grid-template-columns:70px 1fr;gap:6px;align-items:center;margin:8px 0}
+  .kvrow{display:flex;gap:4px}
+  .slot{width:34px;height:30px;border-radius:6px;border:1px solid var(--border);background:#0a0f1e;
+    display:flex;align-items:center;justify-content:center;font-size:10px;font-family:var(--mono);color:#3a4560;transition:.3s}
+  .slot.filled{background:linear-gradient(180deg,#123a2a,#0e2a1f);border-color:#2c6b52;color:#8fe0b0}
+  .slot.filled.v{background:linear-gradient(180deg,#2b2348,#1e1838);border-color:#5a4a8a;color:#d0b8ff}
+  .slot.fresh{box-shadow:0 0 0 2px var(--accent)}
+  .kvlab{font-size:12px;font-family:var(--mono);color:var(--muted);text-align:right;padding-right:8px}
+  .stats{display:flex;gap:10px;flex-wrap:wrap;margin:10px 0}
+  .stat{flex:1 1 150px;background:#0d1426;border:1px solid var(--border);border-radius:10px;padding:12px}
+  .stat .n{font-size:22px;font-family:var(--mono);color:var(--accent)}
+  .stat .l{font-size:12px;color:var(--muted)}
+  .modebtn{margin-right:6px}
+  .modebtn.sel{border-color:var(--accent);color:#fff;background:#12233f}
+  .costbar{height:26px;border-radius:6px;display:flex;align-items:center;padding:0 8px;font-size:12px;font-family:var(--mono);color:#02121c}
+  .costbar.cache{background:linear-gradient(90deg,#4cc9f0,#7be0a8)}
+  .costbar.nocache{background:linear-gradient(90deg,#f87171,#fbbf24)}
+  .costrow{display:flex;align-items:center;gap:10px;margin:6px 0;font-size:13px}
+  .costrow .lb{width:80px;color:var(--muted);font-size:12px}
+</style>
+</head>
+<body>
+<nav class="top"><div class="inner">
+  <span class="brand">AVI 学习地图</span>
+  <a href="index.html">总览</a>
+  <a href="01-transformer-flow.html">① 数据流</a>
+  <a href="02-attention.html">② 注意力</a>
+  <a class="active" href="03-kv-cache.html">③ KV Cache</a>
+  <a href="04-rope.html">④ RoPE</a>
+  <a href="05-inference.html">⑤ 推理与采样</a>
+  <a href="06-tensor-parallel.html">⑥ 张量并行</a>
+  <a href="07-quantization.html">⑦ 量化</a>
+  <a href="08-optimized-cu.html">⑧ 算子</a>
+  <a href="09-hybrid-attention.html">⑨ 混合注意力</a>
+  <a href="10-speculative.html">⑩ 投机解码</a>
+</div></nav>
+
+<div class="wrap">
+  <h1>③ KV Cache：为什么生成第 100 个字不用重算前 99 个</h1>
+  <p class="lead">这是 LLM 推理最核心的加速点。点“生成下一个字”，对比两种做法的代价——右边“有缓存”只算了 1 个 token，左边“无缓存”却把整段历史又算了一遍。</p>
+
+  <div class="card">
+    <div class="row">
+      <button id="m-cache" class="small modebtn sel">⚡ 有 KV Cache</button>
+      <button id="m-nocache" class="small modebtn">🐢 无缓存（每次重算）</button>
+      <button id="gen" class="primary small">生成下一个字 ▶</button>
+      <button id="reset" class="small">↺ 重置</button>
+    </div>
+
+    <h3 style="margin-top:16px">序列（前面的蓝色是提示词，紫色是生成的）</h3>
+    <div class="tokrow" id="toks"></div>
+
+    <h3>KV Cache 状态（每个 token 一行 Key + 一行 Value）</h3>
+    <p class="muted" style="margin:2px 0 8px">绿色 = Key 已缓存，紫色 = Value 已缓存。只有<b>新 token</b> 会写入新格子；旧的格子原地不动、直接复用。</p>
+    <div class="kvwrap">
+      <div class="kvlab" style="grid-column:1;">Key<br><small>K</small></div>
+      <div class="kvrow" id="krow"></div>
+      <div class="kvlab" style="grid-column:1;">Value<br><small>V</small></div>
+      <div class="kvrow" id="vrow"></div>
+    </div>
+
+    <div class="stats">
+      <div class="stat"><div class="n" id="s-len">0</div><div class="l">序列长度</div></div>
+      <div class="stat"><div class="n" id="s-this">0</div><div class="l">本次 forward 处理的 token 数</div></div>
+      <div class="stat"><div class="n" id="s-total">0</div><div class="l">累计 forward token 数</div></div>
+      <div class="stat"><div class="n" id="s-gen">0</div><div class="l">已生成 token 数</div></div>
+    </div>
+
+    <h3>两种模式的“计算量”对比</h3>
+    <div class="costrow"><span class="lb">有缓存</span><div class="costbar cache" id="cost-cache" style="width:2%">1</div></div>
+    <div class="costrow"><span class="lb">无缓存</span><div class="costbar nocache" id="cost-nocache" style="width:2%">1</div></div>
+    <p class="muted" id="costnote">每生成 1 个 token，无缓存要重算整段历史，代价随长度平方级增长；有缓存只需算 1 个。</p>
+  </div>
+
+  <h2>缓存里到底存了什么</h2>
+  <p>注意力需要用到每个历史 token 的 <b>K</b> 和 <b>V</b>（见 <a href="02-attention.html">第 2 课</a>）。既然它们算完就不变，那就存下来：新 token 到来时，只把它自己的 K/V <strong>追加</strong>到缓存尾部，然后让它的 Q 去和整段缓存的 K/V 做注意力。</p>
+  <div class="card">
+    <pre><code>// engine.cpp · full_attention()（本项目真实写法）
+int old = state.length;
+state.key.narrow(0, old, T).copy_(k);      // 把新的 K 追加到第 old 行起
+state.value.narrow(0, old, T).copy_(v);    // Value 同理
+state.length += T;                          // 长度推进
+
+// 解码时 query 只有 1 个，但 K/V 是整段历史：
+out = gqa_decode(q, k, v, state.key, state.value, decode_offset_);</code></pre>
+    <div class="filetip">缓存在 <code>struct State{ Tensor key, value; int length; }</code> 里，每个会话、每一层各一份。</div>
+  </div>
+
+  <h2>线性注意力层用“递归状态”代替缓存</h2>
+  <p>别忘了本项目 64 层里有 <strong>48 层是 Gated DeltaNet（线性注意力）</strong>。它<strong>不存 KV</strong>，而是维护一个固定大小的递归矩阵 <span class="shapes">[H, K, V]</span>（FP32）——不管历史多长，这个状态大小恒定。所以它更省显存，但“记忆”是压缩过的。</p>
+
+  <div class="grid g2">
+    <div class="card tight">
+      <h3>full_attention 的缓存</h3>
+      <p class="muted">随序列长度<b>线性增长</b>：<code>length × HK × D</code> × 2(K和V)。长文本下是显存大头。用了 GQA，HK 只有 4，已经省了很多。</p>
+    </div>
+    <div class="card tight">
+      <h3>linear_attention 的状态</h3>
+      <p class="muted">大小<b>固定不变</b>：<code>H × K × V</code> 的递归矩阵 + conv 的短历史。代价是注意力被“递归压缩”了。</p>
+    </div>
+  </div>
+
+  <div class="note"><b>关键直觉：</b>KV Cache 的本质是“<b>用显存换计算</b>”——把算过的 K/V 留着重复用，避免每生成一个字就重跑整段历史。本项目还在此之上做了前缀缓存（相同开头能直接复用 KV）。</div>
+</div>
+
+<script>
+const P=4;                 // 提示词长度
+const MAX=9;               // 最多生成
+let gen=0, mode="cache";
+let totalCache=P, totalNoCache=P, prevTotal=0;
+// 初始 prefill：一次算 P 个
+const toks=document.getElementById("toks");
+const krow=document.getElementById("krow"), vrow=document.getElementById("vrow");
+const WORDS=["我","正","在","学","习","推理","引擎","很","有趣"];
+
+function slots(count,type){
+  let h="";
+  for(let i=0;i<count;i++) h+=`<div class="slot ${type} filled">t${i}</div>`;
+  return h;
+}
+function render(freshK){
+  const L=P+gen;
+  // 序列
+  let h="";
+  for(let i=0;i<P;i++) h+=`<div class="tk prompt">${WORDS[i]||("p"+i)}</div>`;
+  for(let i=0;i<gen;i++) h+=`<div class="tk new">${WORDS[P+i]||("g"+i)}</div>`;
+  toks.innerHTML=h;
+  // KV 网格
+  krow.innerHTML=slots(L,"k");
+  vrow.innerHTML=slots(L,"v");
+  if(freshK!==undefined && freshK>=0){
+    const cells=slots(L,"k");
+    // 给最后一个格子高亮
+    [...krow.children].forEach((c,i)=>{if(i===L-1)c.classList.add("fresh");});
+    [...vrow.children].forEach((c,i)=>{if(i===L-1)c.classList.add("fresh");});
+  }
+  // 统计
+  const thisStep = mode==="cache" ? 1 : L;
+  document.getElementById("s-len").textContent=L;
+  document.getElementById("s-this").textContent=thisStep;
+  document.getElementById("s-total").textContent= totalCache+totalNoCache-totalNoCache;
+  document.getElementById("s-total").textContent= mode==="cache"?totalCache:totalNoCache;
+  document.getElementById("s-gen").textContent=gen;
+  // 成本条
+  const maxCost=Math.max(totalCache,totalNoCache,1);
+  const cc=document.getElementById("cost-cache"), cn=document.getElementById("cost-nocache");
+  cc.style.width=Math.max(2,totalCache/maxCost*100)+"%"; cc.textContent=totalCache;
+  cn.style.width=Math.max(2,totalNoCache/maxCost*100)+"%"; cn.textContent=totalNoCache;
+  document.getElementById("costnote").innerHTML= mode==="cache"
+    ? "当前：有缓存模式。每次只算 <b>1</b> 个新 token（decode），累计计算量随长度<b>线性</b>增长。"
+    : "当前：无缓存模式。每个新 token 都要重新 forward 整段历史（长度 "+L+"），累计计算量<b>平方级</b>增长。";
+}
+document.getElementById("gen").onclick=()=>{
+  if(gen>=MAX)return;
+  gen++;
+  const L=P+gen;
+  if(mode==="cache"){ totalCache+=1; }
+  else { totalNoCache+=L; }        // 重算整段
+  // 让两条都推进以便对比：无缓存永远走“重算”路径
+  render(L-1);
+};
+document.getElementById("m-cache").onclick=function(){mode="cache";this.classList.add("sel");document.getElementById("m-nocache").classList.remove("sel");render();};
+document.getElementById("m-nocache").onclick=function(){mode="nocache";this.classList.add("sel");document.getElementById("m-cache").classList.remove("sel");render();};
+document.getElementById("reset").onclick=()=>{gen=0;totalCache=P;totalNoCache=P;mode="cache";document.getElementById("m-cache").classList.add("sel");document.getElementById("m-nocache").classList.remove("sel");render();};
+render();
+</script>
+</body>
+</html>

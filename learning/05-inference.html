@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>⑤ 推理与采样 · AVI 学习地图</title>
+<link rel="stylesheet" href="assets/style.css">
+<style>
+  .tl{display:flex;flex-wrap:wrap;gap:6px;margin:12px 0}
+  .blk{min-width:34px;padding:8px 4px;border-radius:8px;text-align:center;font-size:11px;font-family:var(--mono);
+       border:1px solid var(--border);transition:.25s}
+  .blk.pre{background:#12233f;border-color:#3a5c8a;color:#bfe0ff}
+  .blk.pre.done{background:#1b3a63}
+  .blk.dec{background:#2b2348;border-color:#6a52a0;color:#e0d0ff}
+  .blk.now{outline:2px solid var(--accent);transform:translateY(-3px);box-shadow:0 8px 20px rgba(76,201,240,.25)}
+  .metrics{display:flex;gap:10px;flex-wrap:wrap;margin:10px 0}
+  .metric{flex:1 1 130px;background:#0d1426;border:1px solid var(--border);border-radius:10px;padding:10px 12px}
+  .metric .n{font-size:20px;font-family:var(--mono);color:var(--accent)}
+  .metric .l{font-size:12px;color:var(--muted)}
+  .ctrl{display:flex;align-items:center;gap:12px;margin:8px 0;flex-wrap:wrap}
+  .ctrl label{margin:0;width:auto;color:var(--text);font-size:13px}
+  .ctrl input[type=range]{flex:1;min-width:150px;max-width:300px}
+  .ctrl .val{font-family:var(--mono);color:var(--accent);min-width:64px;font-size:13px}
+  .samp{display:grid;grid-template-columns:110px 1fr 130px;gap:8px;align-items:center;margin:5px 0;font-size:13px}
+  .samp .tk{font-family:var(--mono);text-align:right;color:var(--muted)}
+  .samp .bar{height:18px;border-radius:5px;background:#0a0f1e;border:1px solid var(--border);overflow:hidden;position:relative}
+  .samp .bar i{display:block;height:100%;background:linear-gradient(90deg,var(--accent),var(--accent2));transition:width .3s}
+  .samp .bar.cut i{background:linear-gradient(90deg,#4a5570,#5a6a90)}
+  .samp .bar.pick i{background:linear-gradient(90deg,#4ade80,#7be0a8)}
+  .samp .num{font-family:var(--mono);color:#9fd8ff;font-size:12px}
+  .chosen{margin-top:10px;font-family:var(--mono);font-size:14px}
+  .chosen b{color:var(--ok)}
+</style>
+</head>
+<body>
+<nav class="top"><div class="inner">
+  <span class="brand">AVI 学习地图</span>
+  <a href="index.html">总览</a>
+  <a href="01-transformer-flow.html">① 数据流</a>
+  <a href="02-attention.html">② 注意力</a>
+  <a href="03-kv-cache.html">③ KV Cache</a>
+  <a href="04-rope.html">④ RoPE</a>
+  <a class="active" href="05-inference.html">⑤ 推理与采样</a>
+  <a href="06-tensor-parallel.html">⑥ 张量并行</a>
+  <a href="07-quantization.html">⑦ 量化</a>
+  <a href="08-optimized-cu.html">⑧ 算子</a>
+  <a href="09-hybrid-attention.html">⑨ 混合注意力</a>
+  <a href="10-speculative.html">⑩ 投机解码</a>
+</div></nav>
+
+<div class="wrap">
+  <h1>⑤ 推理与采样：先读题，再一个字一个字写</h1>
+  <p class="lead">整个生成分成两段：<b>Prefill</b>（把整段提示词一次读进去，还要分块控制显存）和 <b>Decode</b>（之后每次只写一个字）。最后一步是“<b>采样</b>”：从打分里挑出一个 token。点下面的按钮感受节奏，再拖动滑块看采样怎么变。</p>
+
+  <h2>Prefill / Decode 时间线</h2>
+  <div class="card">
+    <div class="row">
+      <button id="run" class="primary small">▶ 开始生成</button>
+      <button id="step" class="small">下一步 ▶</button>
+      <button id="reset" class="small">↺ 重置</button>
+      <span class="pill" id="phase">阶段：待开始</span>
+    </div>
+    <div class="tl" id="tl"></div>
+    <div class="metrics">
+      <div class="metric"><div class="n" id="m-chunk">0</div><div class="l">当前 prefill 分块</div></div>
+      <div class="metric"><div class="n" id="m-pread">0 / 384</div><div class="l">已读入 prompt token</div></div>
+      <div class="metric"><div class="n" id="m-gen">0</div><div class="l">已生成 token</div></div>
+      <div class="metric"><div class="n" id="m-mode">—</div><div class="l">当前计算模式</div></div>
+    </div>
+    <p class="muted" id="tlnote">提示词 384 个 token，被切成 128 一块共 3 块，逐块推进（<code>--prefill-chunk 128</code>）。每块里所有位置同时算注意力；读完后进入 decode，每次只算 1 个新 token（靠 <a href="03-kv-cache.html">KV Cache</a> 复用历史）。</p>
+    <div class="filetip">对应 <code>worker.cpp</code> 主循环：每轮推进一个 prefill chunk（<code>engine.step</code>），ready 后每个请求走一次 <code>engine.decode_batch</code>，再 <code>sample</code> 出 token。</div>
+  </div>
+
+  <h2>采样：怎么从 248320 个打分里挑 1 个</h2>
+  <p>模型最后吐出的是词表上每个 token 的“打分”（logits），我们要把它变成一个选择。下面用几个候选词演示（真实是 24 万多个）。拖动滑块看规则怎么一步步“削”掉可选范围。</p>
+  <div class="card">
+    <div class="ctrl"><label>温度 temperature</label><input type="range" id="temp" min="0" max="2" step="0.1" value="0.8"><span class="val" id="tempV">0.8</span></div>
+    <div class="ctrl"><label>top-k（保留前 k 个）</label><input type="range" id="topk" min="0" max="8" step="1" value="0"><span class="val" id="topkV">0 (关)</span></div>
+    <div class="ctrl"><label>top-p（累计概率截断）</label><input type="range" id="topp" min="0" max="1" step="0.05" value="1"><span class="val" id="toppV">1.00</span></div>
+    <div class="ctrl"><label>重复惩罚 rep_penalty</label><input type="range" id="pen" min="1" max="1.6" step="0.05" value="1"><span class="val" id="penV">1.00</span></div>
+    <div class="row">
+      <button id="draw" class="primary small">🎲 采样一个 token</button>
+      <span class="pill" id="rule">规则：—</span>
+    </div>
+    <div id="sampList"></div>
+    <div class="chosen" id="chosen">点“采样一个 token”开始。</div>
+    <div class="filetip">对应 <code>worker.cpp · sample()</code>：先按 <b>rep_penalty</b> 修正已出现过的 token 分数；<b>temperature==0</b> 时直接取最大值（贪心）；否则 <b>top-k</b> 排序截断 → 按 <code>exp((x−max)/T)</code> 归一化 → <b>top-p</b> 累计截断 → 离散分布抽样。</div>
+  </div>
+
+  <div class="card">
+    <pre><code>// worker.cpp · sample()（简化的真实逻辑）
+if(!constrained && temperature==0 && repetition_penalty==1)
+    return at::max(logits).index;             // 贪心：直接取最大
+
+for each token i:
+    if(repeated.count(i)) value = value<0 ? value*penalty : value/penalty;
+    // 温度
+    p = exp((value - best) / temperature);
+// top-k 只保留前 k 个；top-p 再按累计概率截断
+// 最后：法一取最大值 / 法二按概率随机抽</code></pre>
+    <div class="filetip"><b>JSON 模式</b>还会先套一层 <code>grammar</code> 掩码：把“不合语法”的 token 直接置为不可选，保证输出一定是合法 JSON。</div>
+  </div>
+
+  <div class="note"><b>一句话抓住：</b>Prefill 是“读题”（一次读很多、只做一遍），Decode 是“写字”（一次一个、反复做）。采样则决定这字是“最稳的”（贪心）还是“有随机性的”（温度 + top-k/top-p）。</div>
+</div>
+
+<script>
+// ================= Prefill / Decode 时间线 =================
+const PROMPT=384, CHUNK=128, NCHUNK=PROMPT/CHUNK, MAXGEN=5;
+const tl=document.getElementById("tl");
+let phaseIdx=-1;               // -1 未开始；0..NCHUNK-1 prefill；>=NCHUNK decode
+let timer=null;
+const phase=document.getElementById("phase");
+
+function buildTL(){
+  tl.innerHTML="";
+  for(let i=0;i<NCHUNK;i++){
+    const d=document.createElement("div");
+    d.className="blk pre"; d.dataset.i=i;
+    d.textContent="chunk"+(i+1);
+    tl.appendChild(d);
+  }
+  for(let i=0;i<MAXGEN;i++){
+    const d=document.createElement("div");
+    d.className="blk dec"; d.dataset.i=NCHUNK+i;
+    d.textContent="tok"+(i+1);
+    tl.appendChild(d);
+  }
+}
+function renderTL(){
+  [...tl.children].forEach((c,k)=>{
+    c.classList.toggle("now", k===phaseIdx);
+    c.classList.toggle("done", k<phaseIdx);
+  });
+}
+function renderMetrics(){
+  const isPre = phaseIdx>=0 && phaseIdx<NCHUNK;
+  const isDec = phaseIdx>=NCHUNK;
+  document.getElementById("m-chunk").textContent = isPre? (phaseIdx+1): (phaseIdx>=NCHUNK?NCHUNK:0);
+  const pread = isPre? Math.min(PROMPT,(phaseIdx+1)*CHUNK) : (phaseIdx>=NCHUNK?PROMPT:0);
+  document.getElementById("m-pread").textContent = pread+" / "+PROMPT;
+  document.getElementById("m-gen").textContent = isDec? (phaseIdx-NCHUNK+1):0;
+  document.getElementById("m-mode").textContent = isPre? "Prefill" : (isDec? "Decode" : "—");
+  phase.textContent = "阶段：" + (phaseIdx<0? "待开始" : (isPre? ("Prefill 第"+(phaseIdx+1)+"块") : ("Decode 第"+(phaseIdx-NCHUNK+1)+"个")));
+}
+function advance(){
+  if(phaseIdx>=NCHUNK+MAXGEN-1) return false;
+  phaseIdx++; renderTL(); renderMetrics(); return true;
+}
+document.getElementById("step").onclick=()=>{ if(!advance()) flash(); };
+document.getElementById("run").onclick=function(){
+  if(timer){clearInterval(timer);timer=null;this.textContent="▶ 继续";return;}
+  this.textContent="⏸ 暂停";
+  timer=setInterval(()=>{ if(!advance()){clearInterval(timer);timer=null;document.getElementById("run").textContent="▶ 重新开始";} },800);
+};
+document.getElementById("reset").onclick=()=>{clearInterval(timer);timer=null;phaseIdx=-1;renderTL();renderMetrics();document.getElementById("run").textContent="▶ 开始生成";};
+function flash(){const n=document.getElementById("tlnote");n.style.color="var(--warn)";setTimeout(()=>n.style.color="",400);}
+buildTL(); renderTL(); renderMetrics();
+
+// ================= 采样 =================
+const CANDS=[
+  {tk:"的", score:4.6, repeated:true},
+  {tk:"了", score:4.2, repeated:false},
+  {tk:"是", score:3.7, repeated:false},
+  {tk:"在", score:3.1, repeated:true},
+  {tk:"推", score:2.4, repeated:false},
+  {tk:"理", score:1.9, repeated:false},
+  {tk:"引", score:1.1, repeated:false},
+  {tk:"擎", score:0.4, repeated:false}
+];
+const tempEl=document.getElementById("temp"),topkEl=document.getElementById("topk"),toppEl=document.getElementById("topp"),penEl=document.getElementById("pen");
+function relabel(){
+  document.getElementById("tempV").textContent=(+tempEl.value).toFixed(1);
+  document.getElementById("topkV").textContent=(+topkEl.value===0?"0 (关)":topkEl.value);
+  document.getElementById("toppV").textContent=(+toppEl.value).toFixed(2);
+  document.getElementById("penV").textContent=(+penEl.value).toFixed(2);
+}
+// 计算流程，返回每一步：penalty 后分数 → softmax 概率 → 是否被 top-k / top-p 截断
+function compute(){
+  const T=+tempEl.value, K=+topkEl.value, P=+toppEl.value, pen=+penEl.value;
+  let arr=CANDS.map(c=>({...c}));
+  // 1) 重复惩罚
+  arr.forEach(c=>{ if(c.repeated) c.adj = c.score<0? c.score*pen : c.score/pen; else c.adj=c.score; });
+  // 2) 贪心
+  if(T===0){
+    let best=arr[0]; arr.forEach(c=>{ if(c.adj>best.adj) best=c; });
+    arr.forEach(c=>{ c.prob=0; c.state = (c===best)?"pick":"cut"; });
+    return {arr, rule:"temperature=0 → 贪心（直接取最大值）", best};
+  }
+  // 3) 排序 + top-k
+  arr.sort((a,b)=> b.adj-a.adj);
+  let keep = (K>0&&K<arr.length)? K : arr.length;
+  // 4) softmax（稳定）
+  const mx=arr[0].adj, ex=arr.map(c=>Math.exp((c.adj-mx)/T));
+  const sum=ex.reduce((a,b)=>a+b,0);
+  arr.forEach((c,i)=> c.prob=ex[i]/sum);
+  // 5) top-p 累计截断
+  let cum=0, pcut=arr.length;
+  for(let i=0;i<keep;i++){ cum+=arr[i].prob; if(cum>=P){ pcut=i+1; break; } }
+  pcut=Math.max(pcut,1);
+  // 6) 抽样（在保留集合内按概率）
+  const pool=arr.slice(0,pcut);
+  const tot=pool.reduce((a,c)=>a+c.prob,0);
+  let r=Math.random()*tot, pick=pool[0];
+  for(const c of pool){ r-=c.prob; if(r<=0){ pick=c; break; } }
+  arr.forEach((c,i)=>{ c.state = (i<pcut)? (c===pick?"pick":"keep") : "cut"; });
+  const ruleParts=[];
+  ruleParts.push("temperature="+T.toFixed(1));
+  if(K>0) ruleParts.push("top-k="+K);
+  if(P<1) ruleParts.push("top-p="+P.toFixed(2));
+  if(pen>1) ruleParts.push("rep_penalty="+pen.toFixed(2));
+  return {arr, rule:"规则："+ruleParts.join(" · "), best:pick};
+}
+function draw(){
+  relabel();
+  const {arr, rule, best}=compute();
+  document.getElementById("rule").textContent=rule;
+  const maxp=Math.max(...arr.map(c=>c.prob), 1e-9);
+  const list=document.getElementById("sampList");
+  list.innerHTML="";
+  arr.forEach(c=>{
+    const row=document.createElement("div"); row.className="samp";
+    const tk=document.createElement("div"); tk.className="tk"; tk.textContent=c.tk+(c.repeated?" ↺":"");
+    const wrap=document.createElement("div"); wrap.className="bar"+(c.state==="cut"?" cut":(c.state==="pick"?" pick":""));
+    const bar=document.createElement("i"); bar.style.width=(c.prob/maxp*100)+"%";
+    wrap.appendChild(bar);
+    const num=document.createElement("div"); num.className="num";
+    num.textContent = c.prob>0 ? (c.prob*100).toFixed(1)+"%  (logit "+c.adj.toFixed(2)+")" : (c.state==="cut"?"已截断":"—");
+    row.append(tk,wrap,num); list.appendChild(row);
+  });
+  document.getElementById("chosen").innerHTML = "本次选中：<b>"+(best?best.tk:"—")+"</b>"+
+    (best? "  (概率 "+(best.prob*100).toFixed(1)+"%)":"");
+}
+[tempEl,topkEl,toppEl,penEl].forEach(e=>e.oninput=()=>{relabel();});
+document.getElementById("draw").onclick=draw;
+relabel(); draw();
+</script>
+</body>
+</html>

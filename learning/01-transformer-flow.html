@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>① 数据流动整体直觉 · AVI 学习地图</title>
+<link rel="stylesheet" href="assets/style.css">
+<style>
+  .flow{display:flex;flex-wrap:wrap;align-items:stretch;gap:6px;margin:10px 0 4px}
+  .fnode{flex:1 1 120px;min-width:118px;background:#0d1426;border:1px solid var(--border);border-radius:12px;
+    padding:12px 10px;text-align:center;font-size:13.5px;transition:.25s;position:relative}
+  .fnode small{display:block;color:var(--muted);font-size:11px;margin-top:4px;font-family:var(--mono)}
+  .fnode.on{border-color:var(--accent);background:linear-gradient(180deg,#12233f,#0d1a30);
+    box-shadow:0 0 0 2px rgba(76,201,240,.35),0 8px 24px rgba(76,201,240,.18);transform:translateY(-3px)}
+  .fnode.done{border-color:#2c6b52}
+  .farrow{align-self:center;color:var(--accent);font-size:18px;padding:0 2px}
+  .track{position:relative;height:8px;background:#0a0f1e;border:1px solid var(--border);border-radius:999px;margin:14px 0 6px;overflow:hidden}
+  .track i{position:absolute;left:0;top:0;bottom:0;width:0;background:linear-gradient(90deg,var(--accent),var(--accent2));transition:width .35s}
+  .dot{position:absolute;top:50%;width:16px;height:16px;border-radius:50%;background:#fff;box-shadow:0 0 12px 3px var(--accent);
+    transform:translate(-50%,-50%);transition:left .35s}
+  #detail{min-height:118px}
+  .layerstack{display:flex;flex-wrap:wrap;gap:4px;margin-top:8px}
+  .lyr{width:26px;height:20px;border-radius:5px;border:1px solid var(--border);cursor:pointer;
+    display:flex;align-items:center;justify-content:center;font-size:9px;font-family:var(--mono);color:#cfe0f5;transition:.15s}
+  .lyr.lin{background:#123a2a;border-color:#2c6b52}
+  .lyr.full{background:#2b2348;border-color:#5a4a8a}
+  .lyr:hover,.lyr.on{outline:2px solid var(--accent);transform:translateY(-2px)}
+  .shapes{font-family:var(--mono);font-size:12px;color:#9fd8ff}
+  .switchline{display:flex;gap:8px;margin:6px 0}
+  .switchline button.sel{border-color:var(--accent);color:#fff;background:#12233f}
+  .pipebox{background:#0d1426;border:1px solid var(--border);border-radius:10px;padding:10px 12px;margin:8px 0}
+</style>
+</head>
+<body>
+<nav class="top"><div class="inner">
+  <span class="brand">AVI 学习地图</span>
+  <a href="index.html">总览</a>
+  <a class="active" href="01-transformer-flow.html">① 数据流</a>
+  <a href="02-attention.html">② 注意力</a>
+  <a href="03-kv-cache.html">③ KV Cache</a>
+  <a href="04-rope.html">④ RoPE</a>
+  <a href="05-inference.html">⑤ 推理与采样</a>
+  <a href="06-tensor-parallel.html">⑥ 张量并行</a>
+  <a href="07-quantization.html">⑦ 量化</a>
+  <a href="08-optimized-cu.html">⑧ 算子</a>
+  <a href="09-hybrid-attention.html">⑨ 混合注意力</a>
+  <a href="10-speculative.html">⑩ 投机解码</a>
+</div></nav>
+
+<div class="wrap">
+  <h1>① 一次推理，数据怎么从 A 流到 B</h1>
+  <p class="lead">先建立“数据包在管道里走一圈”的整体画面。点“▶ 播放”，看数据从输入一路走到新 token，然后被<strong>拼回输入再走一遍</strong>——这就是自回归生成。</p>
+
+  <div class="card">
+    <div class="switchline">
+      <button id="mode-prefill" class="small sel">Prefill（读入整段提示）</button>
+      <button id="mode-decode" class="small">Decode（一次生成一个字）</button>
+    </div>
+    <div class="flow" id="flow">
+      <div class="fnode" data-i="0">图片 + 文字<small>input</small></div>
+      <div class="farrow">→</div>
+      <div class="fnode" data-i="1">预处理<small>Python 离线</small></div>
+      <div class="farrow">→</div>
+      <div class="fnode" data-i="2">Embedding 查表<small>engine.embed</small></div>
+      <div class="farrow">→</div>
+      <div class="fnode" data-i="3">64 层 Transformer<small>engine.step</small></div>
+      <div class="farrow">→</div>
+      <div class="fnode" data-i="4">归一化+输出头<small>engine.logits</small></div>
+      <div class="farrow">→</div>
+      <div class="fnode" data-i="5">采样出新 token<small>worker.sample</small></div>
+    </div>
+    <div class="track"><i id="bar"></i><span class="dot" id="dot" style="left:0"></span></div>
+    <div class="row">
+      <button id="play" class="primary small">▶ 播放</button>
+      <button id="prev" class="small">◀ 上一步</button>
+      <button id="next" class="small">下一步 ▶</button>
+      <button id="reset" class="small">↺ 重置</button>
+      <span class="pill" id="looplabel">数据包位置：待发送</span>
+    </div>
+  </div>
+
+  <div class="card" id="detail">
+    <h3 id="d-title">点击任意阶段，或按“播放”</h3>
+    <p id="d-body" class="muted">每个方块代表数据流动的一个阶段。开始后，白色圆点会沿管道前进；走完第 6 步，它会“回环”到 Embedding——因为新生成的 token 会成为下一轮的输入。</p>
+  </div>
+
+  <h2>第 3 步内部：64 层里藏着两种注意力</h2>
+  <p>整个模型并不是 64 层“一样”的层。它的 <code>layer_types</code> 是一个循环：<strong>3 层线性注意力（Gated DeltaNet）+ 1 层完整注意力</strong>，重复 16 次共 64 层。下面每一格是一层，点击看它用哪种注意力。</p>
+
+  <div class="card">
+    <div class="layerstack" id="layers"></div>
+    <div class="legend" style="margin-top:10px">
+      <span><b style="background:#123a2a;border:1px solid #2c6b52"></b>linear_attention（Gated DeltaNet，递归状态）</span>
+      <span><b style="background:#2b2348;border:1px solid #5a4a8a"></b>full_attention（KV Cache + 门控）</span>
+    </div>
+    <div class="pipebox" id="layerInfo" style="margin-top:12px">点击上方任意一层 → 这里显示该层的数据通路。</div>
+  </div>
+
+  <h2>两条路径：Prefill 与 Decode 的差别</h2>
+  <div class="grid g2">
+    <div class="card tight">
+      <h3>Prefill <span class="tag p">一次读入 N 个 token</span></h3>
+      <p class="muted">把整段提示词（可能很多 token）<strong>一次性</strong>灌进网络。数据形状是 <span class="shapes">[N, 5120]</span>。这一步每个位置都要算注意力，计算量大但只做一次。本项目还会把它切成 chunk（默认 128）分块推进，控制显存峰值。</p>
+      <div class="filetip">对应代码：<code>main.cpp</code> 的 prefill 循环 / <code>worker.cpp</code> 每轮推进一个 chunk</div>
+    </div>
+    <div class="card tight">
+      <h3>Decode <span class="tag d">一次只来 1 个 token</span></h3>
+      <p class="muted">生成阶段每次都只处理<strong>新产生的 1 个 token</strong>，形状 <span class="shapes">[1, 5120]</span>。历史信息不用重算——存在 <a href="03-kv-cache.html">KV Cache</a> 里。这一步计算量小但被反复执行，所以引擎会专门为它做 CUDA Graph、批量 decode 等优化。</p>
+      <div class="filetip">对应代码：<code>engine.decode()</code> / <code>engine.decode_batch()</code></div>
+    </div>
+  </div>
+
+  <h2>把每一阶段对应到真实代码</h2>
+  <div class="card">
+    <pre><code>输入(ids, positions)  →  engine.embed(ids)              // 查表得到 [T,5120]
+                      →  engine.step(hidden, positions)  // 64 层循环，见下
+                      →  engine.logits(hidden)           // 取最后一个位置，投到词表 [248320]
+                      →  sample(logits)                  // 选出一个 token id
+                      →  再作为下一轮 decode 的输入 ↺</code></pre>
+    <div class="filetip">engine.step() 里每一层做两件事：<strong>注意力子层</strong>（full 或 delta）+ <strong>MLP 子层</strong>（SwiGLU），每层都带残差相加。</div>
+  </div>
+
+  <div class="note">学完这页，请记住三件事：① 数据是 <span class="shapes">[token 数, 5120]</span> 的张量；② 它要在 64 层里被反复加工；③ 最后一步选出的 token 会回环成为新输入。接下来就逐块拆开。</div>
+</div>
+
+<script>
+const NAV=[
+  {t:"① 图片 + 文字",b:"原始输入：<b>文本 token id</b> 和<b>图片</b>。文本被分词成 id 序列；图片被切成 patch。这一步还在模型之外。"},
+  {t:"② 预处理",b:"Python 离线完成：文本分词 → <code>input_ids</code>；图片切 patch、算坐标、算 mRoPE 位置。产物是一个 <code>avi-request-v1</code> 请求目录。见 <code>tools/prepare_request.py</code>。"},
+  {t:"③ Embedding 查表",b:"把每个 token id 换成一条向量：<code>engine.embed(ids)</code>。输出形状 <span class='shapes'>[T, 5120]</span>。图片特征会用 <code>index_copy_</code> 替换掉 image token 对应的位置。"},
+  {t:"④ 64 层 Transformer",b:"核心计算区。<code>engine.step()</code> 把这批向量依次送进 64 层；每层 = 注意力子层 + MLP 子层，并做残差相加。两种层交替出现（3 线性 + 1 完整）。"},
+  {t:"⑤ 归一化 + 输出头",b:"<code>engine.logits()</code> 先做最终 RMSNorm，再用 <code>lm_head</code> 把 5120 维映射到词表 248320 维，得到每个词的“打分”。"},
+  {t:"⑥ 采样出新 token",b:"<code>sample()</code> 根据打分（可加温度/top-k/top-p）选出一个 token。它会被拼回输入，再次进入第 2~6 步，直到遇到结束符。↺"}
+];
+const PREPOST={
+  prefill:"Prefill：整段提示一次性读入，形状 [N,5120]，每步推进一个 chunk。",
+  decode:"Decode：只输入新 token，形状 [1,5120]，靠 KV Cache 复用历史。"
+};
+let cur=-1, timer=null, mode="prefill";
+const flow=document.getElementById("flow");
+const nodes=[...flow.querySelectorAll(".fnode")];
+const bar=document.getElementById("bar"), dot=document.getElementById("dot");
+const looplabel=document.getElementById("looplabel");
+const dTitle=document.getElementById("d-title"), dBody=document.getElementById("d-body");
+
+function render(i,loop){
+  nodes.forEach((n,k)=>{n.classList.toggle("on",k===i&&!loop);n.classList.toggle("done",k<i);});
+  const pct=i<0?0:(i/(nodes.length-1))*100;
+  bar.style.width=pct+"%";
+  dot.style.left=pct+"%";
+  if(i<0){dTitle.textContent="点击任意阶段，或按“播放”";dBody.innerHTML="每个方块代表数据流动的一个阶段。";looplabel.textContent="数据包位置：待发送";return;}
+  dTitle.textContent=NAV[i].t;
+  dBody.innerHTML=NAV[i].b+(i===2||i===3?" <span class='pill acc'>"+PREPOST[mode]+"</span>":"");
+  looplabel.textContent=loop?"↺ 已回环：新 token 成为输入":"数据包位置："+NAV[i].t.replace(/^[①②③④⑤⑥]\s*/,"");
+}
+function step(dir){cur+=dir;if(cur<0)cur=0;if(cur>NAV.length-1)cur=NAV.length-1;render(cur,false);}
+document.getElementById("next").onclick=()=>step(1);
+document.getElementById("prev").onclick=()=>step(-1);
+document.getElementById("reset").onclick=()=>{clearInterval(timer);timer=null;cur=-1;render(-1);document.getElementById("play").textContent="▶ 播放";};
+document.getElementById("play").onclick=function(){
+  if(timer){clearInterval(timer);timer=null;this.textContent="▶ 继续";return;}
+  this.textContent="⏸ 暂停";
+  if(cur>=NAV.length-1)cur=-1;
+  timer=setInterval(()=>{
+    if(cur>=NAV.length-1){clearInterval(timer);timer=null;render(NAV.length-1,true);document.getElementById("play").textContent="▶ 重播";return;}
+    cur++;render(cur,false);
+  },900);
+};
+document.getElementById("mode-prefill").onclick=function(){mode="prefill";this.classList.add("sel");document.getElementById("mode-decode").classList.remove("sel");render(cur,false);};
+document.getElementById("mode-decode").onclick=function(){mode="decode";this.classList.add("sel");document.getElementById("mode-prefill").classList.remove("sel");render(cur,false);};
+
+// 64 层堆叠
+const LT=[];
+for(let i=0;i<64;i++)LT.push((i%4===3)?"full":"lin");
+const stack=document.getElementById("layers"), info=document.getElementById("layerInfo");
+LT.forEach((k,i)=>{
+  const d=document.createElement("div");
+  d.className="lyr "+k;d.textContent=i;d.title="第 "+i+" 层 · "+(k==="full"?"full_attention":"linear_attention");
+  d.onclick=()=>{
+    [...stack.children].forEach(c=>c.classList.remove("on"));d.classList.add("on");
+    info.innerHTML= k==="full"
+      ? "<b>第 "+i+" 层 · full_attention</b>：从 <code>x</code> 投影出 Q/K/V(+gate)，RoPE 后写入 <b>KV Cache</b>，用 <code>gqa_decode</code> 对全部历史做注意力，再乘 sigmoid 门控。历史越长，注意力越大。"
+      : "<b>第 "+i+" 层 · linear_attention (Gated DeltaNet)</b>：不做“对所有历史求注意力”，而是维护一个固定大小的<b>递归状态</b> <span class='shapes'>[H,K,V]</span>，每来一个 token 就按 delta 规则更新。显存不随长度增长。";
+  };
+  stack.appendChild(d);
+});
+let rnd=0; for(let i=0;i<64;i++) if(LT[i]==="full") rnd++;
+document.getElementById("layerInfo").innerHTML="这 64 层里有 <b>"+(64-rnd)+"</b> 层线性注意力、<b>"+rnd+"</b> 层完整注意力（每 4 层出现 1 次）。点击任意层查看细节。";
+</script>
+</body>
+</html>

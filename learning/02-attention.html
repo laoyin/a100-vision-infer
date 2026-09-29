@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>② 注意力机制 · AVI 学习地图</title>
+<link rel="stylesheet" href="assets/style.css">
+<style>
+  .agrid{display:grid;gap:3px;margin-top:8px}
+  .cell{aspect-ratio:1;border-radius:6px;display:flex;align-items:center;justify-content:center;
+    font-size:11px;font-family:var(--mono);cursor:pointer;border:1px solid transparent;transition:.12s;color:#02121c}
+  .cell:hover{border-color:#fff}
+  .lbl{display:flex;align-items:center;justify-content:center;font-size:11.5px;color:var(--muted);
+    font-family:var(--mono);padding:2px}
+  .qlbl{justify-content:flex-end;padding-right:8px}
+  .masked{background:#0a0f1e !important;color:#43506e !important;border:1px dashed #2a3350}
+  .selected{outline:2px solid #fff;outline-offset:1px}
+  .rowhl{box-shadow:0 0 0 2px rgba(76,201,240,.6)}
+  .bars{margin-top:10px}
+  .barline{display:flex;align-items:center;gap:8px;margin:4px 0;font-size:12px}
+  .barline .name{width:70px;text-align:right;color:var(--muted);font-family:var(--mono)}
+  .barline .b{height:14px;border-radius:4px;background:linear-gradient(90deg,var(--accent),var(--accent2));transition:width .3s}
+  .barline .v{font-family:var(--mono);color:#9fd8ff;width:54px}
+  .steps{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0}
+  .steps .s{flex:1 1 150px;background:#0d1426;border:1px solid var(--border);border-radius:10px;padding:10px 12px}
+  .steps .s b{color:var(--accent)}
+  .formula{font-family:var(--mono);background:#0a0f1e;border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:#9fd8ff;display:inline-block;margin:4px 0}
+  .legendbar{display:flex;align-items:center;gap:8px;font-size:11px;color:var(--muted);margin-top:8px}
+  .grad{height:10px;width:160px;border-radius:5px;background:linear-gradient(90deg,#0a0f1e,#4cc9f0,#b388ff)}
+</style>
+</head>
+<body>
+<nav class="top"><div class="inner">
+  <span class="brand">AVI 学习地图</span>
+  <a href="index.html">总览</a>
+  <a href="01-transformer-flow.html">① 数据流</a>
+  <a class="active" href="02-attention.html">② 注意力</a>
+  <a href="03-kv-cache.html">③ KV Cache</a>
+  <a href="04-rope.html">④ RoPE</a>
+  <a href="05-inference.html">⑤ 推理与采样</a>
+  <a href="06-tensor-parallel.html">⑥ 张量并行</a>
+  <a href="07-quantization.html">⑦ 量化</a>
+  <a href="08-optimized-cu.html">⑧ 算子</a>
+  <a href="09-hybrid-attention.html">⑨ 混合注意力</a>
+  <a href="10-speculative.html">⑩ 投机解码</a>
+</div></nav>
+
+<div class="wrap">
+  <h1>② 注意力：每个 token 该“看谁”</h1>
+  <p class="lead">注意力就是给每个 token 算一份“该关注谁”的权重表。点格子、切开关，看着这张表从原始打分 → 因果掩码 → Softmax 一步步变形。</p>
+
+  <div class="card">
+    <h3>第一个 token 是“查询 Q”，它去问所有 token 的“钥匙 K”</h3>
+    <p class="muted">每个 token 都会投影出三个向量：<b>Q</b>（我要找什么）、<b>K</b>（我能提供什么）、<b>V</b>（我真正携带的信息）。用 Q 和每个 K 点积得到“匹配分”，再归一化成权重，最后按权重把 V 加起来。</p>
+    <div class="steps">
+      <div class="s"><b>1. 投影</b><br><span class="muted">q=x·Wq，k=x·Wk，v=x·Wv</span></div>
+      <div class="s"><b>2. 打分</b><br><span class="muted">score = q·k / √d</span></div>
+      <div class="s"><b>3. 掩码</b><br><span class="muted">未来的 token 置为 -∞</span></div>
+      <div class="s"><b>4. 归一化</b><br><span class="muted">softmax → 每行和为 1</span></div>
+      <div class="s"><b>5. 加权求和</b><br><span class="muted">out = Σ 权重·v</span></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <button id="t-mask" class="small sel">☑ 因果掩码</button>
+      <button id="t-soft" class="small sel">☑ Softmax</button>
+      <span class="muted" style="font-size:13px">点击任意格子查看那一对 (查询→钥匙)</span>
+    </div>
+    <div style="overflow:auto">
+      <div class="agrid" id="grid"></div>
+    </div>
+    <div class="legendbar">
+      <span>低</span><span class="grad"></span><span>高</span>
+      <span style="margin-left:14px">上三角（虚线格）= 被因果掩码挡住的“未来”</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3 id="q-title">查询 token：— 的注意力分布</h3>
+    <div class="bars" id="bars"></div>
+    <p class="muted" style="margin-bottom:0" id="q-note">点上面网格里的任意一行，这里会画出该 token 把注意力分给了哪些 token。注意它只会分给“自己及左边”的历史。</p>
+  </div>
+
+  <h2>为什么要有因果掩码？</h2>
+  <p>语言模型是<strong>从左往右</strong>生成的。计算第 i 个位置时，绝不能偷看第 i+1 个位置（那是还没生成的“未来”）。所以把矩阵的<b>上三角</b>全部设成 \(-∞\)，Softmax 之后它们的权重就变成 0。</p>
+
+  <h2>本项目里的三个“不一样”</h2>
+  <div class="grid g3">
+    <div class="card tight">
+      <h3>① GQA 分组</h3>
+      <p class="muted">24 个查询头，但只有 <b>4 个 K/V 头</b>。每 6 个查询头共享同一份 K/V，省显存。解码时用 <code>gqa_decode</code> kernel 计算。</p>
+    </div>
+    <div class="card tight">
+      <h3>② 输出门控</h3>
+      <p class="muted">注意力结果还要乘一个 <code>gate.sigmoid()</code>——注意力算完，再用一个门决定“放多少出去”。</p>
+    </div>
+    <div class="card tight">
+      <h3>③ 前缀拼接</h3>
+      <p class="muted">解码时 query 只有 1 个，但 K/V 是<b>整段历史</b>。项目用显式 offset 掩码而不是简单 <code>causal=true</code>，以正确处理分块。</p>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>对应真实代码 <code>Engine::full_attention()</code></h3>
+    <pre><code>// 1) 投影出 Q/K/V(+gate)，本项目把它融合成一次 qkv_gate GEMM
+q = norm(qg[...,0:D], q_norm);  gate = qg[...,D:2D];
+k = norm(proj[...,2HD : 2HD+HK·D], k_norm);
+v = proj[...,2HD+HK·D : ...];
+
+// 2) 加位置信息（RoPE，见第 4 课）
+q = fused_rope(q, positions, ...); k = fused_rope(k, positions, ...);
+
+// 3) 写入 KV Cache，然后算注意力
+out = gqa_decode(q, k, v, state.key, state.value, offset) * gate.sigmoid();
+return linear(out, o_proj, reduce=true);   // 输出投影，TP 下要 AllReduce</code></pre>
+  </div>
+
+  <div class="note"><b>一句话抓住：</b>注意力 = “打分 → 屏蔽未来 → softmax 成权重 → 按权重加权平均 V”。它就是 token 之间互相交换信息的方式。</div>
+</div>
+
+<script>
+const TOK=["我们","来","看","注意","力","怎么","算"];
+const T=TOK.length;
+// 造一个“局部关注 + 波动”的原始打分矩阵（教学用，非真实数据）
+function base(i,j){return 1.6*Math.exp(-Math.abs(i-j)/1.3)+0.9*Math.sin(i*1.7+j*2.3)+0.6*Math.cos(i*0.6-j*1.1);}
+let useMask=true, useSoft=true, selQ=3;
+const grid=document.getElementById("grid");
+const barsEl=document.getElementById("bars");
+
+function rowWeights(i){
+  // 返回第 i 行的最终权重（含掩码/softmax）
+  const raw=[];
+  for(let j=0;j<T;j++){
+    if(useMask && j>i) raw.push(null);           // 被掩码
+    else raw.push(base(i,j));
+  }
+  if(!useSoft){ // 直接把原始分按行归一化到 0~1 以便上色
+    const vals=raw.filter(v=>v!==null); const mn=Math.min(...vals),mx=Math.max(...vals);
+    return raw.map(v=>v===null?null:(mx===mn?0.5:(v-mn)/(mx-mn)));
+  }
+  const vals=raw.filter(v=>v!==null); const mx=Math.max(...vals);
+  const ex=raw.map(v=>v===null?null:Math.exp(v-mx));
+  const s=ex.reduce((a,b)=>a+(b||0),0);
+  return ex.map(v=>v===null?null:v/s);
+}
+function color(w){
+  if(w===null) return "";
+  // 深蓝 -> 青 -> 紫
+  const a=Math.min(1,w);
+  const r=Math.round(10+a*150), g=Math.round(15+a*150), b=Math.round(30+a*200);
+  return `rgb(${r},${g},${b})`;
+}
+function build(){
+  grid.style.gridTemplateColumns=`64px repeat(${T},minmax(34px,1fr))`;
+  grid.innerHTML="";
+  grid.appendChild(el("lbl qlbl","Q\\K"));
+  for(const t of TOK){grid.appendChild(el("lbl",t));}
+  for(let i=0;i<T;i++){
+    grid.appendChild(el("lbl qlbl",TOK[i]));
+    const row=rowWeights(i);
+    for(let j=0;j<T;j++){
+      const w=row[j];
+      const c=document.createElement("div");
+      c.className="cell"+(w===null?" masked":"")+(i===selQ?" rowhl":"");
+      if(w!==null){c.style.background=color(w);c.textContent=w.toFixed(2);}
+      c.onclick=()=>{selQ=i;build();drawBars();};
+      c.title=`${TOK[i]} ← ${TOK[j]}`;
+      grid.appendChild(c);
+    }
+  }
+}
+function el(cls,txt){const d=document.createElement("div");d.className=cls;if(txt)d.textContent=txt;return d;}
+function drawBars(){
+  const row=rowWeights(selQ);
+  document.getElementById("q-title").textContent="查询 token：“"+TOK[selQ]+"” 的注意力分布";
+  barsEl.innerHTML="";
+  row.forEach((w,j)=>{
+    const line=document.createElement("div");line.className="barline";
+    const name=el("name",TOK[j]);
+    const track=document.createElement("div");track.style.flex="1";track.style.display="flex";track.style.alignItems="center";
+    const b=document.createElement("div");b.className="b";
+    const shown=w===null?0:w;
+    b.style.width=(shown*100)+"%";b.style.background=w===null?"#2a3350":"";
+    track.appendChild(b);
+    const v=el("v",w===null?"掩码":"×"+(w*100).toFixed(1)+"%");
+    line.append(name,track,v);barsEl.appendChild(line);
+  });
+  document.getElementById("q-note").innerHTML=useMask
+    ? "该 token 只把注意力分给<b>自己及左侧</b>的 token（右侧被因果掩码挡住）。"
+    : "关闭掩码后，它可以“看到未来”——但真实推理里绝不允许这样。";
+  document.getElementById("q-note").innerHTML+=useSoft?" 权重来自 softmax，每行和为 1。":"";
+}
+document.getElementById("t-mask").onclick=function(){useMask=!useMask;this.classList.toggle("sel",useMask);this.textContent=(useMask?"☑":"☐")+" 因果掩码";build();drawBars();};
+document.getElementById("t-soft").onclick=function(){useSoft=!useSoft;this.classList.toggle("sel",useSoft);this.textContent=(useSoft?"☑":"☐")+" Softmax";build();drawBars();};
+build();drawBars();
+</script>
+</body>
+</html>

@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AVI 学习地图 · 总览</title>
+<link rel="stylesheet" href="assets/style.css">
+<style>
+  .hero{padding:8px 0 4px}
+  .hero .sub{color:var(--muted);font-size:16px;max-width:720px}
+  .cards{display:grid;grid-template-columns:repeat(2,1fr);gap:14px;margin-top:18px}
+  @media(max-width:820px){.cards{grid-template-columns:1fr}}
+  .topic{display:block;background:linear-gradient(180deg,var(--panel),#101731);border:1px solid var(--border);
+    border-radius:14px;padding:16px 16px 14px;transition:.18s;position:relative;overflow:hidden}
+  .topic:hover{border-color:var(--accent);transform:translateY(-2px);text-decoration:none}
+  .topic .no{font-family:var(--mono);font-size:12px;color:var(--accent);letter-spacing:1px}
+  .topic h3{margin:4px 0 4px;color:var(--text);font-size:17px}
+  .topic p{margin:0;color:var(--muted);font-size:13.5px}
+  .topic .files{margin-top:8px;font-family:var(--mono);font-size:11.5px;color:#7f93b8}
+  .topic::after{content:"";position:absolute;right:-30px;top:-30px;width:90px;height:90px;border-radius:50%;
+    background:radial-gradient(circle,var(--accent) 0,transparent 70%);opacity:.10}
+  .flowbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;font-size:13px;margin:6px 0 2px}
+  .flowbar .node{background:#0d1426;border:1px solid var(--border);border-radius:9px;padding:6px 10px}
+  .flowbar .arrow{color:var(--accent)}
+  .note{background:#0d1730;border:1px dashed var(--border);border-radius:12px;padding:12px 16px;color:var(--muted);font-size:13.5px}
+</style>
+</head>
+<body>
+<nav class="top"><div class="inner">
+  <span class="brand">AVI 学习地图</span>
+  <a class="active" href="index.html">总览</a>
+  <a href="01-transformer-flow.html">① 数据流</a>
+  <a href="02-attention.html">② 注意力</a>
+  <a href="03-kv-cache.html">③ KV Cache</a>
+  <a href="04-rope.html">④ RoPE</a>
+  <a href="05-inference.html">⑤ 推理与采样</a>
+  <a href="06-tensor-parallel.html">⑥ 张量并行</a>
+  <a href="07-quantization.html">⑦ 量化</a>
+  <a href="08-optimized-cu.html">⑧ 算子</a>
+  <a href="09-hybrid-attention.html">⑨ 混合注意力</a>
+  <a href="10-speculative.html">⑩ 投机解码</a>
+</div></nav>
+
+<div class="wrap">
+  <div class="hero">
+    <h1>看懂一个 LLM 推理引擎，从这里开始</h1>
+    <p class="sub">
+      这套页面把 <code>a100-vision-infer</code> 这个 C++/CUDA 推理引擎里最难懂的概念，
+      拆成 <b>10 个可交互的可视化</b>。目标只有一个：让你先在脑子里建立
+      <b>“一次推理时，数据到底怎么从 A 流到 B”</b> 的整体直觉，再回到真实代码去看细节。
+    </p>
+  </div>
+
+  <h2>先记住这张“总数据流”</h2>
+  <div class="card">
+    <div class="flowbar">
+      <span class="node">图片 + 文字</span><span class="arrow">→</span>
+      <span class="node">预处理<br><small>Python</small></span><span class="arrow">→</span>
+      <span class="node">Embedding 查表<br><small>engine.embed</small></span><span class="arrow">→</span>
+      <span class="node">64 层 Transformer<br><small>engine.step</small></span><span class="arrow">→</span>
+      <span class="node">归一化 + 输出头<br><small>engine.logits</small></span><span class="arrow">→</span>
+      <span class="node">采样出新 token<br><small>worker.sample</small></span><span class="arrow">↺</span>
+    </div>
+    <p class="muted" style="margin-bottom:0">
+      第 5 步产生的 token 会拼回输入，再走一遍第 3~6 步，如此循环，
+      <b>直到遇到结束符或达到长度上限</b>。这就是“自回归生成”。
+    </p>
+  </div>
+
+  <h2>端到端串讲：一次请求 → 一串 token</h2>
+  <p class="muted" style="margin-top:0">
+    把前面 10 个主题串成一条线。假设你发来一句话（或一张图 + 一句话），
+    引擎内部会经过下面这些站，每一站都能点回对应主题：
+  </p>
+  <div class="grid g2">
+    <div class="card tight">
+      <h3>① 请求进来 <span class="pill acc">HTTP / SSE</span></h3>
+      <p class="muted">常驻 <code>worker</code> 收到请求，负责编排整个生成循环；答案用 SSE 逐字推回浏览器。</p>
+      <div class="filetip">src/worker.cpp · tools/serve.py</div>
+    </div>
+    <div class="card tight">
+      <h3>② 预处理（多模态） <span class="pill">Python</span></h3>
+      <p class="muted">图片切成 patch 过视觉前端，文字过 tokenizer；图文拼成同一段输入 token 序列。</p>
+      <div class="filetip">tools/prepare_request.py</div>
+    </div>
+    <div class="card tight">
+      <h3>③ Embedding 查表</h3>
+      <p class="muted">每个 token id 查表变成 <code>[T, 5120]</code> 的隐藏状态——数据第一次“变成向量”。</p>
+      <div class="filetip">engine.embed</div>
+    </div>
+    <div class="card tight">
+      <h3>④ Prefill（吃下整段）</h3>
+      <p class="muted">整段输入一次并行过 64 层，顺手写满 <a href="03-kv-cache.html">KV Cache</a> 与线性注意力的递归状态。</p>
+      <div class="filetip">engine.step(T&gt;1)</div>
+    </div>
+    <div class="card tight">
+      <h3>⑤ 64 层内部</h3>
+      <p class="muted">每层：RMSNorm → <a href="09-hybrid-attention.html">混合注意力</a>（3 线性 + 1 全注意力，含 <a href="04-rope.html">mRoPE</a>）→ SwiGLU；TP=2 时到处 <a href="06-tensor-parallel.html">AllReduce</a>。</p>
+      <div class="filetip">src/engine.cpp · step()</div>
+    </div>
+    <div class="card tight">
+      <h3>⑥ 归一化 + 输出头</h3>
+      <p class="muted">最后过 RMSNorm，再乘输出头得到 <code>248320</code> 维 logits——每个词一个分数。</p>
+      <div class="filetip">engine.logits</div>
+    </div>
+    <div class="card tight">
+      <h3>⑦ 采样出一个 token</h3>
+      <p class="muted">按温度 / top-k / top-p 从概率里挑一个 token（见 <a href="05-inference.html">第 5 课</a>）。</p>
+      <div class="filetip">src/worker.cpp · sample()</div>
+    </div>
+    <div class="card tight">
+      <h3>⑧ Decode 循环</h3>
+      <p class="muted">把新 token 追加进输入，只算这 1 个 token（复用缓存），回到 ⑤ 再走一遍；直到命中 EOS 或长度上限。想更快？见 <a href="10-speculative.html">第 10 课 投机解码</a>。</p>
+      <div class="filetip">engine.step(T=1) ↺</div>
+    </div>
+  </div>
+  <div class="note" style="margin-top:14px">
+    <b>一句话总结：</b>Prefill 一次算很多 token（④，算力密集），Decode 每次只算一个（⑧，访存密集）。
+    这两种负载特性，正是后面 <a href="06-tensor-parallel.html">张量并行</a> 与 <a href="07-quantization.html">FP8 量化</a> 针对优化的对象；而 Decode 的访存瓶颈，还能靠 <a href="10-speculative.html">投机解码</a> 进一步摊薄。
+  </div>
+
+  <h2>10 个主题（建议按顺序学）</h2>
+  <div class="cards">
+    <a class="topic" href="01-transformer-flow.html">
+      <div class="no">TOPIC 01</div>
+      <h3>数据流动整体直觉</h3>
+      <p>点一下就能看数据包在“预处理 → 多层 Transformer → 采样”之间流动，并区分 Prefill 与 Decode 两条路径。</p>
+      <div class="files">src/main.cpp · src/engine.cpp</div>
+    </a>
+    <a class="topic" href="02-attention.html">
+      <div class="no">TOPIC 02</div>
+      <h3>注意力机制</h3>
+      <p>Q/K/V、注意力分数矩阵、因果掩码、Softmax、加权求和——一层一层看它怎么算出“该关注谁”。</p>
+      <div class="files">src/engine.cpp · full_attention()</div>
+    </a>
+    <a class="topic" href="03-kv-cache.html">
+      <div class="no">TOPIC 03</div>
+      <h3>KV Cache</h3>
+      <p>为什么生成第 100 个字不用重算前 99 个字？动画对比“无缓存重算”与“有缓存追加”。</p>
+      <div class="files">src/engine.cpp · State{key,value}</div>
+    </a>
+    <a class="topic" href="04-rope.html">
+      <div class="no">TOPIC 04</div>
+      <h3>RoPE 位置编码</h3>
+      <p>拖动滑块，看一个向量如何被“按位置旋转”。再理解本项目的 mRoPE（图文三维位置）。</p>
+      <div class="files">src/optimized.cu · fused_rope</div>
+    </a>
+    <a class="topic" href="05-inference.html">
+      <div class="no">TOPIC 05</div>
+      <h3>推理与采样</h3>
+      <p>分块 prefill 时间线 + 采样可视化：贪心 / 温度 / top-k / top-p 到底怎么从概率里挑出一个 token。</p>
+      <div class="files">src/worker.cpp · sample()</div>
+    </a>
+    <a class="topic" href="06-tensor-parallel.html">
+      <div class="no">TOPIC 06</div>
+      <h3>张量并行 TP</h3>
+      <p>一个矩阵怎么切给 2 张卡？列并行、行并行、AllReduce 归约，动画演示拼回完整结果。</p>
+      <div class="files">tools/format_utils.py · partition()</div>
+    </a>
+    <a class="topic" href="07-quantization.html">
+      <div class="no">TOPIC 07</div>
+      <h3>量化 FP8</h3>
+      <p>输入任意数字，实时看它被编码成 FP8 E4M3FN 的 8 个 bit，以及误差有多少。</p>
+      <div class="files">tools/format_utils.py · quantize_fp8()</div>
+    </a>
+    <a class="topic" href="08-optimized-cu.html">
+      <div class="no">TOPIC 08</div>
+      <h3>optimized.cu 算子</h3>
+      <p>算子融合、GEMM 分块、寄存器里做递归扫描——对照 <code>optimized.cu</code> 看优化思路。</p>
+      <div class="files">src/optimized.cu · src/kernels.cu</div>
+    </a>
+    <a class="topic" href="09-hybrid-attention.html">
+      <div class="no">TOPIC 09</div>
+      <h3>混合注意力（Gated DeltaNet）</h3>
+      <p>64 层里只有 16 层用全注意力，其余 48 层是线性注意力。看清“便宜的多用、贵的少用”的架构取舍。</p>
+      <div class="files">src/engine.cpp · delta_attention()</div>
+    </a>
+    <a class="topic" href="10-speculative.html">
+      <div class="no">TOPIC 10</div>
+      <h3>投机解码（MTP）</h3>
+      <p>用小草稿模型批量猜、目标模型一趟判。演示贪心验证、commit 与 KV/递归状态回滚。</p>
+      <div class="files">src/speculative.cpp · src/speculative.h</div>
+    </a>
+  </div>
+
+  <h2>怎么用这套页面</h2>
+  <div class="grid g2">
+    <div class="card tight">
+      <h3>1. 先玩，再读</h3>
+      <p class="muted">每个页面都有可点的按钮、可拖的滑块。先动手感受，再回来看文字和代码路径。</p>
+    </div>
+    <div class="card tight">
+      <h3>2. 对照真实代码</h3>
+      <p class="muted">每个概念都标注了它对应项目里的哪个文件/函数。看完动画就去 <code>src/</code> 里找它。</p>
+    </div>
+    <div class="card tight">
+      <h3>3. 抓住三个灵魂</h3>
+      <p class="muted"><b>混合注意力</b>（Full + Gated DeltaNet）、<b>张量并行</b>、<b>FP8 量化</b>——搞懂这三个就懂了大半。</p>
+    </div>
+    <div class="card tight">
+      <h3>4. 诚实看边界</h3>
+      <p class="muted">项目本身还是“实验版、待 A100 验收”。学的是它的<b>设计意图</b>，不是已验证的成熟系统。</p>
+    </div>
+  </div>
+
+  <div class="note">
+    <b>提示：</b>本目录是纯静态 HTML，直接用浏览器打开 <code>index.html</code> 即可，
+    无需服务器、无需联网。所有动画都在本地运行。
+  </div>
+</div>
+</body>
+</html>

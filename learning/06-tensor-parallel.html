@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>⑥ 张量并行 · AVI 学习地图</title>
+<link rel="stylesheet" href="assets/style.css">
+<style>
+  .matwrap{display:grid;grid-template-columns:44px 1fr;gap:8px;align-items:center}
+  .mat{display:grid;gap:3px}
+  .mcell{height:30px;border-radius:5px;border:1px solid var(--border);background:#0a0f1e;
+    display:flex;align-items:center;justify-content:center;font-size:10px;font-family:var(--mono);color:#5a6a90;transition:.25s}
+  .mcell.r0{background:#12233f;border-color:#3a5c8a;color:#bfe0ff}
+  .mcell.r1{background:#2b2348;border-color:#6a52a0;color:#e0d0ff}
+  .mcell.r2{background:#123a2a;border-color:#2c6b52;color:#8fe0b0}
+  .mcell.r3{background:#3a2a12;border-color:#8a6a2c;color:#e9c86b}
+  .axis-x{display:flex;gap:3px;font-size:10px;color:var(--muted);font-family:var(--mono)}
+  .axis-x span{flex:1;text-align:center}
+  .axis-y{display:flex;flex-direction:column;gap:3px;font-size:10px;color:var(--muted);font-family:var(--mono);justify-content:center}
+  .axis-y span{height:30px;display:flex;align-items:center;justify-content:flex-end;padding-right:4px}
+  .gpus{display:grid;gap:12px;margin-top:10px}
+  .gpu{background:#0d1426;border:1px solid var(--border);border-radius:12px;padding:12px}
+  .gpu h4{margin:0 0 6px;font-size:13px;color:var(--accent)}
+  .vec{display:flex;gap:4px;flex-wrap:wrap}
+  .vec b{font-family:var(--mono);font-size:12px;background:#0a0f1e;border:1px solid var(--border);
+    border-radius:5px;padding:3px 7px;color:#cfe9ff;font-weight:400}
+  .vec b.sum{background:#123a2a;border-color:#2c6b52;color:#8fe0b0}
+  .arrowdown{text-align:center;color:var(--accent);font-size:22px;margin:4px 0}
+  .modeseg button.sel{border-color:var(--accent);color:#fff;background:#12233f}
+  .legend b.r0{background:#12233f;border:1px solid #3a5c8a}
+  .legend b.r1{background:#2b2348;border:1px solid #6a52a0}
+</style>
+</head>
+<body>
+<nav class="top"><div class="inner">
+  <span class="brand">AVI 学习地图</span>
+  <a href="index.html">总览</a>
+  <a href="01-transformer-flow.html">① 数据流</a>
+  <a href="02-attention.html">② 注意力</a>
+  <a href="03-kv-cache.html">③ KV Cache</a>
+  <a href="04-rope.html">④ RoPE</a>
+  <a href="05-inference.html">⑤ 推理与采样</a>
+  <a class="active" href="06-tensor-parallel.html">⑥ 张量并行</a>
+  <a href="07-quantization.html">⑦ 量化</a>
+  <a href="08-optimized-cu.html">⑧ 算子</a>
+  <a href="09-hybrid-attention.html">⑨ 混合注意力</a>
+  <a href="10-speculative.html">⑩ 投机解码</a>
+</div></nav>
+
+<div class="wrap">
+  <h1>⑥ 张量并行：把一个大矩阵切给多张卡</h1>
+  <p class="lead">本项目的首要配置是 <b>TP=2（两张 A100）</b>。一个权重矩阵太大、单卡放不下或算得慢，就把它<b>沿某个方向切开</b>，每张卡只存一半、算一半。难点在于：算完之后<b>怎么把结果拼回完整的样子</b>。</p>
+
+  <div class="card">
+    <div class="row">
+      <span class="muted" style="font-size:13px">选择 TP：</span>
+      <span class="modeseg">
+        <button id="tp1" class="small">TP=1</button>
+        <button id="tp2" class="small sel">TP=2</button>
+        <button id="tp4" class="small">TP=4</button>
+      </span>
+      <span class="muted" style="font-size:13px;margin-left:10px">切分方式：</span>
+      <span class="modeseg">
+        <button id="col" class="small sel">列并行（切输出维）</button>
+        <button id="row" class="small">行并行（切输入维）</button>
+      </span>
+    </div>
+    <p class="muted" id="splitNote"></p>
+    <div class="matwrap">
+      <div class="axis-y" id="axisY"></div>
+      <div>
+        <div class="axis-x" id="axisX"></div>
+        <div class="mat" id="mat"></div>
+      </div>
+    </div>
+    <div class="legend">
+      <span><b class="r0"></b>rank0 持有</span>
+      <span><b class="r1"></b>rank1 持有</span>
+      <span class="muted">（TP=4 时再细分给 rank2/rank3）</span>
+    </div>
+    <div class="filetip">本项目的切分规则在 <code>tools/format_utils.py · partition()</code>：<code>chunk(values)</code> 切第 0 维（输出），用于 <code>gate/up/q/k/v_proj</code>；<code>chunk(values,1)</code> 切第 1 维（输入），用于 <code>down_proj/o_proj/out_proj</code>。</div>
+  </div>
+
+  <h2>两种切法，代价不同</h2>
+  <div class="grid g2">
+    <div class="card tight">
+      <h3>列并行 <span class="tag p">切输出</span></h3>
+      <p class="muted">每张卡算出一部分<b>输出通道</b>。比如 <code>q_proj</code> 24 个头，TP=2 时每卡算 12 个头的 Q。好处：<b>不需要通信</b>就能各自往下算（直到需要拼的地方）。</p>
+    </div>
+    <div class="card tight">
+      <h3>行并行 <span class="tag d">切输入</span></h3>
+      <p class="muted">每张卡拿到输入的<b>一部分</b>，算出的是“部分和”。比如 <code>o_proj</code>，两卡各算一半贡献，必须 <b>AllReduce 相加</b>才是完整结果。</p>
+    </div>
+  </div>
+
+  <h2>AllReduce：把“部分和”合并成“全和”</h2>
+  <p>行并行算完，每张卡手里都是一个不完整的结果。要对位相加。点按钮看它怎么合：</p>
+  <div class="card">
+    <div class="row">
+      <button id="reduce" class="primary small">⇄ 执行 AllReduce</button>
+      <button id="resetR" class="small">↺ 重置</button>
+      <span class="pill" id="rnote">两张卡各持一半贡献</span>
+    </div>
+    <div class="gpus" id="gpus"></div>
+    <div class="arrowdown" id="downArrow">⇅ NCCL AllReduce</div>
+    <div class="filetip">对应 <code>engine.cpp · sum()</code>：<code>ncclAllReduce(..., ncclFloat, ncclSum, ...)</code>。每个 rank 都会得到<b>相同</b>的完整结果（这是“All”的含义），于是后续每层可以继续各算各的。</div>
+  </div>
+
+  <div class="card">
+    <pre><code>// engine.cpp · Engine::sum()  —— 张量并行的“缝合点”
+ncclAllReduce(buffer, buffer, count, ncclFloat, ncclSum, comm, stream);
+// 每个 rank 把各自的部分和累加，结果广播回所有 rank
+
+// 于是 linears 里：
+Tensor linear(x, w, reduce=true) { auto y = fp8_linear(x, w, s);
+    return reduce ? sum(y) : y; }   // 行并行层：reduce=true</code></pre>
+    <div class="filetip">除了 AllReduce，TP 还需要在层间 <b>广播</b>采样出的 token（每个 rank 要吃到同一个 token 才能继续同构计算）——见 <code>worker.cpp</code> 里的 <code>MPI_Bcast(&token, ...)</code>。</div>
+  </div>
+
+  <div class="note"><b>一句话抓住：</b>张量并行 = “切矩阵 + 算完把结果缝回去”。切输出（列并行）通常不用通信，切输入（行并行）必须 AllReduce。分界点就是引擎里 <code>reduce=true/false</code> 的那个开关。</div>
+</div>
+
+<script>
+const OUT=8, IN=6;                  // 演示矩阵：8 行输出 × 6 列输入
+let tp=2, mode="col";
+const RCOL=["r0","r1","r2","r3"];
+
+function rankOf(r,c){
+  if(tp===1) return 0;
+  if(mode==="col"){ return Math.floor(r/(OUT/tp)); }   // 切输出维 → 按行分组
+  else { return Math.floor(c/(IN/tp)); }               // 切输入维 → 按列分组
+}
+function buildMatrix(){
+  const mat=document.getElementById("mat");
+  mat.style.gridTemplateColumns=`repeat(${IN},1fr)`;
+  mat.innerHTML="";
+  for(let r=0;r<OUT;r++)for(let c=0;c<IN;c++){
+    const d=document.createElement("div");
+    const rk=rankOf(r,c);
+    d.className="mcell "+RCOL[rk];
+    d.textContent="w"+r+c;
+    d.title=`输出${r} × 输入${c} → rank${rk}`;
+    mat.appendChild(d);
+  }
+  // x 轴
+  const ax=document.getElementById("axisX"); ax.innerHTML="";
+  for(let c=0;c<IN;c++){const s=document.createElement("span");s.textContent="in"+c;ax.appendChild(s);}
+  // y 轴
+  const ay=document.getElementById("axisY"); ay.innerHTML="";
+  for(let r=0;r<OUT;r++){const s=document.createElement("span");s.textContent="out"+r;ay.appendChild(s);}
+  // 说明
+  const note=document.getElementById("splitNote");
+  note.innerHTML = mode==="col"
+    ? `列并行：沿<b>输出维</b>切成 ${tp} 份，每份 ${OUT/tp} 行。<b>每张卡独立算出自己的输出通道</b>，之后需要拼接。`
+    : `行并行：沿<b>输入维</b>切成 ${tp} 份，每份 ${IN/tp} 列。<b>每张卡只看到一部分输入</b>，输出是“部分和”，必须 AllReduce 相加。`;
+}
+
+// ===== AllReduce 演示 =====
+const V=[0,0,0,0];
+let contrib=[];   // 每卡的贡献
+function freshContrib(){
+  contrib=[];
+  for(let r=0;r<tp;r++){
+    contrib.push(V.map((_,i)=> (r+1)*(i+1) + r*0.5));  // 造两个不同的“部分和”
+  }
+}
+function renderGpus(reduced){
+  const g=document.getElementById("gpus");
+  g.innerHTML="";
+  g.style.gridTemplateColumns = tp===1? "1fr" : "1fr 1fr";
+  for(let r=0;r<tp;r++){
+    const box=document.createElement("div"); box.className="gpu";
+    const h=document.createElement("h4"); h.textContent="GPU / rank "+r;
+    const vec=document.createElement("div"); vec.className="vec";
+    (reduced?V:contrib[r]).forEach(v=>{
+      const b=document.createElement("b");
+      b.textContent=(Math.round(v*100)/100).toFixed(2);
+      b.className=(reduced?"sum":"");
+      vec.appendChild(b);
+    });
+    box.append(h,vec); g.appendChild(box);
+  }
+  document.getElementById("rnote").textContent = reduced
+    ? "AllReduce 完成：两卡拿到相同的“全和”"
+    : tp===1? "单卡：本来就是完整的" : "两张卡各持一半贡献（部分和）";
+  document.getElementById("rnote").className = "pill "+(reduced?"ok":"");
+}
+document.getElementById("reduce").onclick=()=>{ renderGpus(true); };
+document.getElementById("resetR").onclick=()=>{ freshContrib(); renderGpus(false); };
+document.getElementById("tp1").onclick=()=>setTP(1);
+document.getElementById("tp2").onclick=()=>setTP(2);
+document.getElementById("tp4").onclick=()=>setTP(4);
+function setTP(t){
+  tp=t;
+  for(const [id,n] of [["tp1",1],["tp2",2],["tp4",4]])
+    document.getElementById(id).classList.toggle("sel", n===t);
+  buildMatrix(); freshContrib(); renderGpus(false);
+}
+document.getElementById("col").onclick=()=>{mode="col";document.getElementById("col").classList.add("sel");document.getElementById("row").classList.remove("sel");buildMatrix();};
+document.getElementById("row").onclick=()=>{mode="row";document.getElementById("row").classList.add("sel");document.getElementById("col").classList.remove("sel");buildMatrix();};
+
+buildMatrix(); freshContrib(); renderGpus(false);
+</script>
+</body>
+</html>
