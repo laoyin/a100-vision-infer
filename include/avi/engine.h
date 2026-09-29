@@ -6,14 +6,17 @@
 #include <unordered_map>
 #include <vector>
 #include <memory>
+#include <functional>
 namespace avi {
 using at::Tensor;
 using json = nlohmann::json;
 Tensor fp8_decode(Tensor codes, Tensor scales);
 Tensor delta_scan(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, Tensor state);
 struct Weight { Tensor data, scale; };
-struct EngineOptions { bool optimized=true; bool extra_fusions=false; bool cublas_prefill=false; bool cuda_graph=false; bool tp_lm_head=false; bool reference_prefill=false; bool vector_gemv=false; size_t image_cache_bytes=256ULL<<20; size_t prefix_cache_bytes=512ULL<<20; size_t host_prefix_cache_bytes=0; };
+struct EngineOptions { bool optimized=true; bool extra_fusions=false; bool cublas_prefill=false; bool cuda_graph=false; bool tp_lm_head=false; bool reference_prefill=false; bool vector_gemv=false; int mtp_tokens=0; size_t weight_cache_bytes=0; size_t image_cache_bytes=256ULL<<20; size_t prefix_cache_bytes=512ULL<<20; size_t host_prefix_cache_bytes=0; };
+struct SpeculativeResult { std::vector<int64_t> tokens; int consumed=0,proposed=0,accepted=0; };
 struct DecodeGraph;
+struct DraftGraph;
 class Engine {
  public:
   Engine(const std::string& model_dir, int rank, int world, int device, ncclComm_t comm, int capacity, EngineOptions options={});
@@ -31,18 +34,40 @@ class Engine {
   void set_trace_prefix(const std::string& prefix) { trace_prefix_=prefix; }
   Tensor embed(Tensor ids);
   Tensor logits(Tensor hidden);
+  SpeculativeResult speculate(int64_t pending,int64_t position,int consumed,int budget,const std::vector<int64_t>& eos,
+      const std::function<int64_t(Tensor)>& select={});
+  int64_t greedy(Tensor logits);
+  void enable_draft_graph(bool enabled) { draft_graph_enabled_=enabled; }
+  void enable_gdn_chunk(bool enabled) { gdn_chunk_enabled_=enabled; }
   Tensor read_input(const std::string& dir, const json& desc);
   const json& config() const { return config_; }
  private:
+  struct State { Tensor key, value, conv, recurrent; int length=0; };
   Tensor linear(Tensor x, const std::string& prefix, bool reduce=false);
   Tensor norm(Tensor x, const std::string& prefix, bool one_center=true);
   Tensor layer_norm(Tensor x, const std::string& prefix);
-  Tensor full_attention(Tensor x, Tensor positions, int layer, const std::string& prefix, Tensor projected={}, bool finish=true);
+  Tensor full_attention(Tensor x, Tensor positions, int layer, const std::string& prefix, Tensor projected={}, bool finish=true, State* external=nullptr);
   Tensor delta_attention(Tensor x, int layer, const std::string& prefix, Tensor projected={}, bool finish=true);
   Tensor tensor(const std::string& name);
   Tensor sum(Tensor x);
-  struct State { Tensor key, value, conv, recurrent; int length=0; };
   std::vector<State> states_;
+  struct Draft { State state; Tensor hidden; };
+  std::unordered_map<int,Draft> drafts_;
+  Tensor mtp_step(Tensor embeddings,Tensor positions,Tensor hidden,bool single_decode=false);
+  Tensor draft_one(int64_t token,int64_t position,Tensor hidden);
+  Tensor local_candidates(Tensor normalized);
+  std::vector<int64_t> gather_candidates(Tensor candidates);
+  bool draft_graph_enabled_=false;
+  std::unordered_map<int,std::shared_ptr<DraftGraph>> draft_graphs_;
+  std::unordered_map<int,std::shared_ptr<DraftGraph>> draft_graph_pool_;
+  void release_draft(int id);
+  void advance_draft(Tensor embeddings,Tensor positions,Tensor target_hidden);
+  Tensor project_logits(Tensor normalized);
+  bool verifying_=false;
+  bool gdn_chunk_enabled_=false;
+  std::vector<Tensor> verify_recurrent_,verify_conv_;
+  std::unordered_map<std::string,Tensor> decoded_weights_;
+  size_t decoded_bytes_=0;
   std::unordered_map<std::string,Weight> weights_;
   std::unordered_map<std::string,std::vector<std::string>> mixed_projections_;
   json config_, text_, vision_;

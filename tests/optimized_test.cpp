@@ -96,5 +96,46 @@ void run_optimized_tests(){
  auto rx=at::randn({3,2,64},opt).to(at::kBFloat16);
  auto rp=at::zeros({3,3},opt.dtype(at::kLong));
  TORCH_CHECK(at::equal(avi::fused_rope(rx,rp,32,10000.,4,4),rx),"Zero-position RoPE mismatch");
- std::cout<<"Optimized GEMV/WMMA, RMS, SwiGLU, register GDN, GQA and convolution passed\n";
+ // Every saved recurrent state must match executing exactly that accepted prefix.
+ for(int T:{1,31,32,33,67})for(int K:{16,128}){
+  auto q=avi::fused_l2(at::randn({T,2,K},opt).to(at::kBFloat16));
+  auto k=avi::fused_l2(at::randn_like(q)),v=at::randn({T,2,32},opt).to(at::kBFloat16);
+  auto g=-at::rand({T,2},opt)*.1,b=at::rand({T,2},opt);
+  auto reference=at::randn({2,K,32},opt),state=reference.clone();
+  auto expected=avi::delta_scan_fast(q,k,v,g,b,reference);
+  auto actual=avi::delta_scan_chunked(q,k,v,g,b,state);
+  TORCH_CHECK(at::allclose(actual.to(at::kFloat),expected.to(at::kFloat),.02,.003),"Chunked GDN output mismatch");
+  TORCH_CHECK(at::allclose(state,reference,.001,.0001),"Chunked GDN state mismatch");
+ }
+ for(int K:{16,128}) {
+  auto q=avi::fused_l2(at::randn({6,2,K},opt).to(at::kBFloat16));
+  auto k=avi::fused_l2(at::randn_like(q)),v=at::randn({6,2,32},opt).to(at::kBFloat16);
+  auto g=-at::rand({6,2},opt),b=at::rand({6,2},opt),initial=at::randn({2,K,32},opt);
+  auto state=initial.clone(),history=at::empty({6,2,K,32},opt);
+  auto all=avi::delta_scan_fast(q,k,v,g,b,state,history);
+  auto sequential=initial.clone();
+  for(int i=0;i<6;++i){
+   auto row=avi::delta_scan_fast(q.narrow(0,i,1),k.narrow(0,i,1),v.narrow(0,i,1),g.narrow(0,i,1),b.narrow(0,i,1),sequential);
+   TORCH_CHECK(at::allclose(row.to(at::kFloat),all.narrow(0,i,1).to(at::kFloat),1e-5,1e-5),"GDN verification output");
+   TORCH_CHECK(at::allclose(sequential,history.select(0,i),1e-5,1e-5),"GDN accepted-prefix state");
+   // Resume after rollback; discarded future state must have no effect.
+   if(i<5){
+    auto restored=history.select(0,i).clone();
+    avi::delta_scan_fast(q.narrow(0,i+1,5-i),k.narrow(0,i+1,5-i),v.narrow(0,i+1,5-i),g.narrow(0,i+1,5-i),b.narrow(0,i+1,5-i),restored);
+    TORCH_CHECK(at::allclose(restored,state,1e-5,1e-5),"GDN rollback/resume");
+   }
+  }
+ }
+ for(int T:{1,2,4,6})for(int old:{0,255,257}){
+  int H=4,HK=2,D=128;
+  auto q=at::randn({T,H,D},opt).to(at::kBFloat16),k=at::randn({T,HK,D},opt).to(at::kBFloat16),v=at::randn_like(k);
+  auto keys=at::randn({512,HK,D},opt).to(at::kBFloat16),vals=at::randn_like(keys);
+  auto refk=keys.clone(),refv=vals.clone();auto actual=avi::gqa_chunk(q,k,v,keys,vals,old);
+  for(int i=0;i<T;++i){
+   auto expected=avi::gqa_decode(q.narrow(0,i,1),k.narrow(0,i,1),v.narrow(0,i,1),refk,refv,at::full({1},old+i,opt.dtype(at::kLong)));
+   TORCH_CHECK(at::allclose(actual.narrow(0,i,1).to(at::kFloat),expected.to(at::kFloat),.01,.01),"Causal multi-query GQA mismatch");
+  }
+  TORCH_CHECK(at::equal(keys.narrow(0,0,old+T),refk.narrow(0,0,old+T)),"Chunk KV append mismatch");
+ }
+ std::cout<<"Optimized kernels, speculative GDN rollback and multi-query GQA passed\n";
 }

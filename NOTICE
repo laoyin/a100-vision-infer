@@ -8,6 +8,12 @@ Licensed under Apache License 2.0. Reference source and license are in reference
 NInfer (https://github.com/Neroued/ninfer) informed the fixed-model, offline-conversion,
 explicit-state design. No NInfer implementation files are copied into this project.
 
+Native MTP architecture/state design was also checked against vLLM Qwen3.5 MTP
+and SGLang speculative hybrid-state handling. No upstream implementation files
+are copied. See docs/native-mtp.md for source links and implementation boundaries.
+Chunked GDN uses an independently expressed triangular-solve delta recurrence;
+Flash Linear Attention is referenced as an optimization direction, not vendored.
+
 third_party/nlohmann/json.hpp is nlohmann/json v3.11.3, MIT licensed;
 see third_party/nlohmann/LICENSE.MIT.
 

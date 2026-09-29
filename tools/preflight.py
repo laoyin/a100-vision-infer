@@ -25,8 +25,9 @@ def inspect(root,tp=None):
     m=json.loads((root/'manifest.json').read_text(encoding='utf-8'))
     if m.get('format')!='avi-v1' or m.get('tp') not in (1,2,4) or len(m['ranks'])!=m['tp']:raise ValueError('Invalid format/TP')
     if tp is not None and m['tp']!=tp:raise ValueError('TP mismatch')
-    from format_utils import expected_shapes
+    from format_utils import expected_shapes,mtp_shapes
     names=set(expected_shapes(m['config']))
+    if m.get('native_mtp'):names.update(mtp_shapes(m['config']))
     sizes=[]
     for rank in m['ranks']:
         if set(rank['tensors'])!=names:raise ValueError('Weight names mismatch')

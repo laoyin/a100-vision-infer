@@ -1,6 +1,6 @@
 # Reusing existing speculative decoding
 
-Reviewed 2026-09-29. Native AVI speculative decoding is NOT implemented by this change. The new experiment delegates all drafting, target verification and state commit to the installed upstream vLLM. No upstream kernels are copied or reimplemented here.
+Reviewed 2026-09-29. This document describes the upstream vLLM reference experiment, which delegates drafting, target verification and state commit to installed vLLM. The separate [native MTP candidate](native-mtp.md) now implements C++/CUDA speculation and has its own server validation suite.
 
 ## Sources and selection
 

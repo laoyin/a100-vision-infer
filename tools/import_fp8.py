@@ -3,12 +3,12 @@ import argparse,copy,json
 from pathlib import Path
 import numpy as np
 from fp8_import_utils import validate_quantization,partition_fp8
-from format_utils import expected_shapes,partition,bf16_bytes
+from format_utils import expected_shapes,partition,bf16_bytes,mtp_shapes
 from export_vocabulary import export_vocabulary
 from convert import validate
 
 def main():
- p=argparse.ArgumentParser(description=__doc__);p.add_argument('--model',type=Path,required=True);p.add_argument('--out',type=Path,required=True);p.add_argument('--tp',type=int,choices=[1,2,4],default=2);a=p.parse_args()
+ p=argparse.ArgumentParser(description=__doc__);p.add_argument('--model',type=Path,required=True);p.add_argument('--out',type=Path,required=True);p.add_argument('--tp',type=int,choices=[1,2,4],default=2);p.add_argument('--include-mtp',action='store_true');a=p.parse_args()
  import torch
  from safetensors import safe_open
  config=json.loads((a.model/'config.json').read_text(encoding='utf-8'));quant=validate_quantization(config)
@@ -16,6 +16,11 @@ def main():
  index=a.model/'model.safetensors.index.json'
  shards=sorted(set(json.loads(index.read_text())['weight_map'].values())) if index.exists() else ['model.safetensors']
  locations={}
+ if a.include_mtp:
+  from inspect_mtp import inspect
+  audit=inspect(a.model)
+  if not audit['eligible_for_trial']:raise ValueError('MTP audit failed: '+json.dumps(audit.get('missing',audit)))
+  if (a.model/'mtp.safetensors').is_file() and 'mtp.safetensors' not in shards:shards.append('mtp.safetensors')
  for relative in shards:
   path=(a.model/relative).resolve()
   if not path.is_relative_to(a.model.resolve()) or not path.is_file():raise ValueError('Invalid shard path')
@@ -23,18 +28,27 @@ def main():
    for key in f.keys():
     if key in locations:raise ValueError(f'Duplicate tensor {key}')
     locations[key]=path
+ aliases={}
+ if a.include_mtp:
+  for key in list(locations):
+   if key.startswith('model.mtp.'):
+    target=key.removeprefix('model.')
+    if target in locations:raise ValueError('Duplicate MTP alias '+target)
+    locations[target]=locations.pop(key);aliases[target]=key
  expected=expected_shapes(native)
- skipped=[k for k in locations if k.startswith(('mtp.','model.mtp.'))]
+ if a.include_mtp:expected.update(mtp_shapes(native))
+ skipped=[] if a.include_mtp else [k for k in locations if k.startswith(('mtp.','model.mtp.'))]
  scale_names={name[:-7]+'.weight_scale_inv' for name in expected if name.endswith('.weight')}
  unknown=set(locations)-set(expected)-scale_names-set(skipped)
  if unknown:raise ValueError(f'Unsupported checkpoint tensor names: {sorted(unknown)[:20]}')
  if set(expected)-set(locations):raise ValueError(f'Missing weights: {sorted(set(expected)-set(locations))[:20]}')
  def read(name):
   if name not in locations:raise ValueError(f'Missing scale tensor {name}; expected HF weight_scale_inv layout')
-  with safe_open(locations[name],framework='pt',device='cpu') as f:return f.get_tensor(name)
+  with safe_open(locations[name],framework='pt',device='cpu') as f:return f.get_tensor(aliases.get(name,name))
  a.out.mkdir(parents=True,exist_ok=False);(a.out/'INCOMPLETE').write_text('Import in progress')
  manifest={'format':'avi-v1','tp':a.tp,'precision':'fp8','config':native,'source_quantization_config':quant,'quantization':'E4M3FN original codes, row-expanded block128 multipliers; BF16 activation compute','ranks':[{'tensors':{}} for _ in range(a.tp)],'skipped':skipped}
  used=set();quantized=0
+ manifest['native_mtp']=a.include_mtp
  for rank in range(a.tp):(a.out/f'rank{rank}').mkdir()
  for name,shape in expected.items():
   tensor=read(name)

@@ -15,7 +15,7 @@ def partition_fp8(name,codes,scales,text,rank,tp):
  if scales.shape!=((n+127)//128,(k+127)//128):raise ValueError(f'Invalid block scale shape for {name}: {scales.shape}')
  if not np.isfinite(scales).all() or (scales<=0).any():raise ValueError('Block scales must be finite and positive')
  if ((codes&127)==127).any():raise ValueError('Nonfinite E4M3FN weight')
- row_parallel=name.startswith('model.language_model.layers.') and name.endswith(('.mlp.down_proj.weight','.self_attn.o_proj.weight','.linear_attn.out_proj.weight'))
+ row_parallel=name.startswith(('model.language_model.layers.', 'mtp.layers.')) and name.endswith(('.mlp.down_proj.weight','.self_attn.o_proj.weight','.linear_attn.out_proj.weight'))
  if row_parallel and tp>1 and k%(128*tp):raise ValueError('TP column split must align with 128-element blocks')
  expanded=np.repeat(scales,128,axis=0)[:n]
  output=partition(name,codes,text,rank,tp)

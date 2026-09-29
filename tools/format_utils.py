@@ -43,7 +43,7 @@ def quantize_fp8(values):
 def partition(name, values, text, rank, tp):
     if tp not in (1, 2, 4) or not 0 <= rank < tp:
         raise ValueError('Invalid rank/TP')
-    if tp == 1 or not name.startswith('model.language_model.layers.'):
+    if tp == 1 or not name.startswith(('model.language_model.layers.', 'mtp.layers.')):
         return values
     def chunk(x, axis=0):
         if x.shape[axis] % tp:
@@ -161,4 +161,24 @@ def expected_shapes(config):
     result[p+'.merger.norm.weight']=(vh,); result[p+'.merger.norm.bias']=(vh,)
     mh=vh*v['spatial_merge_size']**2
     linear(p+'.merger.linear_fc1',mh,mh,True); linear(p+'.merger.linear_fc2',v['out_hidden_size'],mh,True)
+    return result
+
+
+def mtp_shapes(config):
+    t = config['text_config']
+    if t.get('mtp_num_hidden_layers') != 1 or t.get('mtp_use_dedicated_embeddings', False):
+        raise ValueError('Native MTP requires one layer and shared embeddings')
+    h, d, mid = t['hidden_size'], t['head_dim'], t['intermediate_size']
+    q, kv = t['num_attention_heads']*d, t['num_key_value_heads']*d
+    result = {'mtp.fc.weight': (h, 2*h)}
+    for n in ('norm', 'pre_fc_norm_embedding', 'pre_fc_norm_hidden'):
+        result[f'mtp.{n}.weight'] = (h,)
+    for n in ('input_layernorm', 'post_attention_layernorm'):
+        result[f'mtp.layers.0.{n}.weight'] = (h,)
+    for n in ('q_norm', 'k_norm'):
+        result[f'mtp.layers.0.self_attn.{n}.weight'] = (d,)
+    for n, shape in {'q_proj': (2*q,h), 'k_proj': (kv,h), 'v_proj': (kv,h), 'o_proj': (h,q)}.items():
+        result[f'mtp.layers.0.self_attn.{n}.weight'] = shape
+    for n, shape in {'gate_proj': (mid,h), 'up_proj': (mid,h), 'down_proj': (h,mid)}.items():
+        result[f'mtp.layers.0.mlp.{n}.weight'] = shape
     return result

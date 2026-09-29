@@ -6,7 +6,8 @@ import numpy as np
 from format_utils import image_geometry, rope_positions
 
 def main():
-    p=argparse.ArgumentParser(description=__doc__); p.add_argument('--out',type=Path,required=True); p.add_argument('--block-fp8',action='store_true'); a=p.parse_args()
+    p=argparse.ArgumentParser(description=__doc__); p.add_argument('--out',type=Path,required=True); p.add_argument('--block-fp8',action='store_true'); p.add_argument('--mtp',action='store_true'); a=p.parse_args()
+    if a.mtp and not a.block_fp8:p.error('--mtp requires --block-fp8')
     import torch
     from transformers import Qwen3_5Config,Qwen3_5ForConditionalGeneration
     torch.manual_seed(42)
@@ -29,13 +30,24 @@ def main():
         cfg.text_config.head_dim=128;cfg.text_config.linear_key_head_dim=128;cfg.text_config.linear_value_head_dim=128
         cfg.vision_config.out_hidden_size=256
     a.out.mkdir(parents=True,exist_ok=False)
+    if a.mtp:
+        cfg.text_config.mtp_num_hidden_layers=1
+        cfg.text_config.mtp_use_dedicated_embeddings=False
     model=Qwen3_5ForConditionalGeneration(cfg).to(torch.bfloat16).eval()
     model.save_pretrained(a.out/'model',safe_serialization=True)
     if a.block_fp8:
         from safetensors.torch import save_file
         state=model.state_dict();converted={};excluded=[]
+        if a.mtp:
+            h=cfg.text_config.hidden_size
+            state['mtp.fc.weight']=(torch.randn(h,2*h)*.02).to(torch.bfloat16)
+            for name in ('norm','pre_fc_norm_embedding','pre_fc_norm_hidden'):
+                state[f'mtp.{name}.weight']=torch.zeros(h,dtype=torch.bfloat16)
+            for name,tensor in list(state.items()):
+                if name.startswith('model.language_model.layers.1.'):
+                    state[name.replace('model.language_model.layers.1.','mtp.layers.0.')]=tensor.clone()
         for name,tensor in state.items():
-            quantize=name.startswith('model.language_model.layers.') and tensor.ndim==2 and name.endswith('.weight') and not name.endswith(('.in_proj_a.weight','.in_proj_b.weight'))
+            quantize=name.startswith(('model.language_model.layers.','mtp.layers.')) and tensor.ndim==2 and name.endswith('.weight') and not name.endswith(('.in_proj_a.weight','.in_proj_b.weight'))
             if not quantize:
                 converted[name]=tensor.contiguous()
                 if name.endswith('.weight'):excluded.append(name[:-7])
@@ -62,6 +74,9 @@ def main():
                     'coords':write('coords',coords,'I64'),'position_indices':write('indices',indices,'I64'),
                     'position_weights':write('weights',factors,'F32')}]}
     (request_dir/'request.json').write_text(json.dumps(req,indent=2))
+    if a.mtp:
+        req['max_new_tokens']=12
+        (request_dir/'request.json').write_text(json.dumps(req,indent=2))
     print(a.out)
 
 if __name__=='__main__': main()

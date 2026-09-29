@@ -25,10 +25,12 @@ int main(int argc,char** argv) {
   ncclComm_t comm=nullptr;
   try {
     std::string model,request,output; int chunk=128;
-    bool trace=false,layer_trace=false; avi::EngineOptions options;
+    bool trace=false,layer_trace=false,draft_graph=false,gdn_chunk=false; avi::EngineOptions options;
     for(int i=1;i<argc;i++) {
       std::string key=argv[i];
       if(key=="--baseline"){options.optimized=false;continue;}
+      if(key=="--mtp-draft-graph"){draft_graph=true;continue;}
+      if(key=="--gdn-chunk"){gdn_chunk=true;continue;}
       if(key=="--cuda-graph"){options.cuda_graph=true;continue;}
       if(key=="--extra-fusions"){options.extra_fusions=true;continue;}
       if(key=="--cublas-prefill"){options.cublas_prefill=true;continue;}
@@ -40,6 +42,8 @@ int main(int argc,char** argv) {
       TORCH_CHECK(i+1<argc,"Missing argument for ",key); std::string value=argv[++i];
       if(key=="--model") model=value; else if(key=="--request") request=value;
       else if(key=="--output") output=value; else if(key=="--prefill-chunk") chunk=std::stoi(value);
+      else if(key=="--mtp-tokens") options.mtp_tokens=std::stoi(value);
+      else if(key=="--weight-cache-mib") options.weight_cache_bytes=std::stoull(value)<<20;
       else { TORCH_CHECK(false,"Unknown option ",key); }
     }
     TORCH_CHECK(!model.empty() && !request.empty() && !output.empty(),"Usage: avi-infer --model ARTIFACT --request REQUEST_DIR --output result.json [--prefill-chunk 128] [--trace]");
@@ -47,6 +51,8 @@ int main(int argc,char** argv) {
     int local_world; MPI_Comm_size(local_comm,&local_world); TORCH_CHECK(local_world==world,"Multi-node is not implemented");
     TORCH_CHECK(chunk>0,"Prefill chunk must be positive");
     TORCH_CHECK(!layer_trace||!options.cuda_graph,"Layer trace requires eager execution; use a separate untraced Graph benchmark");
+    TORCH_CHECK(!options.mtp_tokens||(!trace&&!layer_trace),"Use non-MTP runs for per-token traces");
+    TORCH_CHECK(!draft_graph||options.mtp_tokens>0,"Draft Graph requires --mtp-tokens");
     TORCH_CHECK(!std::filesystem::exists(output),"Refusing to overwrite output ",output);
     TORCH_CHECK(!std::filesystem::exists(model+"/INCOMPLETE"),"Incomplete model conversion");
     int count; C10_CUDA_CHECK(cudaGetDeviceCount(&count)); TORCH_CHECK(count>=world,"Each rank must see all requested GPUs");
@@ -64,6 +70,8 @@ int main(int argc,char** argv) {
     TORCH_CHECK(capacity>0 && max_new>0,"Invalid request budgets");
     if(rank==0) std::cerr<<"Loading native model, TP="<<world<<"; no Python model runtime\n";
     auto start=Clock::now(); avi::Engine engine(model,rank,world,local,comm,capacity,options);
+    engine.enable_draft_graph(draft_graph);
+    engine.enable_gdn_chunk(gdn_chunk);
     double load_time=seconds(start); auto ids=engine.read_input(request,req.at("input_ids"));
     auto pos=engine.read_input(request,req.at("positions"));
     TORCH_CHECK(ids.dim()==1 && ids.scalar_type()==at::kLong && pos.scalar_type()==at::kLong && pos.dim()==2 && pos.size(0)==3 && pos.size(1)==ids.numel(),"Invalid ids/position layout");
@@ -93,7 +101,17 @@ int main(int argc,char** argv) {
     if(trace && rank==0) dump(output+".prefill_logits.f32",logits);
     auto eos_vec=req.at("eos_token_ids").get<std::vector<int64_t>>(); std::set<int64_t> eos(eos_vec.begin(),eos_vec.end());
     std::vector<int64_t> generated; start=Clock::now(); std::string reason="length";
-    for(int i=0;i<max_new;i++) {
+    int proposed=0,accepted=0,rounds=0;
+    if(options.mtp_tokens){
+      generated.push_back(engine.greedy(logits));
+      int consumed=ids.numel();
+      while(int(generated.size())<max_new&&!eos.count(generated.back())){
+        auto batch=engine.speculate(generated.back(),next,consumed,max_new-int(generated.size()),eos_vec);
+        generated.insert(generated.end(),batch.tokens.begin(),batch.tokens.end());
+        consumed+=batch.consumed;next+=batch.consumed;proposed+=batch.proposed;accepted+=batch.accepted;++rounds;
+      }
+      if(eos.count(generated.back()))reason="eos";
+    }else for(int i=0;i<max_new;i++) {
       int64_t token=0; if(rank==0) {
         TORCH_CHECK(at::isfinite(logits).all().item<bool>(),"Nonfinite logits; stop and check numerical trace");
         token=logits.argmax(-1).item<int64_t>();
@@ -112,6 +130,10 @@ int main(int argc,char** argv) {
                         {"input_tokens",ids.numel()},{"tp",world},{"backend","native-libtorch-cuda"},
                         {"optimized",options.optimized},{"cuda_graph",options.cuda_graph},{"tp_lm_head",options.tp_lm_head},{"reference_prefill",options.reference_prefill},{"layer_trace",layer_trace},{"load_seconds",load_time},{"vision_seconds",vision_time},{"prefill_seconds",prefill_time},
                         {"decode_loop_seconds",decode_time},{"note","First generated token comes from prefill; timings exclude Python preprocessing. Experimental, not benchmark-certified."}};
+      result["mtp"]={{"window",options.mtp_tokens},{"rounds",rounds},{"proposed",proposed},{"accepted",accepted}};
+      result["weight_cache_bytes"]=options.weight_cache_bytes;
+      result["mtp_draft_graph"]=draft_graph;
+      result["gdn_chunk"]=gdn_chunk;
       std::ofstream f(output); f<<result.dump(2)<<"\n"; TORCH_CHECK(f.good(),"Cannot write output");
       std::cerr<<"Finished "<<generated.size()<<" tokens; output "<<output<<"\n";
     }

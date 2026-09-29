@@ -96,14 +96,15 @@ AVI_GPUS=2,3 bash scripts/test-optimizations.sh
 - `tools/optimization_matrix.py`：正确性与性能矩阵。
 - `tests/optimized_test.cpp`：CUDA kernel 数值回归。
 
+## 原生 MTP 与进一步优化
+
+新增原生 MTP 优化候选：FP8 MTP 导入、候选批量验证、GDN/卷积/KV 状态提交、草稿 CUDA Graph、TP 局部 argmax 通信、短序列 GQA，以及可选解码权重缓存和 GDN 分块预填充。代码已接入 C++/CUDA，新增路径尚待 A100 编译、正确性与性能验收。见 [原生 MTP 优化与一次性测试](docs/native-mtp.md)。
+
 ## 尚未实现
 
-已增加复用现有 vLLM 的 MTP A/B 实验入口，检查原始 checkpoint 的 MTP 权重并对比关闭/MTP1/MTP2/MTP3。见 [开源复用与测试](docs/speculative-reuse.md)。该入口直接运行上游实现，尚未接入本项目原生 C++ 引擎。
-
-- Gated DeltaNet chunk-parallel prefill。
 - Paged KV cache 与公共前缀分页复用。
-- MTP/speculative decoding。
-- 多请求 CUDA Graph capture。
+- MTP 随机采样、完整前缀缓存，以及多个请求的合批验证。
+- MTP 主模型批量验证 CUDA Graph capture。
 - KV cache 量化和跨节点 Tensor Parallel。
 
 这些优化需要新的状态布局或独立数值验收，在没有 A100 实测数据前不会标记为已完成。

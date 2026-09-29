@@ -80,7 +80,7 @@ __global__ void conv_one(const bf* x,const bf* w,bf* hist,bf* y,int C,int K){int
 Tensor conv_decode(Tensor x,Tensor w,Tensor history){x=x.contiguous();TORCH_CHECK(x.is_cuda()&&x.scalar_type()==at::kBFloat16&&w.device()==x.device()&&history.device()==x.device()&&w.scalar_type()==at::kBFloat16&&history.scalar_type()==at::kBFloat16&&w.dim()==3&&w.size(0)==x.numel()&&w.size(2)>=2&&history.numel()==x.numel()*(w.size(2)-1),"Invalid conv state");auto y=at::empty_like(x);conv_one<<<(x.numel()+255)/256,256,0,at::cuda::getCurrentCUDAStream()>>>(ptr(x),ptr(w),outptr(history),outptr(y),x.numel(),w.size(2));C10_CUDA_KERNEL_LAUNCH_CHECK();return y;}
 __global__ void append_kv(const bf* k,const bf* v,bf* keys,bf* vals,const int64_t* offset,int HK,int D){int i=blockIdx.x*256+threadIdx.x;if(i<HK*D){keys[offset[0]*HK*D+i]=k[i];vals[offset[0]*HK*D+i]=v[i];}}
 __global__ void attention_parts(const bf* q,const bf* keys,const bf* vals,const int64_t* offset,float* partial,float* stats,int H,int HK,int D,int P){
- int h=blockIdx.x,p=blockIdx.y,lane=threadIdx.x%32,warp=threadIdx.x/32,base=p*256,L=int(offset[0])+1,hk=h/(H/HK);__shared__ float scores[256];
+ int h=blockIdx.x+blockIdx.z*H,p=blockIdx.y,lane=threadIdx.x%32,warp=threadIdx.x/32,base=p*256,L=int(offset[0])+int(blockIdx.z)+1,hk=(h%H)/(H/HK);__shared__ float scores[256];
  // Graph launch dimensions use capacity; inactive parts need no dot products or reductions.
  if(base>=L){if(!threadIdx.x){stats[(h*P+p)*2]=-INFINITY;stats[(h*P+p)*2+1]=0;}
   for(int d=threadIdx.x;d<D;d+=256)partial[(h*P+p)*D+d]=0;return;}
@@ -93,7 +93,7 @@ __global__ void attention_parts(const bf* q,const bf* keys,const bf* vals,const 
 __global__ void attention_merge(const float* partial,const float* stats,bf* y,int D,int P){int h=blockIdx.x;float m=-INFINITY;for(int p=threadIdx.x;p<P;p+=256)m=fmaxf(m,stats[(h*P+p)*2]);m=block_max(m);float sum=0;for(int p=threadIdx.x;p<P;p+=256)sum+=stats[(h*P+p)*2+1]*expf(stats[(h*P+p)*2]-m);sum=block_sum(sum);for(int d=threadIdx.x;d<D;d+=256){float result=0;for(int p=0;p<P;p++)result+=partial[(h*P+p)*D+d]*expf(stats[(h*P+p)*2]-m);y[h*D+d]=__float2bfloat16_rn(result/sum);}}
 Tensor gqa_decode(Tensor q,Tensor k,Tensor v,Tensor keys,Tensor values,Tensor offset){q=q.contiguous();k=k.contiguous();v=v.contiguous();TORCH_CHECK(q.dim()==3&&q.size(0)==1&&q.scalar_type()==at::kBFloat16&&q.is_cuda()&&keys.is_contiguous()&&values.is_contiguous(),"Invalid decode attention");int H=q.size(1),D=q.size(2),HK=k.size(1),P=(keys.size(0)+255)/256;TORCH_CHECK(HK>0&&H%HK==0&&D<=512&&k.size(2)==D&&v.sizes()==k.sizes()&&offset.is_cuda()&&offset.scalar_type()==at::kLong&&offset.numel()==1,"Invalid GQA geometry");auto out=at::empty_like(q);auto partial=at::empty({H,P,D},q.options().dtype(at::kFloat)),stats=at::empty({H,P,2},q.options().dtype(at::kFloat));auto stream=at::cuda::getCurrentCUDAStream();append_kv<<<(HK*D+255)/256,256,0,stream>>>(ptr(k),ptr(v),outptr(keys),outptr(values),offset.data_ptr<int64_t>(),HK,D);attention_parts<<<dim3(H,P),256,0,stream>>>(ptr(q),ptr(keys),ptr(values),offset.data_ptr<int64_t>(),partial.data_ptr<float>(),stats.data_ptr<float>(),H,HK,D,P);attention_merge<<<H,256,0,stream>>>(partial.data_ptr<float>(),stats.data_ptr<float>(),outptr(out),D,P);C10_CUDA_KERNEL_LAUNCH_CHECK();return out;}
 // Value-column tiling increases the number of blocks; recurrent state stays in registers across time.
-template<int K> __global__ void register_scan(const bf* q,const bf* k,const bf* v,const float* g,const float* beta,float* state,bf* out,int T,int H,int V){
+template<int K> __global__ void register_scan(const bf* q,const bf* k,const bf* v,const float* g,const float* beta,float* state,bf* out,int T,int H,int V,float* trajectory){
  int h=blockIdx.x,j=blockIdx.y*32+threadIdx.x;if(j>=V)return;float s[K];
  #pragma unroll
  for(int i=0;i<K;i++)s[i]=state[(h*K+i)*V+j];
@@ -102,12 +102,39 @@ template<int K> __global__ void register_scan(const bf* q,const bf* k,const bf* 
  for(int i=0;i<K;i++){s[i]*=decay;memory+=s[i]*__bfloat162float(k[base+i]);}
  float delta=(__bfloat162float(v[(t*H+h)*V+j])-memory)*beta[t*H+h],result=0;
  #pragma unroll
- for(int i=0;i<K;i++){s[i]+=__bfloat162float(k[base+i])*delta;result+=s[i]*__bfloat162float(q[base+i]);}
+ for(int i=0;i<K;i++){s[i]+=__bfloat162float(k[base+i])*delta;result+=s[i]*__bfloat162float(q[base+i]);if(trajectory)trajectory[((int64_t(t)*H+h)*K+i)*V+j]=s[i];}
  out[(t*H+h)*V+j]=__float2bfloat16_rn(result*rsqrtf(float(K)));}
  #pragma unroll
  for(int i=0;i<K;i++)state[(h*K+i)*V+j]=s[i];
 }
-Tensor delta_scan_fast(Tensor q,Tensor k,Tensor v,Tensor g,Tensor beta,Tensor state){TORCH_CHECK(q.is_contiguous()&&k.is_contiguous()&&v.is_contiguous()&&g.is_contiguous()&&beta.is_contiguous()&&state.is_contiguous()&&q.is_cuda()&&q.scalar_type()==at::kBFloat16&&state.scalar_type()==at::kFloat,"Invalid register GDN inputs");auto y=at::empty_like(v);int K=q.size(2),T=q.size(0),H=q.size(1),V=v.size(2);auto stream=at::cuda::getCurrentCUDAStream();if(K==128)register_scan<128><<<dim3(H,(V+31)/32),32,0,stream>>>(ptr(q),ptr(k),ptr(v),g.data_ptr<float>(),beta.data_ptr<float>(),state.data_ptr<float>(),outptr(y),T,H,V);else if(K==16)register_scan<16><<<dim3(H,(V+31)/32),32,0,stream>>>(ptr(q),ptr(k),ptr(v),g.data_ptr<float>(),beta.data_ptr<float>(),state.data_ptr<float>(),outptr(y),T,H,V);else { TORCH_CHECK(false,"Register GDN supports K=16 or 128"); }C10_CUDA_KERNEL_LAUNCH_CHECK();return y;}
+Tensor delta_scan_fast(Tensor q,Tensor k,Tensor v,Tensor g,Tensor beta,Tensor state,Tensor trajectory){
+ TORCH_CHECK(q.is_contiguous()&&k.is_contiguous()&&v.is_contiguous()&&g.is_contiguous()&&beta.is_contiguous()&&state.is_contiguous()&&q.is_cuda()&&q.scalar_type()==at::kBFloat16&&state.scalar_type()==at::kFloat,"Invalid register GDN inputs");
+ auto y=at::empty_like(v);int K=q.size(2),T=q.size(0),H=q.size(1),V=v.size(2);
+ if(trajectory.defined()){TORCH_CHECK(trajectory.device()==state.device()&&trajectory.scalar_type()==at::kFloat&&trajectory.is_contiguous()&&trajectory.sizes()==at::IntArrayRef({T,H,K,V}),"Invalid GDN trajectory");}
+ auto history=trajectory.defined()?trajectory.data_ptr<float>():nullptr;auto stream=at::cuda::getCurrentCUDAStream();
+ if(K==128)register_scan<128><<<dim3(H,(V+31)/32),32,0,stream>>>(ptr(q),ptr(k),ptr(v),g.data_ptr<float>(),beta.data_ptr<float>(),state.data_ptr<float>(),outptr(y),T,H,V,history);
+ else if(K==16)register_scan<16><<<dim3(H,(V+31)/32),32,0,stream>>>(ptr(q),ptr(k),ptr(v),g.data_ptr<float>(),beta.data_ptr<float>(),state.data_ptr<float>(),outptr(y),T,H,V,history);
+ else { TORCH_CHECK(false,"Register GDN supports K=16 or 128"); }C10_CUDA_KERNEL_LAUNCH_CHECK();return y;
+}
+
+// Parallel causal queries over a shared KV prefix; no repeated GQA keys or dense mask.
+Tensor gqa_chunk(Tensor q,Tensor k,Tensor v,Tensor keys,Tensor values,int old){
+ q=q.contiguous();k=k.contiguous();v=v.contiguous();
+ TORCH_CHECK(q.is_cuda()&&q.scalar_type()==at::kBFloat16&&q.dim()==3&&k.dim()==3&&v.sizes()==k.sizes(),"Invalid chunk attention");
+ int T=q.size(0),H=q.size(1),D=q.size(2),HK=k.size(1),P=(old+T+255)/256;
+ TORCH_CHECK(keys.dim()==3&&values.sizes()==keys.sizes()&&keys.is_contiguous()&&values.is_contiguous()&&
+     keys.size(1)==HK&&keys.size(2)==D&&keys.device()==q.device()&&values.device()==q.device()&&
+     k.device()==q.device()&&v.device()==q.device()&&k.scalar_type()==at::kBFloat16&&v.scalar_type()==at::kBFloat16&&
+     keys.scalar_type()==at::kBFloat16&&values.scalar_type()==at::kBFloat16,"Invalid chunk KV layout");
+ TORCH_CHECK(T>0&&T<=8&&old>=0&&old+T<=keys.size(0)&&HK>0&&H%HK==0&&D<=512&&k.size(0)==T&&k.size(2)==D,"Invalid chunk geometry");
+ keys.narrow(0,old,T).copy_(k);values.narrow(0,old,T).copy_(v);
+ auto offset=at::full({1},old,q.options().dtype(at::kLong)),out=at::empty_like(q);
+ auto partial=at::empty({T,H,P,D},q.options().dtype(at::kFloat)),stats=at::empty({T,H,P,2},q.options().dtype(at::kFloat));
+ auto stream=at::cuda::getCurrentCUDAStream();
+ attention_parts<<<dim3(H,P,T),256,0,stream>>>(ptr(q),ptr(keys),ptr(values),offset.data_ptr<int64_t>(),partial.data_ptr<float>(),stats.data_ptr<float>(),H,HK,D,P);
+ attention_merge<<<T*H,256,0,stream>>>(partial.data_ptr<float>(),stats.data_ptr<float>(),outptr(out),D,P);
+ C10_CUDA_KERNEL_LAUNCH_CHECK();return out;
+}
 // Match both BF16 rounding boundaries of non-centered RMS before FP32 SiLU gating.
 __global__ void rms_gate(const bf* x,const bf* w,const bf* z,bf* y,int D,float eps){
  int row=blockIdx.x;float sum=0;

@@ -29,6 +29,7 @@ struct Job {
  avi::JsonGrammar grammar;
  std::string id,path,key;json req,options;int slot=0,offset=0,consumed=0;int64_t next=0;
  uint64_t reservation=0;int token_capacity=0;
+ int mtp_proposed=0,mtp_accepted=0,mtp_rounds=0;
  at::Tensor ids,positions,embedding,logits;std::vector<int64_t> generated;
  bool initialized=false,ready=false,needs_decode=false,cancelled=false;std::string finish;
  Clock::time_point submitted=Clock::now();double first_token=-1;std::mt19937_64 rng;
@@ -65,19 +66,25 @@ int main(int argc,char** argv){
  MPI_Init(&argc,&argv);int rank,world,local;MPI_Comm_rank(MPI_COMM_WORLD,&rank);MPI_Comm_size(MPI_COMM_WORLD,&world);
  MPI_Comm host;MPI_Comm_split_type(MPI_COMM_WORLD,MPI_COMM_TYPE_SHARED,rank,MPI_INFO_NULL,&host);MPI_Comm_rank(host,&local);ncclComm_t comm=nullptr;
  try {
-  std::string model;int capacity=20480,concurrency=2,chunk=128,queue_limit=64;avi::EngineOptions options;uint64_t workspace_bytes=8ULL<<30;
+  std::string model;int capacity=20480,concurrency=2,chunk=128,queue_limit=64;bool draft_graph=false,gdn_chunk=false;avi::EngineOptions options;uint64_t workspace_bytes=8ULL<<30;
   for(int i=1;i<argc;i++){std::string key=argv[i];if(key=="--baseline"){options.optimized=false;continue;}if(key=="--cuda-graph"){options.cuda_graph=true;continue;}
       if(key=="--extra-fusions"){options.extra_fusions=true;continue;}
       if(key=="--cublas-prefill"){options.cublas_prefill=true;continue;}
       if(key=="--tp-lm-head"){options.tp_lm_head=true;continue;}
       if(key=="--reference-prefill"){options.reference_prefill=true;continue;}
       if(key=="--vector-gemv"){options.vector_gemv=true;continue;}
+      if(key=="--mtp-draft-graph"){draft_graph=true;continue;}
+      if(key=="--gdn-chunk"){gdn_chunk=true;continue;}
    TORCH_CHECK(i+1<argc,"Missing value for ",key);std::string value=argv[++i];
    if(key=="--model")model=value;else if(key=="--max-context")capacity=std::stoi(value);else if(key=="--max-concurrency")concurrency=std::stoi(value);else if(key=="--prefill-chunk")chunk=std::stoi(value);
+   else if(key=="--mtp-tokens")options.mtp_tokens=std::stoi(value);
+   else if(key=="--weight-cache-mib")options.weight_cache_bytes=std::stoull(value)<<20;
    else if(key=="--prefix-cache-bytes")options.prefix_cache_bytes=std::stoull(value);else if(key=="--workspace-mib")workspace_bytes=std::stoull(value)<<20;else if(key=="--host-prefix-cache-mib")options.host_prefix_cache_bytes=std::stoull(value)<<20;
    else if(key=="--image-cache-mib")options.image_cache_bytes=std::stoull(value)<<20;else if(key=="--prefix-cache-mib")options.prefix_cache_bytes=std::stoull(value)<<20;else { TORCH_CHECK(false,"Unknown option ",key); }
   }
   TORCH_CHECK(!model.empty()&&capacity>0&&chunk>0&&concurrency>0&&concurrency<=8,"Invalid worker configuration");
+  if(options.mtp_tokens){options.prefix_cache_bytes=0;options.host_prefix_cache_bytes=0;}
+  TORCH_CHECK(!draft_graph||options.mtp_tokens>0,"Draft Graph requires --mtp-tokens");
   int nlocal,count;MPI_Comm_size(host,&nlocal);TORCH_CHECK(nlocal==world&&(world==1||world==2||world==4),"Use 1/2/4 local ranks");
   C10_CUDA_CHECK(cudaGetDeviceCount(&count));TORCH_CHECK(count>=world,"All ranks must see the same GPUs");C10_CUDA_CHECK(cudaSetDevice(local));
   cudaDeviceProp prop;C10_CUDA_CHECK(cudaGetDeviceProperties(&prop,local));TORCH_CHECK(prop.major==8&&prop.minor==0,"Requires SM80");
@@ -85,6 +92,8 @@ int main(int argc,char** argv){
   TORCH_CHECK(!std::filesystem::exists(model+"/INCOMPLETE"),"Incomplete model export");
   { // Scope engine/graphs inside the lifetime of comm.
   c10::InferenceMode guard;at::set_num_threads(1);avi::Engine engine(model,rank,world,local,comm,capacity,options);
+  engine.enable_draft_graph(draft_graph);
+  engine.enable_gdn_chunk(gdn_chunk);
   // Reclaim load-time temporary allocator blocks before measuring device headroom.
   C10_CUDA_CHECK(cudaDeviceSynchronize());c10::cuda::CUDACachingAllocator::emptyCache();
   size_t free_bytes,total_bytes;C10_CUDA_CHECK(cudaMemGetInfo(&free_bytes,&total_bytes));
@@ -119,6 +128,7 @@ int main(int argc,char** argv){
     double timeout=job.options.value("timeout_seconds",300.0);TORCH_CHECK(std::isfinite(timeout)&&timeout>=0,"Invalid timeout");
     double temp=job.options.value("temperature",0.0),p=job.options.value("top_p",1.0),pen=job.options.value("repetition_penalty",1.0);int k=job.options.value("top_k",0);
     if(!std::isfinite(temp)||temp<0||!std::isfinite(p)||p<=0||p>1||k<0||!std::isfinite(pen)||pen<=0){emit(rank,{{"event","error"},{"id",id},{"message","Invalid sampling parameters"}});continue;}
+    if(options.mtp_tokens&&temp!=0){emit(rank,{{"event","error"},{"id",id},{"message","Native MTP currently requires temperature=0; use non-MTP worker for stochastic sampling"}});continue;}
     if(job.options.value("json_object",false)&&!grammar_available){emit(rank,{{"event","error"},{"id",id},{"message","Artifact lacks ByteLevel vocabulary; reconvert with tokenizer.json"}});continue;}
     // Rank zero validates metadata; all ranks receive the same admission decision.
     json metadata;
@@ -127,7 +137,7 @@ int main(int argc,char** argv){
     job.req=metadata.at("request");TORCH_CHECK(job.req.at("format")=="avi-request-v1","Invalid request format");
     int64_t prompt=job.req.at("input_ids").at("shape").at(0).get<int64_t>(),output=job.req.at("max_new_tokens");
     TORCH_CHECK(prompt>0&&output>0&&prompt<=capacity&&output<=capacity-prompt,"Invalid token budget");
-    job.token_capacity=int(prompt+output);job.reservation=avi::session_bytes(engine.config(),world,job.token_capacity);
+    job.token_capacity=int(prompt+output);job.reservation=avi::session_bytes(engine.config(),world,job.token_capacity,options.mtp_tokens);
     TORCH_CHECK(job.reservation<=memory.limit(),"Request exceeds session memory budget; lower max_tokens/context/cache or workspace reserve");
     ids.insert(id);pending.push_back(std::move(job));emit(rank,{{"event","queued"},{"id",id}});
     }catch(const std::exception& e){emit(rank,{{"event","error"},{"id",id},{"message",e.what()}});}
@@ -160,7 +170,7 @@ int main(int argc,char** argv){
      int vocab=engine.config().at("text_config").at("vocab_size");TORCH_CHECK(j.ids.min().item<int64_t>()>=0&&j.ids.max().item<int64_t>()<vocab,"Token outside vocabulary");
      j.next=j.req.at("next_position");TORCH_CHECK(j.next==j.positions.max().item<int64_t>()+1,"Invalid continuation position");
      TORCH_CHECK(j.req.at("image_token_id")==engine.config().at("image_token_id"),"Image token mismatch");
-     j.key=avi::request_hash(j.path,j.req);j.logits=engine.restore_prefix(j.key);j.initialized=true;
+     if(options.prefix_cache_bytes||options.host_prefix_cache_bytes){j.key=avi::request_hash(j.path,j.req);j.logits=engine.restore_prefix(j.key);}j.initialized=true;
      if(j.logits.defined()){j.ready=true;j.consumed=n;j.offset=n;emit(rank,{{"event","prefix_hit"},{"id",j.id}});}
      else {auto vision=engine.vision(j.path,j.req);j.embedding=engine.embed(j.ids);auto indices=at::nonzero(j.ids==j.req.at("image_token_id").get<int64_t>()).reshape({-1});
       if(vision.defined()){TORCH_CHECK(vision.size(0)==indices.numel(),"Visual token mismatch");j.embedding.index_copy_(0,indices,vision);}else { TORCH_CHECK(indices.numel()==0,"Missing image features"); }}
@@ -169,13 +179,41 @@ int main(int argc,char** argv){
      if(j.offset==j.ids.numel()){j.logits=engine.logits(hidden.narrow(0,n-1,1));j.ready=true;j.consumed=j.offset;engine.save_prefix(j.key,j.logits);j.embedding=at::Tensor();}}
    }
    std::vector<int> slots,consumed;std::vector<int64_t> tokens,positions;
+   std::set<int> speculated;
+   if(options.mtp_tokens)for(auto& item:active){
+    auto& j=item.second;if(!j.ready||!j.needs_decode||!j.finish.empty())continue;
+    engine.activate(j.slot);auto eos=j.req.at("eos_token_ids").get<std::vector<int64_t>>();
+    Job selection=j; // Copy grammar/history, not device tensor storage.
+    auto select=[&](at::Tensor values){
+      int64_t token=0;
+      if(!rank){
+        selection.logits=values;token=sample(selection);selection.generated.push_back(token);
+        if(selection.options.value("json_object",false)&&token>=0&&size_t(token)<vocabulary.size()&&!vocabulary[token].empty()){
+          TORCH_CHECK(selection.grammar.feed(vocabulary[token]),"Speculative grammar mismatch");
+        }
+      }
+      MPI_Bcast(&token,1,MPI_INT64_T,0,MPI_COMM_WORLD);return token;
+    };
+    std::function<int64_t(at::Tensor)> selector;
+    if(j.options.value("json_object",false)||j.options.value("repetition_penalty",1.0)!=1.0)selector=select;
+    auto batch=engine.speculate(j.generated.back(),j.next,j.consumed,j.req.at("max_new_tokens").get<int>()-int(j.generated.size()),eos,selector);
+    j.consumed+=batch.consumed;j.next+=batch.consumed;j.mtp_proposed+=batch.proposed;j.mtp_accepted+=batch.accepted;++j.mtp_rounds;
+    if(!rank)j.grammar=selection.grammar;
+    for(auto token:batch.tokens){
+      j.generated.push_back(token);emit(rank,{{"event","token"},{"id",j.id},{"token",token},{"index",j.generated.size()-1}});
+    }
+    if(std::find(eos.begin(),eos.end(),j.generated.back())!=eos.end())j.finish="eos";
+    else if(j.generated.size()>=j.req.at("max_new_tokens").get<size_t>())j.finish="length";
+    speculated.insert(item.first);
+   }
    for(auto& item:active){auto& j=item.second;if(j.ready&&j.needs_decode&&j.finish.empty()){slots.push_back(item.first);consumed.push_back(j.consumed);tokens.push_back(j.generated.back());positions.push_back(j.next);}}
-   if(!slots.empty()){auto batch=engine.decode_batch(slots,tokens,positions,consumed);for(size_t i=0;i<slots.size();i++){auto& j=active.at(slots[i]);j.logits=batch.narrow(0,i,1);j.needs_decode=false;j.consumed++;j.next++;}}
-   for(auto& item:active){auto& j=item.second;if(!j.ready||!j.finish.empty())continue;int64_t token=0;if(!rank)token=sample(j);MPI_Bcast(&token,1,MPI_INT64_T,0,MPI_COMM_WORLD);if(!rank&&j.options.value("json_object",false)&&token>=0&&size_t(token)<vocabulary.size()&&!vocabulary[token].empty()){ TORCH_CHECK(j.grammar.feed(vocabulary[token]),"Grammar state mismatch"); }j.generated.push_back(token);j.needs_decode=true;
+   if(!options.mtp_tokens&&!slots.empty()){auto batch=engine.decode_batch(slots,tokens,positions,consumed);for(size_t i=0;i<slots.size();i++){auto& j=active.at(slots[i]);j.logits=batch.narrow(0,i,1);j.needs_decode=false;j.consumed++;j.next++;}}
+   for(auto& item:active){auto& j=item.second;if(!j.ready||!j.finish.empty()||speculated.count(item.first))continue;int64_t token=0;if(!rank)token=sample(j);MPI_Bcast(&token,1,MPI_INT64_T,0,MPI_COMM_WORLD);if(!rank&&j.options.value("json_object",false)&&token>=0&&size_t(token)<vocabulary.size()&&!vocabulary[token].empty()){ TORCH_CHECK(j.grammar.feed(vocabulary[token]),"Grammar state mismatch"); }j.generated.push_back(token);j.needs_decode=true;
     if(j.first_token<0)j.first_token=age(j.submitted);emit(rank,{{"event","token"},{"id",j.id},{"token",token},{"index",j.generated.size()-1}});
     auto eos=j.req.at("eos_token_ids").get<std::vector<int64_t>>();if(std::find(eos.begin(),eos.end(),token)!=eos.end())j.finish="eos";else if(j.generated.size()>=j.req.at("max_new_tokens").get<size_t>())j.finish="length";
    }
    for(auto it=active.begin();it!=active.end();){auto& j=it->second;if(j.finish.empty()){++it;continue;}
+    emit(rank,{{"event","mtp_stats"},{"id",j.id},{"window",options.mtp_tokens},{"rounds",j.mtp_rounds},{"proposed",j.mtp_proposed},{"accepted",j.mtp_accepted}});
     emit(rank,{{"event","done"},{"id",j.id},{"finish_reason",j.finish},{"generated_ids",j.generated},{"input_tokens",j.initialized?j.ids.numel():0},{"ttft_seconds",j.first_token},{"total_seconds",age(j.submitted)},{"cache",engine.cache_stats()},{"json_complete",j.options.value("json_object",false)&&j.grammar.complete()}});
     engine.drop(it->first);memory.release(it->first);ids.erase(j.id);it=active.erase(it);
    }

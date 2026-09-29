@@ -42,6 +42,14 @@ Engine::Engine(const std::string& dir,int rank,int world,int device,ncclComm_t c
   TORCH_CHECK(manifest.at("format")=="avi-v1" && manifest.at("tp")==world,"Artifact format or TP mismatch");
   config_=manifest.at("config"); text_=config_.at("text_config"); vision_=config_.at("vision_config");
   TORCH_CHECK(config_.at("model_type")=="qwen3_5","Only qwen3_5 dense supported");
+  TORCH_CHECK(options_.mtp_tokens>=0&&options_.mtp_tokens<=5,"MTP window must be 0..5");
+  if(options_.mtp_tokens){
+    TORCH_CHECK(options_.optimized&&manifest.value("native_mtp",false),"MTP requires optimized mode and an artifact imported with --include-mtp");
+    TORCH_CHECK(text_.value("mtp_num_hidden_layers",0)==1&&!text_.value("mtp_use_dedicated_embeddings",false),"Only shared-embedding single-layer MTP supported");
+    TORCH_CHECK(!options_.cuda_graph,"MTP target verification uses eager multi-token execution; remove --cuda-graph");
+    int key=text_.at("linear_key_head_dim");TORCH_CHECK(key==16||key==128,"MTP state tracking requires GDN K=16 or 128");
+    options_.prefix_cache_bytes=0;options_.host_prefix_cache_bytes=0;
+  }
   TORCH_CHECK(text_.value("attention_bias",false)==false,"Attention bias unsupported");
   TORCH_CHECK(vision_.value("deepstack_visual_indexes",json::array()).empty(),"Deepstack not supported");
   TORCH_CHECK(text_.at("rope_parameters").value("rope_type",std::string("default"))=="default","Only default RoPE supported");
@@ -49,6 +57,7 @@ Engine::Engine(const std::string& dir,int rank,int world,int device,ncclComm_t c
   auto tensors=manifest.at("ranks").at(rank).at("tensors");
   size_t loaded=0;
   for(auto item=tensors.begin();item!=tensors.end();++item) {
+    if(!options_.mtp_tokens&&item.key().rfind("mtp.",0)==0)continue;
     Weight w; w.data=raw(dir,item.value(),device);
     if(item.value().contains("scale")) w.scale=raw(dir,item.value().at("scale"),device);
     weights_.emplace(item.key(),w);
@@ -73,6 +82,24 @@ Engine::Engine(const std::string& dir,int rank,int world,int device,ncclComm_t c
     }
   }
   TORCH_CHECK(!options_.cuda_graph || options_.optimized,"CUDA Graph requires optimized mode");
+  if(options_.mtp_tokens){
+    fuse_weights("mtp.layers.0.mlp.gate_up",{"mtp.layers.0.mlp.gate_proj","mtp.layers.0.mlp.up_proj"});
+    fuse_weights("mtp.layers.0.self_attn.qkv_gate",{"mtp.layers.0.self_attn.q_proj","mtp.layers.0.self_attn.k_proj","mtp.layers.0.self_attn.v_proj"});
+    verify_recurrent_.resize(states_.size());verify_conv_.resize(states_.size());
+  }
+  // A deterministic, bounded cache of decoded matrices for multi-token GEMMs.
+  // FP8 source codes remain authoritative; no requantization or activation FP8.
+  std::vector<std::string> cache_names;
+  for(const auto& entry:weights_)if(entry.second.scale.defined()&&
+      (entry.first.rfind("model.language_model.layers.",0)==0||entry.first.rfind("mtp.",0)==0))cache_names.push_back(entry.first);
+  std::sort(cache_names.begin(),cache_names.end());
+  for(const auto& name:cache_names){
+    const auto& w=weights_.at(name);size_t bytes=w.data.numel()*2;
+    if(bytes<=options_.weight_cache_bytes-decoded_bytes_){
+      decoded_weights_[name]=fp8_decode(w.data,w.scale);decoded_bytes_+=bytes;
+    }
+  }
+  if(rank_==0&&options_.weight_cache_bytes)std::cerr<<"Decoded GEMM cache bytes: "<<decoded_bytes_<<" / "<<options_.weight_cache_bytes<<"\n";
   C10_CUDA_CHECK(cudaDeviceSynchronize());
 }
 void Engine::fuse_weights(const std::string& dest,const std::vector<std::string>& source) {
@@ -123,7 +150,10 @@ Tensor Engine::linear(Tensor x,const std::string& name,bool reduce) {
   auto it=weights_.find(name+".weight"); TORCH_CHECK(it!=weights_.end(),"Missing linear ",name);
   auto& w=it->second; Tensor y;
   TORCH_CHECK(w.data.dim()>=2,"Invalid matrix ",name);
-  if(w.scale.defined() && options_.optimized && !(options_.cublas_prefill && x.numel()/x.size(-1)>8)) {
+  auto cached=decoded_weights_.find(name+".weight");
+  if(cached!=decoded_weights_.end()&&x.numel()/x.size(-1)>1){
+    y=at::matmul(x,cached->second.t());
+  } else if(w.scale.defined() && options_.optimized && !(options_.cublas_prefill && x.numel()/x.size(-1)>8)) {
     y=fp8_linear(x.reshape({-1,x.size(-1)}).contiguous(),w.data,w.scale,options_.vector_gemv);
     auto shape=x.sizes().vec();shape.back()=w.data.size(0);y=y.reshape(shape);
   } else if(w.scale.defined()) {
@@ -164,7 +194,10 @@ Tensor Engine::embed(Tensor ids) {
   return w.scale.defined()?fp8_decode(selected.contiguous(),w.scale.index_select(0,ids.reshape({-1})).contiguous()):selected;
 }
 Tensor Engine::logits(Tensor x) {
-  auto local=linear(norm(x,"model.language_model.norm"),"lm_head").to(at::kFloat).contiguous();
+  return project_logits(norm(x,"model.language_model.norm"));
+}
+Tensor Engine::project_logits(Tensor x) {
+  auto local=linear(x,"lm_head").to(at::kFloat).contiguous();
   if(!options_.tp_lm_head || world_==1)return local;
   auto gathered=at::empty({world_,local.size(0),local.size(1)},local.options());
   auto status=ncclAllGather(local.data_ptr(),gathered.data_ptr(),local.numel(),ncclFloat,comm_,at::cuda::getCurrentCUDAStream());
@@ -172,7 +205,7 @@ Tensor Engine::logits(Tensor x) {
   // NCCL gives [rank,batch,local_vocab]; preserve batch rows when assembling vocabulary.
   return gathered.permute({1,0,2}).reshape({local.size(0),world_*local.size(1)});
 }
-Tensor Engine::full_attention(Tensor x,Tensor positions,int layer,const std::string& p,Tensor projected,bool finish) {
+Tensor Engine::full_attention(Tensor x,Tensor positions,int layer,const std::string& p,Tensor projected,bool finish,State* external) {
   auto T=x.size(0); int H=text_.at("num_attention_heads").get<int>()/world_;
   int HK=text_.at("num_key_value_heads").get<int>()/world_, D=text_.at("head_dim");
   if(options_.optimized && !projected.defined())projected=linear(x,p+".qkv_gate");
@@ -196,9 +229,14 @@ Tensor Engine::full_attention(Tensor x,Tensor positions,int layer,const std::str
   auto cos=angle.cos().to(x.scalar_type()).unsqueeze(1), sin=angle.sin().to(x.scalar_type()).unsqueeze(1);
   q=rotate(q,cos,sin,rd); k=rotate(k,cos,sin,rd);
   }
-  auto& state=states_.at(layer);
+  auto& state=external?*external:states_.at(layer);
   TORCH_CHECK(decode_mode_ || state.length+T<=session_capacity(),"KV capacity exceeded");
   if(!state.key.defined()) { state.key=at::empty({session_capacity(),HK,D},x.options()); state.value=at::empty_like(state.key); }
+  if(options_.optimized&&!decode_mode_&&T<=8){
+    auto out=gqa_chunk(q,k,v,state.key,state.value,state.length).reshape({T,H*D});state.length+=T;
+    out=options_.extra_fusions?fused_sigmoid_gate(out,gate):out*gate.sigmoid();
+    return finish?linear(out,p+".o_proj",true):out;
+  }
   if(decode_mode_) {
     auto out=gqa_decode(q,k,v,state.key,state.value,decode_offset_).reshape({T,H*D});
     out=(options_.optimized&&options_.extra_fusions)?fused_sigmoid_gate(out,gate):out*gate.sigmoid();
@@ -229,6 +267,7 @@ Tensor Engine::delta_attention(Tensor x,int layer,const std::string& p,Tensor pr
   if(decode_mode_) conv=conv_decode(mixed.reshape({1,C}),tensor(p+".conv1d.weight"),s.conv);
   else {
     auto input=at::cat({s.conv,mixed},-1);
+    if(verifying_)verify_conv_.at(layer)=input;
     s.conv.copy_(input.narrow(-1,input.size(-1)-(kernel-1),kernel-1));
     conv=at::silu(at::conv1d(input,tensor(p+".conv1d.weight"),{},at::IntArrayRef{1},at::IntArrayRef{0},at::IntArrayRef{1},C)).squeeze(0).t();
   }
@@ -246,14 +285,23 @@ Tensor Engine::delta_attention(Tensor x,int layer,const std::string& p,Tensor pr
   Tensor g,beta;
   if(options_.optimized&&options_.extra_fusions){auto gates=fused_gdn_gates(a,b,tensor(p+".A_log"),tensor(p+".dt_bias"));g=gates.first;beta=gates.second;}
   else {g=-tensor(p+".A_log").to(at::kFloat).exp()*at::softplus(a.to(at::kFloat)+tensor(p+".dt_bias").to(at::kFloat));beta=b.sigmoid().to(at::kFloat);}
-  auto result=(options_.optimized&&(K==128||K==16))?delta_scan_fast(q,k,v.contiguous(),g.contiguous(),beta.contiguous(),s.recurrent):delta_scan(q,k,v.contiguous(),g.contiguous(),beta.contiguous(),s.recurrent);
+  Tensor trajectory;
+  if(verifying_){
+    auto& buffer=verify_recurrent_.at(layer);
+    if(!buffer.defined()||buffer.size(0)<T)buffer=at::empty({options_.mtp_tokens+1,H,K,V},s.recurrent.options());
+    trajectory=buffer.narrow(0,0,T);
+  }
+  Tensor result;
+  if(gdn_chunk_enabled_&&!verifying_&&!decode_mode_&&T>=32)result=delta_scan_chunked(q,k,v,g,beta,s.recurrent);
+  else result=(options_.optimized&&(K==128||K==16))?delta_scan_fast(q,k,v.contiguous(),g.contiguous(),beta.contiguous(),s.recurrent,trajectory):delta_scan(q,k,v.contiguous(),g.contiguous(),beta.contiguous(),s.recurrent);
   auto z=(options_.optimized?projected.narrow(-1,C,H*V):linear(x,p+".in_proj_z")).reshape({T,H,V});
   result=(options_.optimized&&options_.extra_fusions)?fused_rms_gate(result,tensor(p+".norm.weight"),z,eps_):(norm(result,p+".norm",false).to(at::kFloat)*at::silu(z.to(at::kFloat))).to(at::kBFloat16);
   result=result.reshape({T,H*V});return finish?linear(result,p+".out_proj",true):result;
 }
 Tensor Engine::step(Tensor x,Tensor positions) {
+  auto embeddings=x;
   struct Restore {bool& value;bool saved;~Restore(){value=saved;}} restore{options_.optimized,options_.optimized};
-  if(options_.reference_prefill&&!decode_mode_)options_.optimized=false;
+  if(options_.reference_prefill&&!decode_mode_&&!verifying_)options_.optimized=false;
   TORCH_CHECK(x.dim()==2 && positions.dim()==2 && positions.size(0)==3 && positions.size(1)==x.size(0),"Invalid text input shape");
   for(size_t i=0;i<states_.size();i++) {
     std::string p="model.language_model.layers."+std::to_string(i);
@@ -265,6 +313,7 @@ Tensor Engine::step(Tensor x,Tensor positions) {
     x=x+linear(gated,p+".mlp.down_proj",true);
     if(!trace_prefix_.empty())trace_layer(x,int(i));
   }
+  if(options_.mtp_tokens&&!verifying_)advance_draft(embeddings,positions,x);
   return x;
 }
 void Engine::trace_layer(Tensor hidden,int layer) {
@@ -336,7 +385,7 @@ struct DecodeGraph {std::unique_ptr<at::cuda::CUDAGraph> graph;Tensor ids,positi
 Engine::~Engine(){
   // NCCL capture retains communicator resources until graph destruction.
   // The owning executable keeps the communicator alive through this destructor.
-  cudaDeviceSynchronize();graphs_.clear();
+  cudaDeviceSynchronize();graphs_.clear();draft_graphs_.clear();draft_graph_pool_.clear();
 }
 int Engine::session_capacity() const {
     auto it=session_capacities_.find(active_);return it==session_capacities_.end()?capacity_:it->second;
@@ -353,7 +402,8 @@ int Engine::session_capacity() const {
   else {states_=std::move(it->second);sessions_.erase(it);}active_=id;
 }
 void Engine::drop(int id) {
-  C10_CUDA_CHECK(cudaDeviceSynchronize());graphs_.erase(id);session_capacities_.erase(id);
+  C10_CUDA_CHECK(cudaDeviceSynchronize());release_draft(id);
+  graphs_.erase(id);session_capacities_.erase(id);
   if(id==active_)states_=std::vector<State>(text_.at("num_hidden_layers").get<int>());else sessions_.erase(id);
 }
 Tensor Engine::decode(int64_t token,int64_t position,int consumed) {

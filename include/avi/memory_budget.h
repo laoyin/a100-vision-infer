@@ -7,7 +7,7 @@
 namespace avi {
 inline uint64_t checked_product(uint64_t a,uint64_t b){if(b&&a>std::numeric_limits<uint64_t>::max()/b)throw std::overflow_error("Memory size overflow");return a*b;}
 inline uint64_t checked_add(uint64_t a,uint64_t b){if(a>std::numeric_limits<uint64_t>::max()-b)throw std::overflow_error("Memory sum overflow");return a+b;}
-inline uint64_t session_bytes(const nlohmann::json& config,int tp,int tokens){
+inline uint64_t session_bytes(const nlohmann::json& config,int tp,int tokens,int mtp_tokens=0){
  if(tp<=0||tokens<=0)throw std::invalid_argument("Invalid reservation geometry");
  auto& t=config.at("text_config");uint64_t total=0;
  auto get=[&](const char* name){auto n=t.at(name).get<int64_t>();if(n<=0)throw std::invalid_argument("Invalid model dimension");return uint64_t(n);};
@@ -21,6 +21,10 @@ inline uint64_t session_bytes(const nlohmann::json& config,int tp,int tokens){
    }else throw std::invalid_argument("Unsupported layer type");
  }
  // Full prompt embeddings, positions/ids and logits remain live across prefill slices.
+ if(mtp_tokens>0){
+   total=checked_add(total,checked_product(checked_product(4ULL*tokens,shard("num_key_value_heads")),get("head_dim")));
+   total=checked_add(total,2*get("hidden_size"));
+ }
  total=checked_add(total,checked_product(tokens,2*get("hidden_size")+32));
  return checked_add(total,4*get("vocab_size"));
 }
