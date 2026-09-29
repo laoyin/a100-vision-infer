@@ -130,6 +130,12 @@ def main():
                 if item.get('type') == 'image_url' and not item['image_url']['url'].startswith('data:image/'):
                     p.error('Use embedded image data; remote image downloads are disabled for reproducible trials')
     env = dict(os.environ, HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1')
+    # PYTHONPATH also reaches vLLM's spawned workers. No site-packages edits,
+    # dependency installs, runtime replacement, or changes to production services.
+    compat = str(Path(__file__).resolve().parent/'compat_flashinfer')
+    env['AVI_FLASHINFER_RUNTIME_COMPAT'] = '1'
+    env['PYTHONPATH'] = compat + (os.pathsep + env['PYTHONPATH'] if env.get('PYTHONPATH') else '')
+    print('Enabled process-local FlashInfer CUDA runtime lookup compatibility', flush=True)
     rows, reference, reference_prompt = [], None, None
     for window in (0, 1, 2, 3):
         name = 'baseline' if window == 0 else f'mtp{window}'
@@ -137,7 +143,7 @@ def main():
         command = [sys.executable, str(Path(__file__).resolve()), '--child', '--model', str(a.model.resolve()),
                    '--body', str(a.body.resolve()), '--out', str(output.resolve()), '--window', str(window),
                    '--requests', str(a.requests), '--max-tokens', str(a.max_tokens), '--max-context', str(a.max_context), '--memory', str(a.memory), '--max-pixels', str(a.max_pixels)]
-        row = {'name': name, 'vllm_version': version}
+        row = {'name': name, 'vllm_version': version, 'cuda_runtime_lookup_compat': True}
         print(f'Starting {name}; log: {a.out/(name+".log")}', flush=True)
         with (a.out/(name+'.log')).open('x', encoding='utf-8') as log:
             process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=env, start_new_session=True)
