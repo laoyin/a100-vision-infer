@@ -23,6 +23,10 @@ This reads safetensors headers only, checks expected dense MTP names/shapes and 
 
 ## One upstream A/B run
 
+The audit also scans a separate `mtp.safetensors`, even when the original shard index omits it. Tensor records include their source file. Duplicate names or malformed headers fail explicitly. For an unindexed sidecar, the Linux runner creates `matrix/model-view` containing symlinks and a complete generated index; original checkpoint files are never edited. Keep the source checkpoint available while testing. This addresses file discovery, not installed vLLM architecture compatibility. Unknown MTP tensor naming still fails the audit rather than being guessed.
+
+`test.log` now identifies the Git commit, audit/request/runtime stages and the failing stage with its exit code. A successful audit alone is not a completed test: require all four profiles in `matrix/summary.json` to pass. Audit failures preserve JSON diagnostics and print a concise error to the log.
+
 ```bash
 git pull --ff-only
 HF_MODEL=/models/your-merged-fp8 \

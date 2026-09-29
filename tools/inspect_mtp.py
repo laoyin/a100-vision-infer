@@ -4,12 +4,15 @@ import json
 from pathlib import Path
 import struct
 import math
+import sys
 
 
 def headers(model):
     model = Path(model).resolve()
     index = model / 'model.safetensors.index.json'
     files = sorted(set(json.loads(index.read_text(encoding='utf-8'))['weight_map'].values())) if index.exists() else ['model.safetensors']
+    if (model/'mtp.safetensors').is_file() and 'mtp.safetensors' not in files:
+        files.append('mtp.safetensors')
     result = {}
     for relative in files:
         path = (model / relative).resolve()
@@ -40,7 +43,7 @@ def headers(model):
             width = widths.get(entry['dtype'])
             if width is not None and math.prod(shape)*width != end-start:
                 raise ValueError('Shape/dtype byte count mismatch: ' + name)
-            result[name] = {'shape': entry['shape'], 'dtype': entry['dtype'], 'bytes': end-start}
+            result[name] = {'shape': entry['shape'], 'dtype': entry['dtype'], 'bytes': end-start, 'file': relative}
     return result
 
 
@@ -90,7 +93,11 @@ def inspect(model):
             if len(shape) != 2 or scale is None or scale['shape'] != [(d+127)//128 for d in shape]:
                 format_errors.append('Missing/invalid block128 scale: ' + name)
     shared = not text.get('mtp_use_dedicated_embeddings', False)
+    index = model/'model.safetensors.index.json'
+    indexed_files = set(json.loads(index.read_text(encoding='utf-8'))['weight_map'].values()) if index.exists() else set()
     return {'eligible_for_trial': bool(required) and shared and not missing and not wrong and not format_errors,
+            'scanned_files': sorted({e['file'] for e in tensors.values()}),
+            'unindexed_mtp_sidecar': (model/'mtp.safetensors').is_file() and 'mtp.safetensors' not in indexed_files,
             'native_artifact': False, 'model_type': config.get('model_type'), 'mtp_num_hidden_layers': count,
             'shared_embeddings': shared, 'mtp_tensor_count': len(mtp), 'mtp_bytes': sum(e['bytes'] for e in mtp.values()),
             'missing': missing, 'wrong_shapes': wrong, 'format_errors': format_errors, 'tensors': mtp,
@@ -98,14 +105,34 @@ def inspect(model):
             'note': 'Header/shape eligibility only, not runtime compatibility or tensor numerical validation. Fine-tuning may reduce draft acceptance. Dedicated MTP embeddings need separate review.'}
 
 
+def prepare_trial_model(model, destination):
+    """Build a separate symlink view with a complete index; never edit source weights."""
+    model, destination = Path(model).resolve(), Path(destination).absolute()
+    tensors = headers(model)
+    destination.mkdir(parents=True, exist_ok=False)
+    for path in model.iterdir():
+        if path.name != 'model.safetensors.index.json':
+            (destination/path.name).symlink_to(path, target_is_directory=path.is_dir())
+    index = {'metadata': {'total_size': sum(e['bytes'] for e in tensors.values())},
+             'weight_map': {name: e['file'] for name, e in tensors.items()}}
+    (destination/'model.safetensors.index.json').write_text(json.dumps(index, indent=2), encoding='utf-8')
+    return destination
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--model', required=True, type=Path)
     p.add_argument('--require-mtp', action='store_true')
     a = p.parse_args()
-    report = inspect(a.model)
+    try:
+        report = inspect(a.model)
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        report = {'eligible_for_trial': False, 'error': str(error)}
     print(json.dumps(report, indent=2))
     if a.require_mtp and not report['eligible_for_trial']:
+        print('MTP audit FAILED: ' + report.get('error', report.get('reason',
+              f"found {report.get('mtp_tensor_count', 0)} MTP tensors; missing={len(report.get('missing', []))}, "
+              f"wrong_shapes={len(report.get('wrong_shapes', {}))}, format_errors={len(report.get('format_errors', []))}. See mtp-audit.json.")), file=sys.stderr)
         raise SystemExit(2)
 
 

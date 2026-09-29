@@ -3,7 +3,10 @@ from pathlib import Path
 import struct
 import tempfile
 import unittest
-from tools.inspect_mtp import inspect, headers
+from unittest.mock import patch
+import subprocess
+import sys
+from tools.inspect_mtp import inspect, headers, prepare_trial_model
 from tools.benchmark_mtp_upstream import engine_options
 
 
@@ -53,6 +56,51 @@ class MTPTests(unittest.TestCase):
             report = inspect(root)
             self.assertFalse(report['eligible_for_trial'])
             self.assertEqual(report['skipped_mtp_tensors'], ['mtp.fc.weight'])
+
+    def test_unindexed_sidecar_and_trial_index(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)/'source'
+            root.mkdir()
+            self.fixture(root)
+            (root/'model.safetensors').rename(root/'mtp.safetensors')
+            self.fixture(root, include=False)
+            original = json.dumps({'weight_map': {'placeholder': 'model.safetensors'}})
+            (root/'model.safetensors.index.json').write_text(original)
+            report = inspect(root)
+            self.assertTrue(report['eligible_for_trial'])
+            self.assertTrue(report['unindexed_mtp_sidecar'])
+            self.assertEqual(report['tensors']['mtp.fc.weight']['file'], 'mtp.safetensors')
+            # Windows CI may lack symlink privilege; validate the generated index independently.
+            with patch.object(Path, 'symlink_to') as link:
+                view = prepare_trial_model(root, Path(directory)/'view')
+                self.assertEqual(link.call_count, 3)
+            index = json.loads((view/'model.safetensors.index.json').read_text())
+            self.assertEqual(index['weight_map']['mtp.fc.weight'], 'mtp.safetensors')
+            self.assertEqual((root/'model.safetensors.index.json').read_text(), original)
+
+    def test_indexed_sidecar_is_not_read_twice(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.fixture(root)
+            (root/'model.safetensors').rename(root/'mtp.safetensors')
+            (root/'model.safetensors.index.json').write_text(json.dumps({'weight_map': {'mtp.fc.weight': 'mtp.safetensors'}}))
+            self.assertTrue(inspect(root)['eligible_for_trial'])
+            self.assertFalse(inspect(root)['unindexed_mtp_sidecar'])
+
+    def test_duplicate_sidecar_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.fixture(root)
+            (root/'mtp.safetensors').write_bytes((root/'model.safetensors').read_bytes())
+            with self.assertRaisesRegex(ValueError, 'Duplicate tensor'):
+                inspect(root)
+
+    def test_cli_failure_keeps_json_and_explains_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run([sys.executable, 'tools/inspect_mtp.py', '--model', directory, '--require-mtp'], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertFalse(json.loads(result.stdout)['eligible_for_trial'])
+            self.assertIn('MTP audit FAILED', result.stderr)
 
     def test_shard_cannot_escape(self):
         with tempfile.TemporaryDirectory() as directory:

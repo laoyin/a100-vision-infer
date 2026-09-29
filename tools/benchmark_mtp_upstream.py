@@ -10,9 +10,9 @@ import subprocess
 import sys
 import time
 try:
-    from .inspect_mtp import inspect
+    from .inspect_mtp import inspect, prepare_trial_model
 except ImportError:
-    from inspect_mtp import inspect
+    from inspect_mtp import inspect, prepare_trial_model
 
 
 def engine_options(model, window, max_context, memory, max_pixels=4000000):
@@ -119,6 +119,9 @@ def main():
         version = importlib.metadata.version('vllm')
     except importlib.metadata.PackageNotFoundError:
         p.error('vLLM is absent from this environment. Nothing will be installed automatically.')
+    if audit.get('unindexed_mtp_sidecar'):
+        a.model = prepare_trial_model(a.model, a.out/'model-view')
+        print(f'Created complete checkpoint index in {a.model}; source weights unchanged. Runtime compatibility still requires successful MTP trials.', flush=True)
     body = json.loads(a.body.read_text(encoding='utf-8'))
     for message in body.get('messages', []):
         content = message.get('content', [])
