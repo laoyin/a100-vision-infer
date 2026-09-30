@@ -25,6 +25,13 @@ def main():
  p.add_argument('--mtp-draft-graph',action='store_true')
  p.add_argument('--gdn-chunk',action='store_true')
  p.add_argument('--flash-prefill',action='store_true')
+ p.add_argument('--gdn-cooperative',action='store_true')
+ p.add_argument('--fused-gdn-conv',action='store_true')
+ p.add_argument('--bf16-tp-reduce',action='store_true')
+ p.add_argument('--frontend-format',choices=['hf','vllm-string'],default='hf')
+ p.add_argument('--frontend-threads',type=int,default=0)
+ p.add_argument('--bf16-patches',action='store_true')
+ p.add_argument('--spool-dir')
  p.add_argument('--profile-stages',action='store_true')
  p.add_argument('--cache-vision-weights',action='store_true')
  p.add_argument('--weight-cache-mib',type=int,default=0)
@@ -38,8 +45,12 @@ def main():
  if bool(a.frontend_model)!=bool(a.body):p.error('--frontend-model and --body must be provided together')
  if a.frontend_model:
   from benchmark_frontend import Frontend
-  frontend=Frontend(a.frontend_model,a.body)
- spool=tempfile.TemporaryDirectory(prefix='avi-benchmark-')
+  if a.frontend_threads<0:p.error('--frontend-threads must be nonnegative')
+  if a.frontend_threads:
+   import torch
+   torch.set_num_threads(a.frontend_threads)
+  frontend=Frontend(a.frontend_model,a.body,content_format=a.frontend_format,bf16_patches=a.bf16_patches)
+ spool=tempfile.TemporaryDirectory(prefix='avi-benchmark-',dir=a.spool_dir)
  prompt_ids=None
  cmd=['mpirun','-np',str(a.tp),a.worker,'--model',str(Path(a.model).resolve()),'--max-context',str(req['max_context']),
       '--max-concurrency',str(a.concurrency),'--prefill-chunk',str(a.prefill_chunk),'--image-cache-mib',str(256 if a.cache else 0),'--prefix-cache-mib',str(512 if a.cache else 0)]
@@ -54,6 +65,9 @@ def main():
  if a.mtp_draft_graph:cmd+=['--mtp-draft-graph']
  if a.gdn_chunk:cmd+=['--gdn-chunk']
  if a.flash_prefill:cmd+=['--flash-prefill']
+ if a.gdn_cooperative:cmd+=['--gdn-cooperative']
+ if a.fused_gdn_conv:cmd+=['--fused-gdn-conv']
+ if a.bf16_tp_reduce:cmd+=['--bf16-tp-reduce']
  if a.profile_stages:cmd+=['--profile-stages']
  if a.cache_vision_weights:cmd+=['--cache-vision-weights']
  process=subprocess.Popen(cmd,stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True,bufsize=1,start_new_session=not a.inherit_process_group);events=queue.Queue()
@@ -114,6 +128,7 @@ def main():
   report['gdn_chunk']=a.gdn_chunk
   report.update(flash_prefill=a.flash_prefill,cache_vision_weights=a.cache_vision_weights)
   report['synchronized_diagnostic']=a.profile_stages
+  report.update(fused_gdn_conv=a.fused_gdn_conv,gdn_cooperative=a.gdn_cooperative,bf16_tp_reduce=a.bf16_tp_reduce,frontend_format=a.frontend_format,frontend_threads=a.frontend_threads,bf16_patches=a.bf16_patches,spool_dir=a.spool_dir)
   report['timing_scope']='CPU image decode/tokenization/preprocessing + disk IPC + native inference + output decoding' if frontend else 'prepared input + native inference'
   report['prompt_token_ids']=prompt_ids
   with open(a.out,'x',encoding='utf-8') as f:json.dump(report,f,indent=2)

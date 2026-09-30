@@ -78,6 +78,9 @@ int main(int argc,char** argv){
       if(key=="--gdn-chunk"){gdn_chunk=true;continue;}
       if(key=="--profile-stages"){profile_stages=true;continue;}
       if(key=="--flash-prefill"){options.flash_prefill=true;continue;}
+      if(key=="--gdn-cooperative"){options.gdn_cooperative=true;continue;}
+      if(key=="--fused-gdn-conv"){options.fused_gdn_conv=true;continue;}
+      if(key=="--bf16-tp-reduce"){options.bf16_tp_reduce=true;continue;}
       if(key=="--cache-vision-weights"){options.cache_vision_weights=true;continue;}
    TORCH_CHECK(i+1<argc,"Missing value for ",key);std::string value=argv[++i];
    if(key=="--model")model=value;else if(key=="--max-context")capacity=std::stoi(value);else if(key=="--max-concurrency")concurrency=std::stoi(value);else if(key=="--prefill-chunk")chunk=std::stoi(value);

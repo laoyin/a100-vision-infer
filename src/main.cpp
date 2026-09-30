@@ -32,6 +32,9 @@ int main(int argc,char** argv) {
       if(key=="--mtp-draft-graph"){draft_graph=true;continue;}
       if(key=="--gdn-chunk"){gdn_chunk=true;continue;}
       if(key=="--flash-prefill"){options.flash_prefill=true;continue;}
+      if(key=="--gdn-cooperative"){options.gdn_cooperative=true;continue;}
+      if(key=="--fused-gdn-conv"){options.fused_gdn_conv=true;continue;}
+      if(key=="--bf16-tp-reduce"){options.bf16_tp_reduce=true;continue;}
       if(key=="--cache-vision-weights"){options.cache_vision_weights=true;continue;}
       if(key=="--cuda-graph"){options.cuda_graph=true;continue;}
       if(key=="--extra-fusions"){options.extra_fusions=true;continue;}

@@ -137,6 +137,23 @@ void run_optimized_tests(){
   }
   TORCH_CHECK(at::equal(keys.narrow(0,0,old+T),refk.narrow(0,0,old+T)),"Chunk KV append mismatch");
  }
+ // Nonzero recurrent states, long prefixes, partial value tiles and rollback.
+ for(int K:{16,128})for(int T:{1,4,33,513})for(int V:{17,32,128}){
+  auto q=avi::fused_l2(at::randn({T,2,K},opt).to(at::kBFloat16));
+  auto k=avi::fused_l2(at::randn_like(q)),v=at::randn({T,2,V},opt).to(at::kBFloat16);
+  auto g=-at::rand({T,2},opt)*.1,b=at::rand({T,2},opt);
+  auto state=at::randn({2,K,V},opt),ref=state.clone();
+  auto trajectory=at::empty({T,2,K,V},opt),reference_history=at::empty_like(trajectory);
+  auto expected=avi::delta_scan_fast(q,k,v,g,b,ref,reference_history);
+  auto actual=avi::delta_scan_fast(q,k,v,g,b,state,trajectory,true);
+  TORCH_CHECK(at::allclose(actual.to(at::kFloat),expected.to(at::kFloat),.02,.003),"Cooperative GDN output mismatch");
+  TORCH_CHECK(at::allclose(trajectory,reference_history,.001,.0001)&&at::allclose(state,ref,.001,.0001),"Cooperative GDN state/trajectory mismatch");
+ }
+ for(int C:{7,64})for(int T:{1,4,33,513}){
+  auto input=at::randn({1,C,T+3},opt).to(at::kBFloat16),weight=at::randn({C,1,4},opt).to(at::kBFloat16);
+  auto expected=at::silu(at::conv1d(input,weight,{},at::IntArrayRef{1},at::IntArrayRef{0},at::IntArrayRef{1},C)).squeeze(0).t();
+  TORCH_CHECK(at::allclose(avi::conv_prefill(input,weight).to(at::kFloat),expected.to(at::kFloat),.02,.01),"Fused GDN convolution mismatch");
+ }
  // Exercise bottom-right causal alignment, including unequal lengths and GQA.
  for(int D:{16,128,256})for(int T:{1,9,33})for(int old:{0,17,257}){
   const int H=6,HK=2,L=old+T;

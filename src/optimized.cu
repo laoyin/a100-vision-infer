@@ -92,6 +92,27 @@ __global__ void attention_parts(const bf* q,const bf* keys,const bf* vals,const 
 }
 __global__ void attention_merge(const float* partial,const float* stats,bf* y,int D,int P){int h=blockIdx.x;float m=-INFINITY;for(int p=threadIdx.x;p<P;p+=256)m=fmaxf(m,stats[(h*P+p)*2]);m=block_max(m);float sum=0;for(int p=threadIdx.x;p<P;p+=256)sum+=stats[(h*P+p)*2+1]*expf(stats[(h*P+p)*2]-m);sum=block_sum(sum);for(int d=threadIdx.x;d<D;d+=256){float result=0;for(int p=0;p<P;p++)result+=partial[(h*P+p)*D+d]*expf(stats[(h*P+p)*2]-m);y[h*D+d]=__float2bfloat16_rn(result/sum);}}
 Tensor gqa_decode(Tensor q,Tensor k,Tensor v,Tensor keys,Tensor values,Tensor offset){q=q.contiguous();k=k.contiguous();v=v.contiguous();TORCH_CHECK(q.dim()==3&&q.size(0)==1&&q.scalar_type()==at::kBFloat16&&q.is_cuda()&&keys.is_contiguous()&&values.is_contiguous(),"Invalid decode attention");int H=q.size(1),D=q.size(2),HK=k.size(1),P=(keys.size(0)+255)/256;TORCH_CHECK(HK>0&&H%HK==0&&D<=512&&k.size(2)==D&&v.sizes()==k.sizes()&&offset.is_cuda()&&offset.scalar_type()==at::kLong&&offset.numel()==1,"Invalid GQA geometry");auto out=at::empty_like(q);auto partial=at::empty({H,P,D},q.options().dtype(at::kFloat)),stats=at::empty({H,P,2},q.options().dtype(at::kFloat));auto stream=at::cuda::getCurrentCUDAStream();append_kv<<<(HK*D+255)/256,256,0,stream>>>(ptr(k),ptr(v),outptr(keys),outptr(values),offset.data_ptr<int64_t>(),HK,D);attention_parts<<<dim3(H,P),256,0,stream>>>(ptr(q),ptr(keys),ptr(values),offset.data_ptr<int64_t>(),partial.data_ptr<float>(),stats.data_ptr<float>(),H,HK,D,P);attention_merge<<<H,256,0,stream>>>(partial.data_ptr<float>(),stats.data_ptr<float>(),outptr(out),D,P);C10_CUDA_KERNEL_LAUNCH_CHECK();return out;}
+// Fuse small depthwise convolution and SiLU. Preserve the BF16 rounding boundary
+// between convolution and activation used by the reference ATen path.
+__global__ void prefill_conv(const bf* input,const bf* weight,bf* output,int C,int T,int width){
+  int64_t index=int64_t(blockIdx.x)*256+threadIdx.x;
+  if(index>=int64_t(T)*C)return;
+  int c=index%C,t=index/C;float value=0.f;
+  for(int j=0;j<width;j++)value+=__bfloat162float(input[int64_t(c)*(T+width-1)+t+j])*__bfloat162float(weight[c*width+j]);
+  value=__bfloat162float(__float2bfloat16_rn(value));
+  output[index]=__float2bfloat16_rn(value/(1.f+expf(-value)));
+}
+Tensor conv_prefill(Tensor input,Tensor weight){
+  TORCH_CHECK(input.is_cuda()&&input.dim()==3&&input.size(0)==1&&weight.dim()==3&&
+      weight.size(0)==input.size(1)&&weight.size(1)==1&&weight.size(2)>0&&
+      input.size(2)>=weight.size(2)&&input.scalar_type()==at::kBFloat16&&
+      weight.scalar_type()==at::kBFloat16&&weight.device()==input.device(),"Invalid prefill convolution");
+  input=input.contiguous();weight=weight.contiguous();
+  int C=input.size(1),width=weight.size(2),T=input.size(2)-width+1;
+  auto out=at::empty({T,C},input.options());
+  prefill_conv<<<(int64_t(T)*C+255)/256,256,0,at::cuda::getCurrentCUDAStream()>>>(ptr(input),ptr(weight),outptr(out),C,T,width);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();return out;
+}
 // Value-column tiling increases the number of blocks; recurrent state stays in registers across time.
 template<int K> __global__ void register_scan(const bf* q,const bf* k,const bf* v,const float* g,const float* beta,float* state,bf* out,int T,int H,int V,float* trajectory){
  int h=blockIdx.x,j=blockIdx.y*32+threadIdx.x;if(j>=V)return;float s[K];
@@ -107,12 +128,44 @@ template<int K> __global__ void register_scan(const bf* q,const bf* k,const bf* 
  #pragma unroll
  for(int i=0;i<K;i++)state[(h*K+i)*V+j]=s[i];
 }
-Tensor delta_scan_fast(Tensor q,Tensor k,Tensor v,Tensor g,Tensor beta,Tensor state,Tensor trajectory){
+// Four adjacent lanes cooperate on one value column. Each holds K/4 state
+// elements instead of K, shortening the serial dot product and reducing registers.
+// All lanes participate in shuffles, including the masked final value tile.
+template<int K> __global__ void cooperative_scan(const bf* q,const bf* k,const bf* v,
+    const float* g,const float* beta,float* state,bf* out,int T,int H,int V,float* trajectory){
+  int h=blockIdx.x,lane=threadIdx.x%4,j=blockIdx.y*32+threadIdx.x/4;
+  float s[K/4];
+  #pragma unroll
+  for(int i=0;i<K/4;i++)s[i]=j<V?state[(h*K+4*i+lane)*V+j]:0.f;
+  for(int t=0;t<T;t++){
+    int base=(t*H+h)*K;float decay=expf(g[t*H+h]),memory=0.f;
+    #pragma unroll
+    for(int i=0;i<K/4;i++){s[i]*=decay;memory+=s[i]*__bfloat162float(k[base+4*i+lane]);}
+    memory+=__shfl_xor_sync(0xffffffff,memory,1,4);
+    memory+=__shfl_xor_sync(0xffffffff,memory,2,4);
+    float delta=((j<V?__bfloat162float(v[(t*H+h)*V+j]):0.f)-memory)*beta[t*H+h];
+    float result=0.f;
+    #pragma unroll
+    for(int i=0;i<K/4;i++){
+      s[i]+=__bfloat162float(k[base+4*i+lane])*delta;
+      result+=s[i]*__bfloat162float(q[base+4*i+lane]);
+      if(trajectory&&j<V)trajectory[((int64_t(t)*H+h)*K+4*i+lane)*V+j]=s[i];
+    }
+    result+=__shfl_xor_sync(0xffffffff,result,1,4);
+    result+=__shfl_xor_sync(0xffffffff,result,2,4);
+    if(lane==0&&j<V)out[(t*H+h)*V+j]=__float2bfloat16_rn(result*rsqrtf(float(K)));
+  }
+  #pragma unroll
+  for(int i=0;i<K/4;i++)if(j<V)state[(h*K+4*i+lane)*V+j]=s[i];
+}
+Tensor delta_scan_fast(Tensor q,Tensor k,Tensor v,Tensor g,Tensor beta,Tensor state,Tensor trajectory,bool cooperative){
  TORCH_CHECK(q.is_contiguous()&&k.is_contiguous()&&v.is_contiguous()&&g.is_contiguous()&&beta.is_contiguous()&&state.is_contiguous()&&q.is_cuda()&&q.scalar_type()==at::kBFloat16&&state.scalar_type()==at::kFloat,"Invalid register GDN inputs");
  auto y=at::empty_like(v);int K=q.size(2),T=q.size(0),H=q.size(1),V=v.size(2);
  if(trajectory.defined()){TORCH_CHECK(trajectory.device()==state.device()&&trajectory.scalar_type()==at::kFloat&&trajectory.is_contiguous()&&trajectory.sizes()==at::IntArrayRef({T,H,K,V}),"Invalid GDN trajectory");}
  auto history=trajectory.defined()?trajectory.data_ptr<float>():nullptr;auto stream=at::cuda::getCurrentCUDAStream();
- if(K==128)register_scan<128><<<dim3(H,(V+31)/32),32,0,stream>>>(ptr(q),ptr(k),ptr(v),g.data_ptr<float>(),beta.data_ptr<float>(),state.data_ptr<float>(),outptr(y),T,H,V,history);
+ if(cooperative&&K==128)cooperative_scan<128><<<dim3(H,(V+31)/32),128,0,stream>>>(ptr(q),ptr(k),ptr(v),g.data_ptr<float>(),beta.data_ptr<float>(),state.data_ptr<float>(),outptr(y),T,H,V,history);
+ else if(cooperative&&K==16)cooperative_scan<16><<<dim3(H,(V+31)/32),128,0,stream>>>(ptr(q),ptr(k),ptr(v),g.data_ptr<float>(),beta.data_ptr<float>(),state.data_ptr<float>(),outptr(y),T,H,V,history);
+ else if(K==128)register_scan<128><<<dim3(H,(V+31)/32),32,0,stream>>>(ptr(q),ptr(k),ptr(v),g.data_ptr<float>(),beta.data_ptr<float>(),state.data_ptr<float>(),outptr(y),T,H,V,history);
  else if(K==16)register_scan<16><<<dim3(H,(V+31)/32),32,0,stream>>>(ptr(q),ptr(k),ptr(v),g.data_ptr<float>(),beta.data_ptr<float>(),state.data_ptr<float>(),outptr(y),T,H,V,history);
  else { TORCH_CHECK(false,"Register GDN supports K=16 or 128"); }C10_CUDA_KERNEL_LAUNCH_CHECK();return y;
 }

@@ -37,6 +37,7 @@ static Tensor raw(const std::string& dir,const json& d,int device) {
 Engine::Engine(const std::string& dir,int rank,int world,int device,ncclComm_t comm,int capacity,EngineOptions options)
  :rank_(rank),world_(world),device_(device),capacity_(capacity),comm_(comm),options_(options) {
   TORCH_CHECK(capacity>0,"Invalid capacity");
+  TORCH_CHECK(!options_.bf16_tp_reduce||world<=2,"BF16 TP reduction is restricted to TP1/TP2");
   TORCH_CHECK(!std::filesystem::exists(dir+"/INCOMPLETE"),"Incomplete model export");
     auto manifest=read_json(dir+"/manifest.json");
   TORCH_CHECK(manifest.at("format")=="avi-v1" && manifest.at("tp")==world,"Artifact format or TP mismatch");
@@ -145,6 +146,11 @@ Tensor Engine::tensor(const std::string& name) {
 Tensor Engine::read_input(const std::string& dir,const json& d) { return raw(dir,d,device_); }
 Tensor Engine::sum(Tensor x) {
   if(world_==1) return x;
+  if(options_.bf16_tp_reduce&&x.scalar_type()==at::kBFloat16){
+    auto output=x.contiguous();
+    auto status=ncclAllReduce(output.data_ptr(),output.data_ptr(),output.numel(),ncclBfloat16,ncclSum,comm_,at::cuda::getCurrentCUDAStream());
+    TORCH_CHECK(status==ncclSuccess,ncclGetErrorString(status));return output;
+  }
   auto f=x.to(at::kFloat).contiguous();
   auto r=ncclAllReduce(f.data_ptr(),f.data_ptr(),f.numel(),ncclFloat,ncclSum,comm_,at::cuda::getCurrentCUDAStream());
   TORCH_CHECK(r==ncclSuccess,ncclGetErrorString(r)); return f.to(x.scalar_type());
@@ -279,7 +285,8 @@ Tensor Engine::delta_attention(Tensor x,int layer,const std::string& p,Tensor pr
     auto input=at::cat({s.conv,mixed},-1);
     if(verifying_)verify_conv_.at(layer)=input;
     s.conv.copy_(input.narrow(-1,input.size(-1)-(kernel-1),kernel-1));
-    conv=at::silu(at::conv1d(input,tensor(p+".conv1d.weight"),{},at::IntArrayRef{1},at::IntArrayRef{0},at::IntArrayRef{1},C)).squeeze(0).t();
+    conv=(options_.optimized&&options_.fused_gdn_conv)?conv_prefill(input,tensor(p+".conv1d.weight")):
+      at::silu(at::conv1d(input,tensor(p+".conv1d.weight"),{},at::IntArrayRef{1},at::IntArrayRef{0},at::IntArrayRef{1},C)).squeeze(0).t();
   }
   auto q=conv.narrow(-1,0,HK*K).reshape({T,HK,K});
   auto k=conv.narrow(-1,HK*K,HK*K).reshape({T,HK,K});
@@ -303,7 +310,7 @@ Tensor Engine::delta_attention(Tensor x,int layer,const std::string& p,Tensor pr
   }
   Tensor result;
   if(gdn_chunk_enabled_&&!verifying_&&!decode_mode_&&T>=32)result=delta_scan_chunked(q,k,v,g,beta,s.recurrent);
-  else result=(options_.optimized&&(K==128||K==16))?delta_scan_fast(q,k,v.contiguous(),g.contiguous(),beta.contiguous(),s.recurrent,trajectory):delta_scan(q,k,v.contiguous(),g.contiguous(),beta.contiguous(),s.recurrent);
+  else result=(options_.optimized&&(K==128||K==16))?delta_scan_fast(q,k,v.contiguous(),g.contiguous(),beta.contiguous(),s.recurrent,trajectory,options_.gdn_cooperative):delta_scan(q,k,v.contiguous(),g.contiguous(),beta.contiguous(),s.recurrent);
   auto z=(options_.optimized?projected.narrow(-1,C,H*V):linear(x,p+".in_proj_z")).reshape({T,H,V});
   result=(options_.optimized&&options_.extra_fusions)?fused_rms_gate(result,tensor(p+".norm.weight"),z,eps_):(norm(result,p+".norm",false).to(at::kFloat)*at::silu(z.to(at::kFloat))).to(at::kBFloat16);
   result=result.reshape({T,H*V});return finish?linear(result,p+".out_proj",true):result;

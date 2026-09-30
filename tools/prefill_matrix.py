@@ -16,6 +16,22 @@ def prompt_difference(actual, expected):
                 vllm_near=expected[max(0, first-5):first+8])
 
 
+def acceptance(profiles, comparisons, upstream_count=2):
+    by_native={}
+    for row in comparisons:
+        ratio=row['latency_ratio_vllm_over_native']
+        if ratio is not None:
+            by_native.setdefault(row['native'],[]).append(ratio)
+    # A winner must beat the fastest matching vLLM configuration, not merely
+    # one slower upstream window. Missing comparisons never count as a win.
+    ratios=[min(values) for values in by_native.values() if len(values)==upstream_count]
+    return {'native_correctness_passed':all(r['status']=='passed' for r in profiles),
+            'cross_engine_matching_comparisons':sum(len(v) for v in by_native.values()),
+            'best_latency_ratio_vs_fastest_vllm':max(ratios) if ratios else None,
+            'faster_on_this_workload':bool(ratios and max(ratios)>1),
+            'scope':'C1 latency on this image only. Both vLLM MTP2/3 must match. C2 has no matched vLLM concurrency result.'}
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     for key in ('previous', 'hf-model', 'vllm-results', 'out'):
@@ -23,6 +39,7 @@ def main():
     p.add_argument('--requests', type=int, default=5)
     p.add_argument('--timeout', type=float, default=1800)
     p.add_argument('--max-pixels', type=int, default=4000000)
+    p.add_argument('--suite', choices=['prefill','deep'], default='prefill')
     a = p.parse_args()
     if a.requests < 1 or a.timeout <= 0:
         p.error('Invalid limits')
@@ -41,8 +58,24 @@ def main():
         ('flash-vision-cache32', ['--flash-prefill', '--cache-vision-weights'], 512, 32768),
         ('diagnostic', ['--flash-prefill', '--cache-vision-weights', '--profile-stages'], 512, 24576),
     ]
-    summary = {'profiles': [], 'comparison': [], 'vllm_reports': str(a.vllm_results.resolve()),
-               'note': 'vLLM timings reused from an earlier run; not a simultaneous hardware-controlled benchmark. Diagnostic profile synchronizes GPU and is excluded from speed comparisons.'}
+    if a.suite=='deep':
+        common+=['--flash-prefill','--frontend-format','vllm-string']
+        frontend=['--frontend-threads','4','--bf16-patches','--spool-dir','/dev/shm']
+        gdn=['--gdn-cooperative','--fused-gdn-conv']
+        profiles=[
+            ('reference',[],512,24576),
+            ('frontend',frontend,512,24576),
+            ('gdn-cooperative',['--gdn-cooperative'],512,24576),
+            ('gdn-conv',['--fused-gdn-conv'],512,24576),
+            ('tp-bf16',['--bf16-tp-reduce'],512,24576),
+            ('combined',frontend+gdn+['--bf16-tp-reduce'],512,24576),
+            ('combined-2048',frontend+gdn+['--bf16-tp-reduce'],2048,24576),
+            ('combined-mtp2',frontend+gdn+['--bf16-tp-reduce','--mtp-tokens','2'],512,24576),
+            ('combined-c2',frontend+gdn+['--bf16-tp-reduce','--concurrency','2'],512,24576),
+            ('diagnostic',frontend+gdn+['--bf16-tp-reduce','--profile-stages'],512,24576),
+        ]
+    summary = {'suite':a.suite,'profiles': [], 'comparison': [], 'vllm_reports': str(a.vllm_results.resolve()),
+               'note': 'vLLM reports are supplied separately (the deep test script generates them in this run). Measurements are sequential, not interleaved. Diagnostic synchronizes GPU and is excluded from speed comparisons.'}
     reference = None
     for name, flags, chunk, cache in profiles:
         output = a.out/(name+'.json')
@@ -61,10 +94,11 @@ def main():
                 reference = report['results'][0]['generated_ids']
             differences = compare_outputs(report['results'], reference, request['eos_token_ids']) if reference is not None else None
             row.update(status='passed' if differences == [] else 'output_mismatch',
+                       concurrency=report['concurrency'],output_tokens_per_second=report['output_tokens_per_second'],
                        differences=differences, latency=report['latency_seconds'], ttft=report['ttft_seconds'],
                        frontend_seconds=[r.get('frontend_seconds') for r in report['results']],
                        stages=[r.get('stages') for r in report['results']])
-            if name != 'diagnostic':
+            if name != 'diagnostic' and report['concurrency']==1:
                 for label, target in upstream.items():
                     prompt = prompt_difference(report['prompt_token_ids'], target['results'][0]['prompt_token_ids'])
                     outputs = compare_outputs(report['results'], target['results'][0]['generated_ids'], request['eos_token_ids'])
@@ -77,7 +111,11 @@ def main():
         summary['profiles'].append(row)
         (a.out/'summary.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
         print(json.dumps(row), flush=True)
-    if any(r['status'] != 'passed' for r in summary['profiles']):
+    ratios=[r['latency_ratio_vllm_over_native'] for r in summary['comparison'] if r['latency_ratio_vllm_over_native'] is not None]
+    summary['acceptance']=acceptance(summary['profiles'],summary['comparison'],len(upstream))
+    (a.out/'summary.json').write_text(json.dumps(summary,indent=2),encoding='utf-8')
+    print(json.dumps(summary['acceptance']),flush=True)
+    if any(r['status'] != 'passed' for r in summary['profiles']) or (a.suite=='deep' and not ratios):
         raise SystemExit(1)
 
 

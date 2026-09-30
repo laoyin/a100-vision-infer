@@ -12,8 +12,9 @@ at::Tensor fused_sigmoid_gate(at::Tensor x,at::Tensor gate);
 at::Tensor fused_l2(at::Tensor x);
 at::Tensor fused_rope(at::Tensor x,at::Tensor positions,int rotary,double theta,int height_section,int width_section);
 at::Tensor conv_decode(at::Tensor x,at::Tensor weight,at::Tensor history);
+at::Tensor conv_prefill(at::Tensor input,at::Tensor weight);
 at::Tensor gqa_decode(at::Tensor q,at::Tensor k,at::Tensor v,at::Tensor keys,at::Tensor values,at::Tensor offset);
 at::Tensor gqa_chunk(at::Tensor q,at::Tensor k,at::Tensor v,at::Tensor keys,at::Tensor values,int old);
-at::Tensor delta_scan_fast(at::Tensor q,at::Tensor k,at::Tensor v,at::Tensor g,at::Tensor beta,at::Tensor state,at::Tensor trajectory={});
+at::Tensor delta_scan_fast(at::Tensor q,at::Tensor k,at::Tensor v,at::Tensor g,at::Tensor beta,at::Tensor state,at::Tensor trajectory={},bool cooperative=false);
 at::Tensor delta_scan_chunked(at::Tensor q,at::Tensor k,at::Tensor v,at::Tensor g,at::Tensor beta,at::Tensor state,int chunk=32);
 }

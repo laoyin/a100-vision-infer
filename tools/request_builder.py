@@ -6,9 +6,16 @@ from format_utils import image_geometry, rope_positions
 
 
 def build_request(processor, config, generation, messages, images, out, *, max_pixels=4000000,
-                  max_context=20480, max_new_tokens=256, thinking=False):
+                  max_context=20480, max_new_tokens=256, thinking=False,content_format='hf',bf16_patches=False):
     if not 0 < max_new_tokens < max_context or max_pixels <= 0:
         raise ValueError('Invalid request budget')
+    if content_format=='vllm-string':
+        from chat_format import vllm_string_messages
+        marker=''.join(processor.tokenizer.convert_ids_to_tokens(config[key])
+                       for key in ('vision_start_token_id','image_token_id','vision_end_token_id'))
+        messages=vllm_string_messages(messages,marker)
+    elif content_format!='hf':
+        raise ValueError('Unknown content format')
     text=processor.apply_chat_template(messages,tokenize=False,add_generation_prompt=True,enable_thinking=thinking)
     size=processor.image_processor.size
     minimum=size['shortest_edge'] if isinstance(size,dict) else size.shortest_edge
@@ -31,9 +38,16 @@ def build_request(processor, config, generation, messages, images, out, *, max_p
          'positions':write('positions',positions,'I64'),'images':[],'thinking':thinking,'max_pixels':max_pixels}
     offset=0;side=int(vc['num_position_embeddings']**0.5)
     for i,(t,h,w) in enumerate(grids):
-        patches=encoded['pixel_values'][offset:offset+h*w].float().numpy().astype('<f4');offset+=h*w
+        pixels=encoded['pixel_values'][offset:offset+h*w];offset+=h*w
+        if bf16_patches:
+            import torch
+            # Identical rounding to the worker's F32 -> BF16 conversion, half the
+            # serialization/read/H2D bytes. Values are not requantized to FP8.
+            patches=pixels.to(torch.bfloat16).contiguous().view(torch.int16).numpy().astype('<i2',copy=False)
+        else:
+            patches=pixels.float().numpy().astype('<f4')
         coords,indices,factors=image_geometry(h,w,merge,side)
-        req['images'].append({'grid':[t,h,w],'patches':write(f'image{i}_patches',patches,'F32'),
+        req['images'].append({'grid':[t,h,w],'patches':write(f'image{i}_patches',patches,'BF16' if bf16_patches else 'F32'),
              'coords':write(f'image{i}_coords',coords,'I64'),'position_indices':write(f'image{i}_indices',indices,'I64'),
              'position_weights':write(f'image{i}_factors',factors,'F32')})
     (out/'request.json').write_text(json.dumps(req,indent=2),encoding='utf-8')

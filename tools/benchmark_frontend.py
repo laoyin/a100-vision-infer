@@ -5,9 +5,11 @@ import json
 from pathlib import Path
 
 class Frontend:
-    def __init__(self,model,body):
+    def __init__(self,model,body,content_format='hf',bf16_patches=False):
         from transformers import AutoProcessor
         self.model=Path(model)
+        self.content_format=content_format
+        self.bf16_patches=bf16_patches
         self.processor=AutoProcessor.from_pretrained(model,local_files_only=True,trust_remote_code=False)
         self.config=json.loads((self.model/'config.json').read_text(encoding='utf-8'))
         generation=self.model/'generation_config.json'
@@ -35,4 +37,5 @@ class Frontend:
                 parts.append({'type':'image'})
             messages.append({'role':message['role'],'content':parts})
         return build_request(self.processor,self.config,self.generation,messages,images,out,
-                             max_pixels=max_pixels,max_context=max_context,max_new_tokens=max_tokens,thinking=False)
+                             max_pixels=max_pixels,max_context=max_context,max_new_tokens=max_tokens,thinking=False,
+                             content_format=self.content_format,bf16_patches=self.bf16_patches)
