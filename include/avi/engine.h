@@ -13,7 +13,7 @@ using json = nlohmann::json;
 Tensor fp8_decode(Tensor codes, Tensor scales);
 Tensor delta_scan(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, Tensor state);
 struct Weight { Tensor data, scale; };
-struct EngineOptions { bool optimized=true; bool extra_fusions=false; bool cublas_prefill=false; bool cuda_graph=false; bool tp_lm_head=false; bool reference_prefill=false; bool vector_gemv=false; bool flash_prefill=false; bool cache_vision_weights=false; bool gdn_cooperative=false; bool fused_gdn_conv=false; bool bf16_tp_reduce=false; bool gdn_wy=false; bool mtp_verify_graph=false; bool profile_kernels=false; bool audit_logits=false; bool multi_token_gemv=false; bool shared_gemv_fp8=false; bool fused_gdn_prepare=false; bool gdn_wy_fused=false; bool reuse_verify_graph=false; int mtp_tokens=0; size_t weight_cache_bytes=0; size_t image_cache_bytes=256ULL<<20; size_t prefix_cache_bytes=512ULL<<20; size_t host_prefix_cache_bytes=0; };
+struct EngineOptions { bool optimized=true; bool extra_fusions=false; bool cublas_prefill=false; bool cuda_graph=false; bool tp_lm_head=false; bool reference_prefill=false; bool vector_gemv=false; bool flash_prefill=false; bool cache_vision_weights=false; bool gdn_cooperative=false; bool fused_gdn_conv=false; bool bf16_tp_reduce=false; bool gdn_wy=false; bool mtp_verify_graph=false; bool profile_kernels=false; bool audit_logits=false; bool multi_token_gemv=false; bool shared_gemv_fp8=false; bool fused_gdn_prepare=false; bool gdn_wy_fused=false; bool reuse_verify_graph=false; bool gdn_tensor_prefill=false; int gdn_tensor_chunk=64; int mtp_tokens=0; size_t weight_cache_bytes=0; size_t image_cache_bytes=256ULL<<20; size_t prefix_cache_bytes=512ULL<<20; size_t host_prefix_cache_bytes=0; };
 struct SpeculativeResult { std::vector<int64_t> tokens; int consumed=0,proposed=0,accepted=0; };
 struct DecodeGraph;
 struct DraftGraph;
@@ -75,7 +75,7 @@ class Engine {
   size_t verify_graph_pool_bytes_=0;
   void release_verify(int id);
   void adopt_verify();
-  uint64_t verify_graph_builds_=0,verify_graph_replays_=0,verify_graph_reuses_=0;
+  uint64_t verify_graph_builds_=0,verify_graph_replays_=0,verify_graph_reuses_=0,gdn_tensor_calls_=0;
   size_t profile_begin(const std::string& label);
   void profile_end(size_t index);
   std::vector<std::shared_ptr<ProfileEvent>> profile_events_;

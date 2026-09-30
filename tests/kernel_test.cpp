@@ -4,6 +4,7 @@
 #include <iostream>
 #include <cmath>
 void run_optimized_tests();
+void run_tensor_gdn_tests();
 int main() {
  try {
   c10::InferenceMode guard; TORCH_CHECK(cudaSetDevice(0)==cudaSuccess,"No GPU");
@@ -36,6 +37,7 @@ int main() {
   TORCH_CHECK(at::equal(at::cat({first,second}),out) && at::equal(split_state,state),"Chunk continuation mismatch");
   TORCH_CHECK(cudaDeviceSynchronize()==cudaSuccess,"CUDA failure");
   run_optimized_tests();
+  run_tensor_gdn_tests();
   std::cout<<"FP8 decoding, GDN recurrence and continuation passed\n"; return 0;
  } catch(const std::exception& e) { std::cerr<<e.what()<<"\n"; return 1; }
 }

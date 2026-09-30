@@ -32,6 +32,8 @@ def main():
  p.add_argument('--multi-token-gemv-fp8',action='store_true')
  p.add_argument('--fused-gdn-prepare',action='store_true')
  p.add_argument('--gdn-wy-fused',action='store_true')
+ p.add_argument('--gdn-tensor-prefill',action='store_true')
+ p.add_argument('--gdn-tensor-chunk',type=int,choices=[32,64],default=64)
  p.add_argument('--reuse-verify-graph',action='store_true')
  p.add_argument('--profile-kernels',action='store_true')
  p.add_argument('--audit-logits',action='store_true')
@@ -81,6 +83,7 @@ def main():
  if a.multi_token_gemv_fp8:cmd+=['--multi-token-gemv-fp8']
  if a.fused_gdn_prepare:cmd+=['--fused-gdn-prepare']
  if a.gdn_wy_fused:cmd+=['--gdn-wy-fused']
+ if a.gdn_tensor_prefill:cmd+=['--gdn-tensor-prefill','--gdn-tensor-chunk',str(a.gdn_tensor_chunk)]
  if a.reuse_verify_graph:cmd+=['--reuse-verify-graph']
  if a.profile_kernels:cmd+=['--profile-kernels']
  if a.audit_logits:cmd+=['--audit-logits']
@@ -138,7 +141,7 @@ def main():
  try:
   deadline=time.monotonic()+a.timeout
   while receive(deadline).get('event')!='ready':pass
-  if a.warmup:run(a.warmup,'warmup-')
+  warmup_results=run(a.warmup,'warmup-')[0] if a.warmup else []
   results,seconds=run(a.requests,'measure-')
   report={'tp_lm_head':a.tp_lm_head,'reference_prefill':a.reference_prefill,'extra_fusions':a.extra_fusions,'cublas_prefill':a.cublas_prefill,'mode':a.mode,'cache_enabled':a.cache,'concurrency':a.concurrency,'prefill_chunk':a.prefill_chunk,'warmup':a.warmup,'input_tokens':req['input_ids']['shape'][0],
           'max_new_tokens':req['max_new_tokens'],**summarize(results,seconds),'results':results,'note':'Resident engine; no trace. Includes per-request Graph capture when enabled. Multirequest batches use eager decode.'}
@@ -147,9 +150,10 @@ def main():
   report.update(mtp_tokens=a.mtp_tokens,weight_cache_mib=a.weight_cache_mib,mtp_draft_graph=a.mtp_draft_graph)
   report['gdn_chunk']=a.gdn_chunk
   report.update(flash_prefill=a.flash_prefill,cache_vision_weights=a.cache_vision_weights)
+  report['warmup_cache_baseline']=warmup_results[-1].get('cache',{}) if warmup_results else {}
   report['synchronized_diagnostic']=a.profile_stages or a.profile_kernels or a.audit_logits
   report.update(gdn_wy=a.gdn_wy,mtp_verify_graph=a.mtp_verify_graph,profile_kernels=a.profile_kernels,audit_logits=a.audit_logits,
-    multi_token_gemv=a.multi_token_gemv,multi_token_gemv_fp8=a.multi_token_gemv_fp8,fused_gdn_prepare=a.fused_gdn_prepare,gdn_wy_fused=a.gdn_wy_fused,reuse_verify_graph=a.reuse_verify_graph)
+    multi_token_gemv=a.multi_token_gemv,multi_token_gemv_fp8=a.multi_token_gemv_fp8,fused_gdn_prepare=a.fused_gdn_prepare,gdn_wy_fused=a.gdn_wy_fused,reuse_verify_graph=a.reuse_verify_graph,gdn_tensor_prefill=a.gdn_tensor_prefill,gdn_tensor_chunk=a.gdn_tensor_chunk)
   report.update(fused_gdn_conv=a.fused_gdn_conv,gdn_cooperative=a.gdn_cooperative,bf16_tp_reduce=a.bf16_tp_reduce,frontend_format=a.frontend_format,frontend_threads=a.frontend_threads,bf16_patches=a.bf16_patches,spool_dir=a.spool_dir)
   report['timing_scope']='CPU image decode/tokenization/preprocessing + disk IPC + native inference + output decoding' if frontend else 'prepared input + native inference'
   report['prompt_token_ids']=prompt_ids

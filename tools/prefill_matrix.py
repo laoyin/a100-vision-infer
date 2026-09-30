@@ -57,6 +57,36 @@ def fused_profiles(frontend,gdn):
     ]
 
 
+def tensor_exercised(report):
+    # This suite measures sequential C1 requests. A cumulative warmup counter
+    # alone must not make an unexercised measured request pass.
+    previous=(report.get('warmup_cache_baseline') or {}).get('gdn_tensor_calls',0)
+    for row in report.get('results',[]):
+        current=(row.get('cache') or {}).get('gdn_tensor_calls',0)
+        if current<=previous:
+            return False
+        previous=current
+    return bool(report.get('results'))
+
+
+def tensor_profiles(frontend,gdn):
+    base=frontend+gdn+['--bf16-tp-reduce']
+    tensor=['--gdn-tensor-prefill']
+    prepare=['--fused-gdn-prepare']
+    graph=['--mtp-verify-graph','--reuse-verify-graph']
+    shared=['--multi-token-gemv-fp8']
+    return [
+        ('reference',base,512,24576),
+        ('tensor-32',base+tensor+['--gdn-tensor-chunk','32'],512,24576),
+        ('tensor-64',base+tensor+['--gdn-tensor-chunk','64'],512,24576),
+        ('tensor-prepare',base+tensor+prepare,512,24576),
+        ('combined-32',base+tensor+prepare+graph+shared+['--gdn-tensor-chunk','32'],512,24576),
+        ('combined-64',base+tensor+prepare+graph+shared,512,24576),
+        ('combined-2048',base+tensor+prepare+graph+shared,2048,24576),
+        ('diagnostic-tensor',base+tensor+prepare+['--profile-stages','--profile-kernels'],512,24576),
+    ]
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     for key in ('previous', 'hf-model', 'vllm-results', 'out'):
@@ -64,7 +94,7 @@ def main():
     p.add_argument('--requests', type=int, default=5)
     p.add_argument('--timeout', type=float, default=1800)
     p.add_argument('--max-pixels', type=int, default=4000000)
-    p.add_argument('--suite', choices=['prefill','deep','graph-wy','native-fused'], default='prefill')
+    p.add_argument('--suite', choices=['prefill','deep','graph-wy','native-fused','gdn-tensor'], default='prefill')
     a = p.parse_args()
     if a.requests < 1 or a.timeout <= 0:
         p.error('Invalid limits')
@@ -87,7 +117,7 @@ def main():
         ('flash-vision-cache32', ['--flash-prefill', '--cache-vision-weights'], 512, 32768),
         ('diagnostic', ['--flash-prefill', '--cache-vision-weights', '--profile-stages'], 512, 24576),
     ]
-    if a.suite in ('deep','graph-wy','native-fused'):
+    if a.suite in ('deep','graph-wy','native-fused','gdn-tensor'):
         common+=['--flash-prefill','--frontend-format','vllm-string']
         frontend=['--frontend-threads','4','--bf16-patches','--spool-dir','/dev/shm']
         gdn=['--gdn-cooperative','--fused-gdn-conv']
@@ -120,6 +150,8 @@ def main():
         ]
     if a.suite=='native-fused':
         profiles=fused_profiles(frontend,gdn)
+    if a.suite=='gdn-tensor':
+        profiles=tensor_profiles(frontend,gdn)
     summary = {'suite':a.suite,'profiles': [], 'comparison': [], 'vllm_reports': str(a.vllm_results.resolve()),
                'note': 'vLLM reports are supplied separately (the deep test script generates them in this run). Measurements are sequential, not interleaved. Diagnostic synchronizes GPU and is excluded from speed comparisons.'}
     reference = None
@@ -146,6 +178,8 @@ def main():
                        stages=[r.get('stages') for r in report['results']],
                        kernel_times=[r.get('kernel_times') for r in report['results']],
                        graph_counters=[r.get('cache') for r in report['results']])
+            if '--gdn-tensor-prefill' in flags and not tensor_exercised(report):
+                row.update(status='tensor_gdn_not_exercised')
             if '--mtp-verify-graph' in flags and not any((r.get('cache') or {}).get('verify_graph_replays',0)>0 for r in report['results']):
                 row.update(status='graph_not_exercised')
             if '--reuse-verify-graph' in flags and not any((r.get('cache') or {}).get('verify_graph_reuses',0)>0 for r in report['results']):
@@ -170,7 +204,7 @@ def main():
                                 'no_matching_cross_engine_comparison':not bool(ratios)}
     (a.out/'summary.json').write_text(json.dumps(summary,indent=2),encoding='utf-8')
     print(json.dumps(summary['acceptance']),flush=True)
-    if any(r['status'] != 'passed' for r in summary['profiles']) or (a.suite in ('deep','graph-wy','native-fused') and not ratios):
+    if any(r['status'] != 'passed' for r in summary['profiles']) or (a.suite in ('deep','graph-wy','native-fused','gdn-tensor') and not ratios):
         raise SystemExit(1)
 
 

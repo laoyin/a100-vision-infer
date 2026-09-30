@@ -80,13 +80,13 @@ __device__ float convolved(const bf* input,const bf* weight,const bf* history,
 // Conv/SiLU/L2/head expansion/gates without materializing [T,C] conv output.
 __global__ void prepare_gdn(const bf* input,const bf* weight,const bf* history,
  const float* log_decay,const float* bias,bf* q,bf* k,bf* v,float* g,float* beta,
- int T,int H,int HK,int K,int V,int stride,int width){
+ int T,int H,int HK,int K,int V,int stride,int width,int QH){
  int t=blockIdx.x,h=blockIdx.y,hk=h/(H/HK),d=threadIdx.x;
  float qv=d<K?convolved(input,weight,history,t,hk*K+d,stride,width):0.f;
  float kv=d<K?convolved(input,weight,history,t,HK*K+hk*K+d,stride,width):0.f;
  float qsum=reduce_block(qv*qv),ksum=reduce_block(kv*kv);
- if(d<K){q[(int64_t(t)*H+h)*K+d]=__float2bfloat16_rn(qv*rsqrtf(qsum+1e-6f));
-         k[(int64_t(t)*H+h)*K+d]=__float2bfloat16_rn(kv*rsqrtf(ksum+1e-6f));}
+ if(d<K&&(QH==H||h%(H/HK)==0)){q[(int64_t(t)*QH+(QH==H?h:hk))*K+d]=__float2bfloat16_rn(qv*rsqrtf(qsum+1e-6f));
+         k[(int64_t(t)*QH+(QH==H?h:hk))*K+d]=__float2bfloat16_rn(kv*rsqrtf(ksum+1e-6f));}
  for(int j=d;j<V;j+=256)v[(int64_t(t)*H+h)*V+j]=__float2bfloat16_rn(
    convolved(input,weight,history,t,2*HK*K+h*V+j,stride,width));
  if(!d){
@@ -160,7 +160,7 @@ at::Tensor small_linear_shared(at::Tensor x,at::Tensor weight,at::Tensor scales)
  C10_CUDA_KERNEL_LAUNCH_CHECK();return output;
 }
 std::vector<at::Tensor> fused_gdn_prepare(at::Tensor projected,at::Tensor weight,at::Tensor history,
- at::Tensor log_decay,at::Tensor bias,int HK,int H,int K,int V){
+ at::Tensor log_decay,at::Tensor bias,int HK,int H,int K,int V,bool grouped_qk){
  int64_t C=2*HK*K+H*V;
  TORCH_CHECK(projected.is_cuda()&&projected.dim()==2&&projected.scalar_type()==at::kBFloat16&&
    projected.is_contiguous()&&H>0&&HK>0&&H%HK==0&&K>0&&K<=256&&V>0&&
@@ -173,12 +173,13 @@ std::vector<at::Tensor> fused_gdn_prepare(at::Tensor projected,at::Tensor weight
  TORCH_CHECK(log_decay.device()==projected.device()&&bias.device()==projected.device()&&log_decay.numel()==H&&bias.numel()==H,
    "Invalid fused GDN gate parameters");
  int T=projected.size(0);
- auto q=at::empty({T,H,K},projected.options()),k=at::empty_like(q),v=at::empty({T,H,V},projected.options());
+ int QH=grouped_qk?HK:H;
+ auto q=at::empty({T,QH,K},projected.options()),k=at::empty_like(q),v=at::empty({T,H,V},projected.options());
  auto g=at::empty({T,H},projected.options().dtype(at::kFloat)),beta=at::empty_like(g);
  auto stream=at::cuda::getCurrentCUDAStream();
  prepare_gdn<<<dim3(T,H),256,0,stream>>>(read_bf(projected),read_bf(weight),read_bf(history),
    log_decay.data_ptr<float>(),bias.data_ptr<float>(),write_bf(q),write_bf(k),write_bf(v),
-   g.data_ptr<float>(),beta.data_ptr<float>(),T,H,HK,K,V,projected.size(1),weight.size(2));
+   g.data_ptr<float>(),beta.data_ptr<float>(),T,H,HK,K,V,projected.size(1),weight.size(2),QH);
  update_history<<<(C*(weight.size(2)-1)+255)/256,256,0,stream>>>(read_bf(projected),write_bf(history),T,C,projected.size(1),weight.size(2));
  C10_CUDA_KERNEL_LAUNCH_CHECK();return {q,k,v,g,beta};
 }

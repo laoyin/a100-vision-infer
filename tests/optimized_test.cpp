@@ -40,6 +40,11 @@ void run_optimized_tests(){
     at::allclose(actual[2].to(at::kFloat),v.to(at::kFloat),.02,.003),"Fused GDN convolution/L2 mismatch");
   TORCH_CHECK(at::allclose(actual[3],gates.first,.0001,.00001)&&at::equal(actual[4],gates.second),"Fused GDN gates mismatch");
   TORCH_CHECK(at::equal(history,input.narrow(-1,T,width-1)),"Fused GDN history update mismatch");
+  auto grouped_history=original.clone();
+  auto grouped=avi::fused_gdn_prepare(projected,weight,grouped_history,log_decay,bias,HK,H,K,V,true);
+  TORCH_CHECK(grouped[0].size(1)==HK&&at::equal(grouped[0].repeat_interleave(H/HK,1),actual[0])&&
+    at::equal(grouped[1].repeat_interleave(H/HK,1),actual[1])&&at::equal(grouped[2],actual[2])&&
+    at::equal(grouped_history,history),"Grouped GDN preparation changed represented inputs/history");
  }
  // Packed GEMV: signed/subnormal FP8, block boundaries, batch and scalar fallback.
  for(int M:{1,2,8})for(int K:{4,128,132,257,5120}){

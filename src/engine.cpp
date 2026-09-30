@@ -70,6 +70,8 @@ Engine::Engine(const std::string& dir,int rank,int world,int device,ncclComm_t c
   TORCH_CHECK(options_.mtp_tokens>=0&&options_.mtp_tokens<=5,"MTP window must be 0..5");
   TORCH_CHECK(!options_.mtp_verify_graph||options_.mtp_tokens>0,"Verification graph requires MTP");
   TORCH_CHECK(!options_.reuse_verify_graph||options_.mtp_verify_graph,"Graph reuse requires --mtp-verify-graph");
+  TORCH_CHECK(options_.gdn_tensor_chunk==32||options_.gdn_tensor_chunk==64,"GDN tensor chunk must be 32 or 64");
+  TORCH_CHECK(!options_.gdn_tensor_prefill||(options_.optimized&&!options_.reference_prefill&&text_.at("linear_key_head_dim")==128&&text_.at("linear_value_head_dim")==128),"Tensor GDN requires optimized K=V=128 prefill");
   if(options_.mtp_tokens){
     TORCH_CHECK(options_.optimized&&manifest.value("native_mtp",false),"MTP requires optimized mode and an artifact imported with --include-mtp");
     TORCH_CHECK(text_.value("mtp_num_hidden_layers",0)==1&&!text_.value("mtp_use_dedicated_embeddings",false),"Only shared-embedding single-layer MTP supported");
@@ -314,6 +316,7 @@ Tensor Engine::delta_attention(Tensor x,int layer,const std::string& p,Tensor pr
   int HK=text_.at("linear_num_key_heads").get<int>()/world_, H=text_.at("linear_num_value_heads").get<int>()/world_;
   int kernel=text_.at("linear_conv_kernel_dim"); auto T=x.size(0); auto& s=states_.at(layer);
   int C=2*HK*K+H*V;
+  bool tensor_prefill=options_.gdn_tensor_prefill&&!verifying_&&!decode_mode_&&T>=32;
   if(options_.optimized && !projected.defined())projected=linear(x,p+".in_proj_all");
   auto mixed=(options_.optimized?projected.narrow(-1,0,C):linear(x,p+".in_proj_qkv")).t().unsqueeze(0);
   if(!s.conv.defined()) {
@@ -324,10 +327,11 @@ Tensor Engine::delta_attention(Tensor x,int layer,const std::string& p,Tensor pr
       !verifying_&&!decode_mode_&&T>=32&&kernel<=32){
     auto preparation=profile_begin("gdn.prepare");
     auto inputs=fused_gdn_prepare(projected.contiguous(),tensor(p+".conv1d.weight"),s.conv,
-      tensor(p+".A_log"),tensor(p+".dt_bias"),HK,H,K,V);
+      tensor(p+".A_log"),tensor(p+".dt_bias"),HK,H,K,V,tensor_prefill);
     profile_end(preparation);
     auto timing=profile_begin("gdn.scan");
-    auto result=(options_.gdn_wy||options_.gdn_wy_fused)?
+    if(tensor_prefill)++gdn_tensor_calls_;
+    auto result=tensor_prefill?delta_scan_tensor(inputs[0],inputs[1],inputs[2],inputs[3],inputs[4],s.recurrent,options_.gdn_tensor_chunk):(options_.gdn_wy||options_.gdn_wy_fused)?
       delta_scan_wy(inputs[0],inputs[1],inputs[2],inputs[3],inputs[4],s.recurrent,32,options_.gdn_wy_fused):
       delta_scan_fast(inputs[0],inputs[1],inputs[2],inputs[3],inputs[4],s.recurrent,{},options_.gdn_cooperative);
     profile_end(timing);
@@ -348,7 +352,7 @@ Tensor Engine::delta_attention(Tensor x,int layer,const std::string& p,Tensor pr
   auto k=conv.narrow(-1,HK*K,HK*K).reshape({T,HK,K});
   auto v=conv.narrow(-1,2*HK*K,H*V).reshape({T,H,V});
   // Match reference normalization and rounding before the FP32 recurrence.
-  if(options_.optimized){q=fused_l2(q).repeat_interleave(H/HK,1).contiguous();k=fused_l2(k).repeat_interleave(H/HK,1).contiguous();}
+  if(options_.optimized){q=fused_l2(q);k=fused_l2(k);if(!tensor_prefill){q=q.repeat_interleave(H/HK,1).contiguous();k=k.repeat_interleave(H/HK,1).contiguous();}}
   else {
   q=(q.to(at::kFloat)*at::rsqrt(q.to(at::kFloat).square().sum(-1,true)+1e-6)).to(at::kBFloat16).repeat_interleave(H/HK,1).contiguous();
   k=(k.to(at::kFloat)*at::rsqrt(k.to(at::kFloat).square().sum(-1,true)+1e-6)).to(at::kBFloat16).repeat_interleave(H/HK,1).contiguous();
@@ -366,7 +370,8 @@ Tensor Engine::delta_attention(Tensor x,int layer,const std::string& p,Tensor pr
   }
   auto scan_timing=profile_begin("gdn.scan");
   Tensor result;
-  if((options_.gdn_wy||options_.gdn_wy_fused)&&!verifying_&&!decode_mode_&&T>=32)result=delta_scan_wy(q,k,v,g,beta,s.recurrent,32,options_.gdn_wy_fused);
+  if(tensor_prefill){++gdn_tensor_calls_;result=delta_scan_tensor(q,k,v,g,beta,s.recurrent,options_.gdn_tensor_chunk);}
+  else if((options_.gdn_wy||options_.gdn_wy_fused)&&!verifying_&&!decode_mode_&&T>=32)result=delta_scan_wy(q,k,v,g,beta,s.recurrent,32,options_.gdn_wy_fused);
   else if(gdn_chunk_enabled_&&!verifying_&&!decode_mode_&&T>=32)result=delta_scan_chunked(q,k,v,g,beta,s.recurrent);
   else result=(options_.optimized&&(K==128||K==16))?delta_scan_fast(q,k,v.contiguous(),g.contiguous(),beta.contiguous(),s.recurrent,trajectory,options_.gdn_cooperative):delta_scan(q,k,v.contiguous(),g.contiguous(),beta.contiguous(),s.recurrent);
   profile_end(scan_timing);
@@ -567,7 +572,7 @@ Tensor Engine::restore_prefix(const std::string& key) {
     if(src.conv.defined()){dst.conv=src.conv.to(at::Device(at::kCUDA,device_),src.conv.scalar_type(),false,true);dst.recurrent=src.recurrent.to(at::Device(at::kCUDA,device_),src.recurrent.scalar_type(),false,true);}}
   return entry.logits.to(at::Device(at::kCUDA,device_),entry.logits.scalar_type(),false,true);
 }
-json Engine::cache_stats() const {return {{"verify_graph_pool_tensor_bytes",verify_graph_pool_bytes_},{"verify_graph_reuses",verify_graph_reuses_},{"verify_graph_pool_entries",verify_graph_pool_.size()},{"verify_graph_builds",verify_graph_builds_},{"verify_graph_replays",verify_graph_replays_},{"image_bytes",image_bytes_},{"prefix_bytes",prefix_bytes_},{"image_hits",image_hits_},{"prefix_hits",prefix_hits_},{"host_prefix_bytes",host_prefix_bytes_},{"host_prefix_hits",host_prefix_hits_}};}
+json Engine::cache_stats() const {return {{"gdn_tensor_calls",gdn_tensor_calls_},{"verify_graph_pool_tensor_bytes",verify_graph_pool_bytes_},{"verify_graph_reuses",verify_graph_reuses_},{"verify_graph_pool_entries",verify_graph_pool_.size()},{"verify_graph_builds",verify_graph_builds_},{"verify_graph_replays",verify_graph_replays_},{"image_bytes",image_bytes_},{"prefix_bytes",prefix_bytes_},{"image_hits",image_hits_},{"prefix_hits",prefix_hits_},{"host_prefix_bytes",host_prefix_bytes_},{"host_prefix_hits",host_prefix_hits_}};}
 std::string request_hash(const std::string& dir,const json& request) {
   std::unique_ptr<EVP_MD_CTX,decltype(&EVP_MD_CTX_free)> context(EVP_MD_CTX_new(),EVP_MD_CTX_free);
   TORCH_CHECK(context&&EVP_DigestInit_ex(context.get(),EVP_sha256(),nullptr)==1,"SHA256 initialization failed");

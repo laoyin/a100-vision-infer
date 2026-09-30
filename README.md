@@ -49,6 +49,8 @@ Prefill 优化视觉与长文本的大矩阵计算，目标是降低首 token �
 - recurrent state 使用 FP32，卷积历史原地更新。
 - 每个请求独立保存 KV、卷积与 recurrent state；KV 容量按实际 token 预算分配。
 
+新增可选的 [A100 GDN Tensor Core 预填充](docs/gdn-tensor-prefill.md)：分组 Q/K 块内乘积复用、专用三角求解和 FP32 状态的 Tensor Core 传播，提供 chunk32/64 消融及独立 FP64 oracle。代码已实现，CUDA 数值与性能待服务器验证。
+
 ### Tensor Parallel 与 Decode
 
 - Attention/GDN 按 head 分片，MLP 使用 column/row parallel。

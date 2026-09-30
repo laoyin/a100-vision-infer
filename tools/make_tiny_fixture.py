@@ -6,7 +6,8 @@ import numpy as np
 from format_utils import image_geometry, rope_positions
 
 def main():
-    p=argparse.ArgumentParser(description=__doc__); p.add_argument('--out',type=Path,required=True); p.add_argument('--block-fp8',action='store_true'); p.add_argument('--mtp',action='store_true'); a=p.parse_args()
+    p=argparse.ArgumentParser(description=__doc__); p.add_argument('--out',type=Path,required=True); p.add_argument('--block-fp8',action='store_true'); p.add_argument('--mtp',action='store_true'); p.add_argument('--text-tokens',type=int,default=2); a=p.parse_args()
+    if not 2<=a.text_tokens<=4096:p.error('--text-tokens must be 2..4096')
     if a.mtp and not a.block_fp8:p.error('--mtp requires --block-fp8')
     import torch
     from transformers import Qwen3_5Config,Qwen3_5ForConditionalGeneration
@@ -64,11 +65,12 @@ def main():
     def write(name,x,dtype):
         (request_dir/(name+'.bin')).write_bytes(x.tobytes())
         return {'file':name+'.bin','shape':list(x.shape),'dtype':dtype}
-    ids=np.array([1,251,250,250,250,250,252,3,4],dtype='<i8')
+    ids=np.concatenate((np.array([1,251,250,250,250,250,252],dtype='<i8'),
+                        np.resize(np.array([3,4],dtype='<i8'),a.text_tokens)))
     pos,nxt=rope_positions(ids,[[1,4,4]],250,2)
     coords,indices,factors=image_geometry(4,4,2,4)
     patches=np.random.default_rng(42).normal(size=(16,1536)).astype('<f4')
-    req={'format':'avi-request-v1','max_context':32,'max_new_tokens':3,'next_position':nxt,
+    req={'format':'avi-request-v1','max_context':max(32,len(ids)+20),'max_new_tokens':3,'next_position':nxt,
          'eos_token_ids':[2],'image_token_id':250,'input_ids':write('ids',ids,'I64'),'positions':write('positions',pos,'I64'),
          'images':[{'grid':[1,4,4],'patches':write('patches',patches,'F32'),
                     'coords':write('coords',coords,'I64'),'position_indices':write('indices',indices,'I64'),

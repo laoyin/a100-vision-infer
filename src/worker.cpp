@@ -86,6 +86,7 @@ int main(int argc,char** argv){
       if(key=="--multi-token-gemv-fp8"){options.multi_token_gemv=true;options.shared_gemv_fp8=true;continue;}
       if(key=="--fused-gdn-prepare"){options.fused_gdn_prepare=true;continue;}
       if(key=="--gdn-wy-fused"){options.gdn_wy_fused=true;continue;}
+      if(key=="--gdn-tensor-prefill"){options.gdn_tensor_prefill=true;continue;}
       if(key=="--reuse-verify-graph"){options.reuse_verify_graph=true;continue;}
       if(key=="--mtp-verify-graph"){options.mtp_verify_graph=true;continue;}
       if(key=="--fused-gdn-conv"){options.fused_gdn_conv=true;continue;}
@@ -93,7 +94,8 @@ int main(int argc,char** argv){
       if(key=="--cache-vision-weights"){options.cache_vision_weights=true;continue;}
    TORCH_CHECK(i+1<argc,"Missing value for ",key);std::string value=argv[++i];
    if(key=="--model")model=value;else if(key=="--max-context")capacity=std::stoi(value);else if(key=="--max-concurrency")concurrency=std::stoi(value);else if(key=="--prefill-chunk")chunk=std::stoi(value);
-   else if(key=="--mtp-tokens")options.mtp_tokens=std::stoi(value);
+   else if(key=="--gdn-tensor-chunk")options.gdn_tensor_chunk=std::stoi(value);
+      else if(key=="--mtp-tokens")options.mtp_tokens=std::stoi(value);
    else if(key=="--weight-cache-mib")options.weight_cache_bytes=std::stoull(value)<<20;
    else if(key=="--prefix-cache-bytes")options.prefix_cache_bytes=std::stoull(value);else if(key=="--workspace-mib")workspace_bytes=std::stoull(value)<<20;else if(key=="--host-prefix-cache-mib")options.host_prefix_cache_bytes=std::stoull(value)<<20;
    else if(key=="--image-cache-mib")options.image_cache_bytes=std::stoull(value)<<20;else if(key=="--prefix-cache-mib")options.prefix_cache_bytes=std::stoull(value)<<20;else { TORCH_CHECK(false,"Unknown option ",key); }
