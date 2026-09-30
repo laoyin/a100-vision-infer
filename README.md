@@ -4,7 +4,7 @@
 
 面向 **2 × NVIDIA A100-SXM4-80GB、TP=2** 与业务指定的 **Qwen3.8-27B LoRA 合并后 FP8 识图模型**的独立推理引擎。目标是在该固定硬件、模型和真实业务工作负载上超过 vLLM MTP。模型结构以 checkpoint 中的实际 `qwen3_5` config 为准。
 
-项目参考 [ninfer](https://github.com/Neroued/ninfer) 的固定模型、离线权重布局、算子融合与显式状态管理思路。TP1/TP4 和小模型路径用于回归与诊断，不属于当前产品优化目标。完整边界与验收见 [固定目标](docs/target-contract.md)。
+项目参考 [ninfer](https://github.com/Neroued/ninfer) 的固定模型、离线权重布局、算子融合与显式状态管理思路。TP1/TP4 和小模型路径用于回归与诊断，不属于当前产品优化目标。完整边界与验收见 [固定目标](docs/target-contract.md)，后续优化依据与实施顺序见 [开源项目与论文研究](docs/research-a100-fixed-model.md)。
 
 当前主要验证配置为 2 × A100-SXM4-80GB、TP=2、E4M3FN block-FP8（128 × 128）。权重保持 FP8，激活及 Tensor Core 计算使用 BF16，Gated DeltaNet recurrent state 使用 FP32。
 
