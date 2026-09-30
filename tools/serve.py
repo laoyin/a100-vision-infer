@@ -75,7 +75,7 @@ def create_app(args):
                  '--image-cache-mib',str(args.image_cache_mib),'--prefix-cache-mib',str(args.prefix_cache_mib)]
         if args.cuda_graph:command.append('--cuda-graph')
         if args.baseline:command.append('--baseline')
-        for name in ('extra_fusions','cublas_prefill','tp_lm_head','vector_gemv','mtp_draft_graph','gdn_chunk'):
+        for name in ('extra_fusions','cublas_prefill','tp_lm_head','vector_gemv','mtp_draft_graph','gdn_chunk','flash_prefill','cache_vision_weights'):
             if getattr(args,name,False):command.append('--'+name.replace('_','-'))
         command+=['--mtp-tokens',str(getattr(args,'mtp_tokens',0)),'--weight-cache-mib',str(getattr(args,'weight_cache_mib',0))]
         process=subprocess.Popen(command,stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True,bufsize=1,start_new_session=True)
@@ -227,7 +227,7 @@ def main():
     p.add_argument('--api-key',default=os.environ.get('AVI_API_KEY'));p.add_argument('--cuda-graph',action='store_true');p.add_argument('--baseline',action='store_true')
     p.add_argument('--mtp-tokens',type=int,choices=range(6),default=0)
     p.add_argument('--weight-cache-mib',type=int,default=0)
-    for name in ('extra-fusions','cublas-prefill','tp-lm-head','vector-gemv','mtp-draft-graph','gdn-chunk'):
+    for name in ('extra-fusions','cublas-prefill','tp-lm-head','vector-gemv','mtp-draft-graph','gdn-chunk','flash-prefill','cache-vision-weights'):
         p.add_argument('--'+name,action='store_true')
     args=p.parse_args();uvicorn.run(create_app(args),host=args.host,port=args.port)
 

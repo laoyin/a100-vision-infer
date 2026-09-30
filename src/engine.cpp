@@ -91,8 +91,13 @@ Engine::Engine(const std::string& dir,int rank,int world,int device,ncclComm_t c
   // FP8 source codes remain authoritative; no requantization or activation FP8.
   std::vector<std::string> cache_names;
   for(const auto& entry:weights_)if(entry.second.scale.defined()&&
-      (entry.first.rfind("model.language_model.layers.",0)==0||entry.first.rfind("mtp.",0)==0))cache_names.push_back(entry.first);
+      (entry.first.rfind("model.language_model.layers.",0)==0||entry.first.rfind("mtp.",0)==0||(options_.cache_vision_weights&&entry.first.rfind("model.visual.",0)==0&&entry.second.data.dim()==2)))cache_names.push_back(entry.first);
   std::sort(cache_names.begin(),cache_names.end());
+  // Prioritize draft/vision within the same explicit per-rank memory budget.
+  if(options_.cache_vision_weights)std::stable_sort(cache_names.begin(),cache_names.end(),[](const auto& a,const auto& b){
+    auto priority=[](const std::string& n){return n.rfind("mtp.",0)==0?0:n.rfind("model.visual.",0)==0?1:2;};
+    return priority(a)<priority(b);
+  });
   for(const auto& name:cache_names){
     const auto& w=weights_.at(name);size_t bytes=w.data.numel()*2;
     if(bytes<=options_.weight_cache_bytes-decoded_bytes_){
@@ -243,6 +248,11 @@ Tensor Engine::full_attention(Tensor x,Tensor positions,int layer,const std::str
     return finish?linear(out,p+".o_proj",true):out;
   }
   int old=state.length; state.key.narrow(0,old,T).copy_(k); state.value.narrow(0,old,T).copy_(v); state.length+=T;
+  if(options_.optimized&&options_.flash_prefill){
+    auto out=avi::flash_prefill(q,state.key.narrow(0,0,state.length),state.value.narrow(0,0,state.length)).reshape({T,H*D});
+    out=options_.extra_fusions?fused_sigmoid_gate(out,gate):out*gate.sigmoid();
+    return finish?linear(out,p+".o_proj",true):out;
+  }
   auto keys=state.key.narrow(0,0,state.length).repeat_interleave(H/HK,1).transpose(0,1).unsqueeze(0);
   auto values=state.value.narrow(0,0,state.length).repeat_interleave(H/HK,1).transpose(0,1).unsqueeze(0);
   auto qp=q.transpose(0,1).unsqueeze(0);

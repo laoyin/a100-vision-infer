@@ -31,6 +31,8 @@ int main(int argc,char** argv) {
       if(key=="--baseline"){options.optimized=false;continue;}
       if(key=="--mtp-draft-graph"){draft_graph=true;continue;}
       if(key=="--gdn-chunk"){gdn_chunk=true;continue;}
+      if(key=="--flash-prefill"){options.flash_prefill=true;continue;}
+      if(key=="--cache-vision-weights"){options.cache_vision_weights=true;continue;}
       if(key=="--cuda-graph"){options.cuda_graph=true;continue;}
       if(key=="--extra-fusions"){options.extra_fusions=true;continue;}
       if(key=="--cublas-prefill"){options.cublas_prefill=true;continue;}

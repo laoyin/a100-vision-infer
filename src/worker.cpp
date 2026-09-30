@@ -26,6 +26,7 @@ static json broadcast(json j,int rank){std::string s=rank?std::string():j.dump()
 static std::vector<std::string> vocabulary;
 static std::unordered_map<std::string,std::vector<int64_t>> grammar_masks;
 struct Job {
+ double vision_seconds=0,prefill_seconds=0;
  avi::JsonGrammar grammar;
  std::string id,path,key;json req,options;int slot=0,offset=0,consumed=0;int64_t next=0;
  uint64_t reservation=0;int token_capacity=0;
@@ -66,7 +67,7 @@ int main(int argc,char** argv){
  MPI_Init(&argc,&argv);int rank,world,local;MPI_Comm_rank(MPI_COMM_WORLD,&rank);MPI_Comm_size(MPI_COMM_WORLD,&world);
  MPI_Comm host;MPI_Comm_split_type(MPI_COMM_WORLD,MPI_COMM_TYPE_SHARED,rank,MPI_INFO_NULL,&host);MPI_Comm_rank(host,&local);ncclComm_t comm=nullptr;
  try {
-  std::string model;int capacity=20480,concurrency=2,chunk=128,queue_limit=64;bool draft_graph=false,gdn_chunk=false;avi::EngineOptions options;uint64_t workspace_bytes=8ULL<<30;
+  std::string model;int capacity=20480,concurrency=2,chunk=128,queue_limit=64;bool draft_graph=false,gdn_chunk=false,profile_stages=false;avi::EngineOptions options;uint64_t workspace_bytes=8ULL<<30;
   for(int i=1;i<argc;i++){std::string key=argv[i];if(key=="--baseline"){options.optimized=false;continue;}if(key=="--cuda-graph"){options.cuda_graph=true;continue;}
       if(key=="--extra-fusions"){options.extra_fusions=true;continue;}
       if(key=="--cublas-prefill"){options.cublas_prefill=true;continue;}
@@ -75,6 +76,9 @@ int main(int argc,char** argv){
       if(key=="--vector-gemv"){options.vector_gemv=true;continue;}
       if(key=="--mtp-draft-graph"){draft_graph=true;continue;}
       if(key=="--gdn-chunk"){gdn_chunk=true;continue;}
+      if(key=="--profile-stages"){profile_stages=true;continue;}
+      if(key=="--flash-prefill"){options.flash_prefill=true;continue;}
+      if(key=="--cache-vision-weights"){options.cache_vision_weights=true;continue;}
    TORCH_CHECK(i+1<argc,"Missing value for ",key);std::string value=argv[++i];
    if(key=="--model")model=value;else if(key=="--max-context")capacity=std::stoi(value);else if(key=="--max-concurrency")concurrency=std::stoi(value);else if(key=="--prefill-chunk")chunk=std::stoi(value);
    else if(key=="--mtp-tokens")options.mtp_tokens=std::stoi(value);
@@ -172,10 +176,17 @@ int main(int argc,char** argv){
      TORCH_CHECK(j.req.at("image_token_id")==engine.config().at("image_token_id"),"Image token mismatch");
      if(options.prefix_cache_bytes||options.host_prefix_cache_bytes){j.key=avi::request_hash(j.path,j.req);j.logits=engine.restore_prefix(j.key);}j.initialized=true;
      if(j.logits.defined()){j.ready=true;j.consumed=n;j.offset=n;emit(rank,{{"event","prefix_hit"},{"id",j.id}});}
-     else {auto vision=engine.vision(j.path,j.req);j.embedding=engine.embed(j.ids);auto indices=at::nonzero(j.ids==j.req.at("image_token_id").get<int64_t>()).reshape({-1});
+      else {
+       if(profile_stages)C10_CUDA_CHECK(cudaDeviceSynchronize());auto vision_start=Clock::now();
+       auto vision=engine.vision(j.path,j.req);
+       if(profile_stages){C10_CUDA_CHECK(cudaDeviceSynchronize());j.vision_seconds+=age(vision_start);}
+       j.embedding=engine.embed(j.ids);auto indices=at::nonzero(j.ids==j.req.at("image_token_id").get<int64_t>()).reshape({-1});
       if(vision.defined()){TORCH_CHECK(vision.size(0)==indices.numel(),"Visual token mismatch");j.embedding.index_copy_(0,indices,vision);}else { TORCH_CHECK(indices.numel()==0,"Missing image features"); }}
     }
-    if(!j.ready){int n=std::min<int64_t>(chunk,j.ids.numel()-j.offset);auto hidden=engine.step(j.embedding.narrow(0,j.offset,n),j.positions.narrow(1,j.offset,n));j.offset+=n;
+    if(!j.ready){
+     if(profile_stages)C10_CUDA_CHECK(cudaDeviceSynchronize());auto prefill_start=Clock::now();
+     int n=std::min<int64_t>(chunk,j.ids.numel()-j.offset);auto hidden=engine.step(j.embedding.narrow(0,j.offset,n),j.positions.narrow(1,j.offset,n));j.offset+=n;
+     if(profile_stages){C10_CUDA_CHECK(cudaDeviceSynchronize());j.prefill_seconds+=age(prefill_start);}
      if(j.offset==j.ids.numel()){j.logits=engine.logits(hidden.narrow(0,n-1,1));j.ready=true;j.consumed=j.offset;engine.save_prefix(j.key,j.logits);j.embedding=at::Tensor();}}
    }
    std::vector<int> slots,consumed;std::vector<int64_t> tokens,positions;
@@ -213,7 +224,8 @@ int main(int argc,char** argv){
     auto eos=j.req.at("eos_token_ids").get<std::vector<int64_t>>();if(std::find(eos.begin(),eos.end(),token)!=eos.end())j.finish="eos";else if(j.generated.size()>=j.req.at("max_new_tokens").get<size_t>())j.finish="length";
    }
    for(auto it=active.begin();it!=active.end();){auto& j=it->second;if(j.finish.empty()){++it;continue;}
-    emit(rank,{{"event","mtp_stats"},{"id",j.id},{"window",options.mtp_tokens},{"rounds",j.mtp_rounds},{"proposed",j.mtp_proposed},{"accepted",j.mtp_accepted}});
+     if(profile_stages)emit(rank,{{"event","stage_stats"},{"id",j.id},{"vision_seconds",j.vision_seconds},{"text_prefill_seconds",j.prefill_seconds},{"synchronized_diagnostic",true}});
+     emit(rank,{{"event","mtp_stats"},{"id",j.id},{"window",options.mtp_tokens},{"rounds",j.mtp_rounds},{"proposed",j.mtp_proposed},{"accepted",j.mtp_accepted}});
     emit(rank,{{"event","done"},{"id",j.id},{"finish_reason",j.finish},{"generated_ids",j.generated},{"input_tokens",j.initialized?j.ids.numel():0},{"ttft_seconds",j.first_token},{"total_seconds",age(j.submitted)},{"cache",engine.cache_stats()},{"json_complete",j.options.value("json_object",false)&&j.grammar.complete()}});
     engine.drop(it->first);memory.release(it->first);ids.erase(j.id);it=active.erase(it);
    }

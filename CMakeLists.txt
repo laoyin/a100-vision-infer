@@ -15,7 +15,7 @@ endif()
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
 # TORCH_CXX_FLAGS carries the libstdc++ ABI setting and must also reach nvcc.
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} ${TORCH_CXX_FLAGS}")
-add_library(avi_core src/engine.cpp src/speculative.cpp src/gdn_chunk.cpp src/kernels.cu src/optimized.cu)
+add_library(avi_core src/engine.cpp src/speculative.cpp src/gdn_chunk.cpp src/flash_prefill.cpp src/kernels.cu src/optimized.cu)
 target_include_directories(avi_core PUBLIC include third_party ${TORCH_INCLUDE_DIRS} ${NCCL_INCLUDE_DIR})
 target_link_libraries(avi_core PUBLIC ${TORCH_LIBRARIES} CUDA::cudart OpenSSL::Crypto ${NCCL_LIBRARY} MPI::MPI_CXX)
 add_executable(avi-infer src/main.cpp)

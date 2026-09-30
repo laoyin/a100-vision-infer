@@ -137,5 +137,18 @@ void run_optimized_tests(){
   }
   TORCH_CHECK(at::equal(keys.narrow(0,0,old+T),refk.narrow(0,0,old+T)),"Chunk KV append mismatch");
  }
- std::cout<<"Optimized kernels, speculative GDN rollback and multi-query GQA passed\n";
+ // Exercise bottom-right causal alignment, including unequal lengths and GQA.
+ for(int D:{16,128,256})for(int T:{1,9,33})for(int old:{0,17,257}){
+  const int H=6,HK=2,L=old+T;
+  auto q=at::randn({T,H,D},opt).to(at::kBFloat16);
+  auto k=at::randn({L,HK,D},opt).to(at::kBFloat16),v=at::randn_like(k);
+  auto actual=avi::flash_prefill(q,k,v);
+  auto mask=at::arange(L,opt.dtype(at::kLong)).unsqueeze(0)<=at::arange(old,L,opt.dtype(at::kLong)).unsqueeze(1);
+  auto expected=at::scaled_dot_product_attention(q.transpose(0,1).unsqueeze(0),
+      k.repeat_interleave(H/HK,1).transpose(0,1).unsqueeze(0),
+      v.repeat_interleave(H/HK,1).transpose(0,1).unsqueeze(0),mask,0.0,false).squeeze(0).transpose(0,1);
+  TORCH_CHECK(at::allclose(actual.to(at::kFloat),expected.to(at::kFloat),.03,.01),
+              "Flash prefill causal/GQA mismatch: D=",D," T=",T," prefix=",old);
+ }
+ std::cout<<"Optimized kernels, speculative GDN rollback, Flash prefill and multi-query GQA passed\n";
 }
