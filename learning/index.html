@@ -39,6 +39,7 @@
   <a href="08-optimized-cu.html">⑧ 算子</a>
   <a href="09-hybrid-attention.html">⑨ 混合注意力</a>
   <a href="10-speculative.html">⑩ 投机解码</a>
+  <a href="11-deep-optimization.html">⑪ 深度优化内核</a>
 </div></nav>
 
 <div class="wrap">
@@ -46,7 +47,7 @@
     <h1>看懂一个 LLM 推理引擎，从这里开始</h1>
     <p class="sub">
       这套页面把 <code>a100-vision-infer</code> 这个 C++/CUDA 推理引擎里最难懂的概念，
-      拆成 <b>10 个可交互的可视化</b>。目标只有一个：让你先在脑子里建立
+      拆成 <b>11 个可交互的可视化</b>。目标只有一个：让你先在脑子里建立
       <b>“一次推理时，数据到底怎么从 A 流到 B”</b> 的整体直觉，再回到真实代码去看细节。
     </p>
   </div>
@@ -69,7 +70,7 @@
 
   <h2>端到端串讲：一次请求 → 一串 token</h2>
   <p class="muted" style="margin-top:0">
-    把前面 10 个主题串成一条线。假设你发来一句话（或一张图 + 一句话），
+    把前面 11 个主题串成一条线。假设你发来一句话（或一张图 + 一句话），
     引擎内部会经过下面这些站，每一站都能点回对应主题：
   </p>
   <div class="grid g2">
@@ -116,10 +117,10 @@
   </div>
   <div class="note" style="margin-top:14px">
     <b>一句话总结：</b>Prefill 一次算很多 token（④，算力密集），Decode 每次只算一个（⑧，访存密集）。
-    这两种负载特性，正是后面 <a href="06-tensor-parallel.html">张量并行</a> 与 <a href="07-quantization.html">FP8 量化</a> 针对优化的对象；而 Decode 的访存瓶颈，还能靠 <a href="10-speculative.html">投机解码</a> 进一步摊薄。
+    这两种负载特性，正是后面 <a href="06-tensor-parallel.html">张量并行</a> 与 <a href="07-quantization.html">FP8 量化</a> 针对优化的对象；而 Decode 的访存瓶颈，还能靠 <a href="10-speculative.html">投机解码</a> 进一步摊薄；再往内核级压榨串行链、kernel 数与通信字节，见 <a href="11-deep-optimization.html">深度优化内核</a>。
   </div>
 
-  <h2>10 个主题（建议按顺序学）</h2>
+  <h2>11 个主题（建议按顺序学）</h2>
   <div class="cards">
     <a class="topic" href="01-transformer-flow.html">
       <div class="no">TOPIC 01</div>
@@ -180,6 +181,12 @@
       <h3>投机解码（MTP）</h3>
       <p>用小草稿模型批量猜、目标模型一趟判。演示贪心验证、commit 与 KV/递归状态回滚。</p>
       <div class="files">src/speculative.cpp · src/speculative.h</div>
+    </a>
+    <a class="topic" href="11-deep-optimization.html">
+      <div class="no">TOPIC 11</div>
+      <h3>深度优化内核</h3>
+      <p>GDN 协作递推（4 lane 共担一列 value、寄存器与串行链降到 1/4）、卷积+SiLU 单 kernel 融合、TP2 BF16 AllReduce 通信减半。</p>
+      <div class="files">src/optimized.cu · src/engine.cpp</div>
     </a>
   </div>
 

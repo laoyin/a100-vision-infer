@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>⑪ 深度优化内核 · AVI 学习地图</title>
+<link rel="stylesheet" href="assets/style.css">
+<style>
+  .lane{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:10px 0}
+  .lane .lc{background:#0d1426;border:1px solid var(--border);border-radius:10px;padding:9px 10px;text-align:center}
+  .lane .lc .id{font-family:var(--mono);font-size:11px;color:var(--accent)}
+  .lane .lc .rg{font-family:var(--mono);font-size:20px;color:#cfe9ff;margin:3px 0}
+  .lane .lc .cap{font-size:11px;color:var(--muted)}
+  .shuf{display:flex;align-items:center;gap:8px;justify-content:center;margin:6px 0;font-family:var(--mono);font-size:12px;color:var(--accent2)}
+  .bar{height:20px;border-radius:6px;background:#0a0f1e;border:1px solid var(--border);overflow:hidden;margin:4px 0}
+  .bar i{display:block;height:100%;transition:width .25s}
+  .bar i.old{background:linear-gradient(90deg,#b388ff,#6a52a0)}
+  .bar i.new{background:linear-gradient(90deg,#4ade80,#2c6b52)}
+  .kv{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:8px 0}
+  @media(max-width:820px){.kv{grid-template-columns:1fr}}
+  .kv .b{background:#0d1426;border:1px solid var(--border);border-radius:10px;padding:8px 10px}
+  .kv .b .k{font-size:11px;color:var(--muted)}
+  .kv .b .v{font-family:var(--mono);font-size:20px;color:#cfe9ff}
+  .kern{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}
+  .kern .kx{flex:1 1 120px;background:#0d1426;border:1px solid var(--border);border-radius:10px;padding:9px 10px;transition:.15s}
+  .kern .kx.on{border-color:var(--accent);background:#12233f;box-shadow:0 0 0 1px var(--accent) inset}
+  .kern .kx.off{opacity:.35}
+  .kern .kx .no{font-family:var(--mono);font-size:10px;color:var(--accent)}
+  .kern .kx .nm{font-size:12.5px;color:#cfe9ff;margin-top:3px}
+  .warnbox{display:none;background:#2a1414;border:1px solid #7a3030;border-radius:10px;padding:9px 12px;color:#ff9b9b;font-size:13px;margin:8px 0}
+  .sw{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin:10px 0}
+  @media(max-width:820px){.sw{grid-template-columns:1fr}}
+  .sw .s{background:#0d1426;border:1px solid var(--border);border-radius:10px;padding:10px 12px}
+  .sw .s .flag{font-family:var(--mono);font-size:12px;color:var(--accent)}
+  .sw .s .d{font-size:12.5px;color:var(--muted);margin-top:4px}
+  .log{font-family:var(--mono);font-size:12px;background:#0a0f1e;border:1px solid var(--border);border-radius:8px;padding:8px 10px;color:#9fd8ff;margin:8px 0;line-height:1.7;overflow-x:auto;white-space:pre}
+</style>
+</head>
+<body>
+<nav class="top"><div class="inner">
+  <span class="brand">AVI 学习地图</span>
+  <a href="index.html">总览</a>
+  <a href="01-transformer-flow.html">① 数据流</a>
+  <a href="02-attention.html">② 注意力</a>
+  <a href="03-kv-cache.html">③ KV Cache</a>
+  <a href="04-rope.html">④ RoPE</a>
+  <a href="05-inference.html">⑤ 推理与采样</a>
+  <a href="06-tensor-parallel.html">⑥ 张量并行</a>
+  <a href="07-quantization.html">⑦ 量化</a>
+  <a href="08-optimized-cu.html">⑧ 算子</a>
+  <a href="09-hybrid-attention.html">⑨ 混合注意力</a>
+  <a href="10-speculative.html">⑩ 投机解码</a>
+  <a class="active" href="11-deep-optimization.html">⑪ 深度优化内核</a>
+</div></nav>
+
+<div class="wrap">
+  <h1>⑪ 深度优化内核：GDN 协作递推 · 卷积+SiLU 融合 · TP2 BF16 归约</h1>
+  <p class="lead">第 ⑨ 课讲过 Gated DeltaNet 的递归状态要在<b>寄存器</b>里沿时间步串行扫描；第 ⑥ 课讲过 TP 只在 row-parallel 输出做一次 AllReduce。本轮（commit <span class="kbd">6f2c2d0</span>）针对这两处的<b>串行链长度、算子调用次数、通信字节数</b>各做了一刀，并顺带对齐了前端格式与图像传输。本页把三刀拆成可交互的模型。</p>
+
+  <h2>① GDN 协作递推内核 <span class="pill acc">--gdn-cooperative</span></h2>
+  <p>原来的 <span class="kbd">register_scan</span> 是<b>一个线程负责一整列 value</b>：它要把 K 个 FP32 状态全部抱在寄存器里，每个时间步做长度为 K 的串行点积。K=128 时就是 128 个 float 寄存器 + 128 次串行乘加，寄存器压力和串行链都很长。</p>
+  <p><b>协作版</b> <span class="kbd">cooperative_scan</span> 让<b>同一 warp 里相邻 4 个 lane 共担一列 value</b>：每 lane 只持 K/4 个状态，局部点积后用 <span class="kbd">__shfl_xor_sync</span>（宽度 4）做子组归约拼出完整结果。串行链与寄存器都降到 1/4。</p>
+  <div class="card tight">
+    <div class="ctrl">
+      <label>key 维度 K</label>
+      <select id="kSel"><option value="16">16</option><option value="128" selected>128</option></select>
+    </div>
+    <div class="lane">
+      <div class="lc"><div class="id">lane 0</div><div class="rg" id="r0">32</div><div class="cap">s[0..K/4)</div></div>
+      <div class="lc"><div class="id">lane 1</div><div class="rg" id="r1">32</div><div class="cap">s[K/4..)</div></div>
+      <div class="lc"><div class="id">lane 2</div><div class="rg" id="r2">32</div><div class="cap">s[2K/4..)</div></div>
+      <div class="lc"><div class="id">lane 3</div><div class="rg" id="r3">32</div><div class="cap">s[3K/4..)</div></div>
+    </div>
+    <div class="shuf">memory / result 局部点积 → <span class="kbd">shfl_xor 1</span> → <span class="kbd">shfl_xor 2</span> → 完整值（4 lane 全参与，含被掩码的尾部 tile）</div>
+    <div class="kv">
+      <div class="b"><div class="k">旧：每线程状态寄存器</div><div class="v" id="regOld">128</div></div>
+      <div class="b"><div class="k">新：每线程状态寄存器</div><div class="v" id="regNew">32</div></div>
+      <div class="b"><div class="k">串行点积长度</div><div class="v"><span id="chainOld">128</span> → <span id="chainNew">32</span></div></div>
+    </div>
+    <div class="bar"><i class="old" id="barOld" style="width:100%"></i></div>
+    <div class="bar"><i class="new" id="barNew" style="width:25%"></i></div>
+    <div class="muted" style="font-size:12px">上：旧 register_scan 寄存器占用；下：新 cooperative_scan（=1/4）。FP32 递归状态仍留在寄存器，不落地显存。</div>
+    <div class="filetip">src/optimized.cu · cooperative_scan()</div>
+    <div class="log">int h=blockIdx.x, lane=threadIdx.x%4, j=blockIdx.y*32+threadIdx.x/4;
+float s[K/4];                                  // 每 lane 只抱 K/4 个状态
+for(int t=0;t&lt;T;t++){
+  for(int i=0;i&lt;K/4;i++){ s[i]*=decay; memory+=s[i]*k[base+4*i+lane]; }  // 局部点积
+  memory+=__shfl_xor_sync(0xffffffff,memory,1,4);          // 4-lane 子组归约
+  memory+=__shfl_xor_sync(0xffffffff,memory,2,4);
+  ...
+  result+=__shfl_xor_sync(0xffffffff,result,1,4);
+  result+=__shfl_xor_sync(0xffffffff,result,2,4);
+  if(lane==0&amp;&amp;j&lt;V) out[..]=__float2bfloat16_rn(result*rsqrtf(K));
+}</div>
+    <p class="muted" style="font-size:12.5px">注意：浮点求和顺序变了，所以<b>默认不开</b>；支持 K=16/128、value 列尾部 tile、以及 MTP 的逐 token 状态轨迹。</p>
+  </div>
+
+  <h2>② GDN 卷积 + SiLU 融合 <span class="pill acc">--fused-gdn-conv</span></h2>
+  <p>GDN 的输入投影后要先做 depthwise conv1d 再过 SiLU。未融合时是<b>两个 kernel</b>（conv1d 写中间张量 → silu 再读再写）外加 squeeze/transpose 的开销；融合版 <span class="kbd">conv_prefill</span> 把两者塞进<b>一个 kernel</b>，并保留中间 BF16 舍入边界，数值不漂移。</p>
+  <div class="card tight">
+    <div class="ctrl"><label><input type="checkbox" id="fuseTgl"> 启用 --fused-gdn-conv</label></div>
+    <div class="kern" id="kernRow">
+      <div class="kx on" id="kConv"><div class="no">kernel 1</div><div class="nm">depthwise conv1d</div></div>
+      <div class="kx on" id="kSilu"><div class="no">kernel 2</div><div class="nm">SiLU</div></div>
+      <div class="kx on" id="kFuse"><div class="no">kernel 1</div><div class="nm">conv + SiLU 融合</div></div>
+    </div>
+    <div class="kv">
+      <div class="b"><div class="k">kernel launch 次数</div><div class="v" id="launchN">2</div></div>
+      <div class="b"><div class="k">中间张量读写</div><div class="v" id="midN">1 次</div></div>
+      <div class="b"><div class="k">BF16 舍入边界</div><div class="v" style="font-size:14px" id="roundN">保留</div></div>
+    </div>
+    <p class="muted" id="fuseDesc" style="font-size:12.5px">未融合：conv1d 与 silu 各一个 kernel，中间结果往返显存。</p>
+    <div class="filetip">src/engine.cpp · delta_attention()</div>
+    <div class="log">conv=(options_.optimized&amp;&amp;options_.fused_gdn_conv)?conv_prefill(input,tensor(p+".conv1d.weight")):
+      at::silu(at::conv1d(input,tensor(p+".conv1d.weight"),{},1,0,1,C)).squeeze(0).t();</div>
+  </div>
+
+  <h2>③ TP2 BF16 归约 <span class="pill acc">--bf16-tp-reduce</span></h2>
+  <p>默认 <span class="kbd">Engine::sum</span> 先把 BF16 投影输出转成 FP32，AllReduce 完再转回 BF16：<b>两次 dtype 转换 + 4 字节/元素</b>的通信量。开启后直接用 <span class="kbd">ncclBfloat16</span> 做 AllReduce：<b>0 次转换 + 2 字节/元素</b>，通信量减半。但多次 BF16 部分和会引入额外舍入，所以<b>只允许 TP1/TP2，TP4 直接拒绝</b>。</p>
+  <div class="card tight">
+    <div class="ctrl">
+      <label>TP world</label>
+      <select id="wSel"><option value="1">1</option><option value="2" selected>2</option><option value="4">4</option></select>
+      <label><input type="checkbox" id="bf16Tgl" checked> 启用 --bf16-tp-reduce</label>
+    </div>
+    <div class="kv">
+      <div class="b"><div class="k">AllReduce 每元素字节</div><div class="v" id="bytesN">2</div></div>
+      <div class="b"><div class="k">dtype 转换次数</div><div class="v" id="convN">0</div></div>
+      <div class="b"><div class="k">相对 FP32 通信量</div><div class="v" id="ratioN">50%</div></div>
+    </div>
+    <div class="bar"><i class="new" id="payload" style="width:50%"></i></div>
+    <div class="warnbox" id="tpWarn">TP4 被拒绝：多个 BF16 部分和会引入额外舍入。引擎在构造时即 <span class="kbd">TORCH_CHECK(!bf16_tp_reduce || world&lt;=2)</span>。</div>
+    <div class="filetip">src/engine.cpp · Engine::sum()</div>
+    <div class="log">if(options_.bf16_tp_reduce &amp;&amp; x.scalar_type()==at::kBFloat16){
+  ncclAllReduce(out,out,n,ncclBfloat16,ncclSum,comm_,stream);   // 直接 BF16 归约
+  return output;
+}
+auto f=x.to(at::kFloat);                                          // 否则 BF16→FP32
+ncclAllReduce(f,f,n,ncclFloat,ncclSum,comm_,stream);
+return f.to(x.scalar_type());                                     // FP32→BF16</div>
+    <p class="muted" style="font-size:12.5px">上线前有一个独立两 rank 测试：把 BF16 AllReduce 的精确输出与"FP32 AllReduce 后再 BF16 舍入"逐元素比对，通过才允许跑 benchmark。</p>
+  </div>
+
+  <h2>④ 本轮其余改动（前端 / 传输）</h2>
+  <div class="sw">
+    <div class="s"><div class="flag">--frontend-format vllm-string</div><div class="d">Qwen 图文消息遵循 vLLM 0.20.1 默认非交错字符串约定（含换行分隔），修正图像后的换行差异；HF 格式仍可用。是格式选择，不是注入 token。</div></div>
+    <div class="s"><div class="flag">--bf16-patches</div><div class="d">直接序列化已舍入的 BF16 像素 patches，请求文件与 host/device 传输字节减半；保留 worker 原有 F32→BF16 输入舍入，不动 FP8 checkpoint。</div></div>
+    <div class="s"><div class="flag">--frontend-threads N</div><div class="d">限制 CPU 预处理线程数（benchmark 用 4），避免过度订阅。</div></div>
+    <div class="s"><div class="flag">--spool-dir /dev/shm</div><div class="d">临时文件放共享内存，减少磁盘 IO；用完即删，不做图像/响应缓存。</div></div>
+  </div>
+
+  <div class="note">
+    三刀的共同思路：<b>缩短串行链</b>（协作递推）、<b>减少 kernel 与中间张量往返</b>（conv+SiLU 融合）、<b>减少通信字节与转换</b>（BF16 归约）。它们都<b>不默认开启</b>，需显式开关并通过数值验收。详见 <a href="../docs/deep-optimizations.md">docs/deep-optimizations.md</a>；相关前置课：<a href="09-hybrid-attention.html">⑨ 混合注意力</a>、<a href="06-tensor-parallel.html">⑥ 张量并行</a>、<a href="08-optimized-cu.html">⑧ 算子</a>。
+  </div>
+</div>
+
+<script>
+function $(id){return document.getElementById(id);}
+// ① cooperative
+var kSel=$('kSel');
+function updCoop(){
+  var K=+kSel.value,q=K/4;
+  $('r0').textContent=q;$('r1').textContent=q;$('r2').textContent=q;$('r3').textContent=q;
+  $('regOld').textContent=K;$('regNew').textContent=q;
+  $('chainOld').textContent=K;$('chainNew').textContent=q;
+  $('barNew').style.width='25%';
+}
+kSel.addEventListener('change',updCoop);updCoop();
+// ② fusion
+var fuseTgl=$('fuseTgl');
+function updFuse(){
+  var f=fuseTgl.checked;
+  $('kConv').className='kx '+(f?'off':'on');
+  $('kSilu').className='kx '+(f?'off':'on');
+  $('kFuse').className='kx '+(f?'on':'off');
+  $('launchN').textContent=f?'1':'2';
+  $('midN').textContent=f?'0 次':'1 次';
+  $('roundN').textContent='保留';
+  $('fuseDesc').textContent=f?'融合：单个 CUDA kernel 内完成 depthwise conv + SiLU，中间结果不出寄存器/共享内存，保留 BF16 舍入边界。':'未融合：conv1d 与 silu 各一个 kernel，中间结果往返显存。';
+}
+fuseTgl.addEventListener('change',updFuse);updFuse();
+// ③ tp reduce
+var wSel=$('wSel'),bf16Tgl=$('bf16Tgl');
+function updTp(){
+  var w=+wSel.value,bf=bf16Tgl.checked;
+  $('tpWarn').style.display=(bf&&w>2)?'block':'none';
+  var bytes=bf?2:4;
+  $('bytesN').textContent=bytes;
+  $('convN').textContent=bf?0:2;
+  $('ratioN').textContent=(bytes/4*100)+'%';
+  $('payload').style.width=(bytes/4*100)+'%';
+}
+wSel.addEventListener('change',updTp);bf16Tgl.addEventListener('change',updTp);updTp();
+</script>
+</body>
+</html>

@@ -1,5 +1,7 @@
 # A100 Vision Infer
 
+中文 | [English](README.en.md)
+
 面向 **NVIDIA A100 80GB** 和 Qwen3.5/Qwen3.8 27B 视觉语言模型的独立 FP8 推理引擎。项目参考 [ninfer](https://github.com/Neroued/ninfer) 的固定模型、离线权重布局、算子融合与显式状态管理思路，针对 A100 SM80 和单机 TP=1/2/4 独立实现。
 
 当前主要验证配置为 2 × A100-SXM4-80GB、TP=2、E4M3FN block-FP8（128 × 128）。权重保持 FP8，激活及 Tensor Core 计算使用 BF16，Gated DeltaNet recurrent state 使用 FP32。
@@ -99,9 +101,26 @@ AVI_GPUS=2,3 bash scripts/test-optimizations.sh
 - `tools/optimization_matrix.py`：正确性与性能矩阵。
 - `tests/optimized_test.cpp`：CUDA kernel 数值回归。
 
-## 原生 MTP 与进一步优化
+## 原生 MTP（投机解码）A100 实测
 
-新增原生 MTP 优化候选：FP8 MTP 导入、候选批量验证、GDN/卷积/KV 状态提交、草稿 CUDA Graph、TP 局部 argmax 通信、短序列 GQA，以及可选解码权重缓存和 GDN 分块预填充。代码已接入 C++/CUDA，新增路径尚待 A100 编译、正确性与性能验收。见 [原生 MTP 优化与一次性测试](docs/native-mtp.md)。
+原生 MTP 已在 C++/CUDA 引擎内实现并完成 A100 验收：13 组原生配置全部运行成功，输出与原生基线一致，每组测试 5 次；vLLM baseline 进程退出码为 1，因此未生成跨引擎比较结果。2 × A100 80GB、TP=2，生成 128 tokens，P50：
+
+| 原生配置 | 首 token 延迟 P50 | 总延迟 P50 |
+| --- | ---: | ---: |
+| 原生基线 | 3.075 s | 5.560 s |
+| 权重解码缓存 | 2.077 s | 4.555 s |
+| MTP2 + 权重缓存 | 2.089 s | 3.117 s |
+| MTP3 + 权重缓存 | 2.101 s | 3.067 s |
+| **MTP3 + 权重缓存 + 草稿 Graph** | **2.076 s** | **3.033 s** |
+| 上述组合再加 GDN 分块 | 3.449 s | 4.404 s |
+
+三个优化结论：
+
+1. **权重缓存有效**：明显降低预填充耗时（TTFT 3.075→2.077 s），并让 MTP 批量验证获得收益。
+2. **MTP 显著压低总延迟**：TTFT 基本不变的前提下，MTP3 + 权重缓存 + 草稿 Graph 把总延迟从 4.555 s 降到 3.033 s（约 −33%），为最优组合。
+3. **GDN 分块预填充在当前形状下不划算**：叠加后回升到 3.449/4.404 s，故不作为默认路径。
+
+实现与开关（FP8 MTP 导入、候选批量验证、GDN/卷积/KV 状态提交、草稿 CUDA Graph、TP 局部 argmax、短序列 GQA、权重缓存、GDN 分块）见 [原生 MTP 优化与一次性测试](docs/native-mtp.md)；原始数据在 `mtp-test/matrix/summary.json`。
 
 ## 尚未实现
 
