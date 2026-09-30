@@ -1,8 +1,12 @@
 #pragma once
 #include <ATen/ATen.h>
 #include <utility>
+#include <vector>
 namespace avi {
-at::Tensor delta_scan_wy(at::Tensor q,at::Tensor k,at::Tensor v,at::Tensor g,at::Tensor beta,at::Tensor state,int chunk=32);
+at::Tensor small_linear_shared(at::Tensor x,at::Tensor weight,at::Tensor scales={});
+std::vector<at::Tensor> fused_gdn_prepare(at::Tensor projected,at::Tensor weight,at::Tensor history,at::Tensor log_decay,at::Tensor bias,int HK,int H,int K,int V);
+at::Tensor wy_propagate(at::Tensor W,at::Tensor U,at::Tensor Q,at::Tensor A,at::Tensor keys,at::Tensor last,at::Tensor state,int T);
+at::Tensor delta_scan_wy(at::Tensor q,at::Tensor k,at::Tensor v,at::Tensor g,at::Tensor beta,at::Tensor state,int chunk=32,bool fused=false);
 at::Tensor gqa_chunk_dynamic(at::Tensor q,at::Tensor k,at::Tensor v,at::Tensor keys,at::Tensor values,at::Tensor offset);
 at::Tensor flash_prefill(at::Tensor q,at::Tensor keys,at::Tensor values);
 at::Tensor fp8_linear(at::Tensor x,at::Tensor codes,at::Tensor scales,bool vector_gemv=false);

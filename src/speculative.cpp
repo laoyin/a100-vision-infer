@@ -8,6 +8,8 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
 #include <cmath>
+#include <array>
+#include <iostream>
 
 namespace avi {
 int64_t Engine::greedy(Tensor values){
@@ -105,8 +107,43 @@ struct VerifyGraph {
   std::unique_ptr<at::cuda::CUDAGraph> graph;
   Tensor embeddings,positions,hidden,candidates;
   std::vector<Tensor> trajectories,conv_inputs;
+  std::vector<std::array<Tensor,4>> storage;
+  int capacity=0;
   ~VerifyGraph(){graph.reset();}
 };
+
+void Engine::release_verify(int id){
+  auto found=verify_graphs_.find(id);if(found==verify_graphs_.end())return;
+  auto graph=found->second;
+  if(options_.reuse_verify_graph){
+    const auto& saved=id==active_?states_:sessions_.at(id);
+    graph->storage.clear();
+    for(const auto& state:saved)graph->storage.push_back({state.key,state.value,state.conv,state.recurrent});
+    size_t bytes=0;
+    for(const auto& storage:graph->storage)for(const auto& tensor:storage)if(tensor.defined())bytes+=tensor.nbytes();
+    for(const auto& tensor:graph->trajectories)if(tensor.defined())bytes+=tensor.nbytes();
+    for(const auto& tensor:graph->conv_inputs)if(tensor.defined())bytes+=tensor.nbytes();
+    // Bound explicitly retained tensors; graph-private workspace is additional.
+    verify_graph_pool_.clear();verify_graph_pool_bytes_=0;
+    if(bytes<=512ULL<<20){verify_graph_pool_[graph->capacity]=graph;verify_graph_pool_bytes_=bytes;}
+  }
+  verify_graphs_.erase(found);
+}
+void Engine::adopt_verify(){
+  if(!options_.reuse_verify_graph)return;
+  auto found=verify_graph_pool_.find(session_capacity());
+  if(found==verify_graph_pool_.end()){verify_graph_pool_.clear();verify_graph_pool_bytes_=0;return;}
+  auto graph=found->second;
+  TORCH_CHECK(graph->storage.size()==states_.size(),"Pooled verification state mismatch");
+  for(size_t i=0;i<states_.size();i++){
+    const auto& storage=graph->storage[i];auto& state=states_[i];
+    state.key=storage[0];state.value=storage[1];state.conv=storage[2];state.recurrent=storage[3];state.length=0;
+    // Prefix KV is overwritten during prefill. GDN always starts from zero.
+    if(state.conv.defined())state.conv.zero_();
+    if(state.recurrent.defined())state.recurrent.zero_();
+  }
+  verify_graphs_[active_]=graph;verify_graph_pool_.erase(found);verify_graph_pool_bytes_=0;++verify_graph_reuses_;
+}
 
 std::pair<Tensor,Tensor> Engine::verify_graph(Tensor embeddings,Tensor positions,int consumed){
   TORCH_CHECK(verifying_&&embeddings.size(0)==options_.mtp_tokens+1&&
@@ -115,6 +152,7 @@ std::pair<Tensor,Tensor> Engine::verify_graph(Tensor embeddings,Tensor positions
   auto& holder=verify_graphs_[active_];if(!holder)holder=std::make_shared<VerifyGraph>();
   auto& graph=*holder;
   if(!graph.graph){
+    graph.capacity=session_capacity();
     graph.embeddings=embeddings.clone();graph.positions=positions.clone();
     std::vector<std::pair<Tensor,Tensor>> saved;
     for(const auto& state:states_)saved.emplace_back(state.conv.defined()?state.conv.clone():Tensor(),
@@ -204,6 +242,27 @@ SpeculativeResult Engine::speculate(int64_t pending,int64_t position,int consume
   }
   int committed=decision.committed_inputs();
   TORCH_CHECK(committed<=int(inputs.size()),"Invalid speculative commit");
+  if(options_.audit_logits){
+    // Keep the original verification batch shape when recomputing diagnostic scores.
+    auto scores=values.defined()?values:logits(target_hidden);
+    auto top=at::topk(scores.narrow(0,0,committed),8,-1,true,true);
+    if(rank_==0){
+      auto ids=std::get<1>(top).to(at::kCPU),logits_cpu=std::get<0>(top).to(at::kCPU).to(at::kFloat);
+      auto log_probs=at::log_softmax(scores.narrow(0,0,committed),-1).gather(-1,std::get<1>(top)).to(at::kCPU);
+      json rows=json::array();
+      for(int i=0;i<committed;i++){
+        json row={{"row",i},{"top_ids",json::array()},{"logits",json::array()},{"log_probs",json::array()}};
+        if(!select)row["selected_id"]=choices.at(i);
+        for(int j=0;j<8;j++){
+          row["top_ids"].push_back(ids.data_ptr<int64_t>()[i*8+j]);
+          row["logits"].push_back(logits_cpu.data_ptr<float>()[i*8+j]);
+          row["log_probs"].push_back(log_probs.data_ptr<float>()[i*8+j]);
+        }
+        rows.push_back(row);
+      }
+      std::cerr<<json({{"event","logit_audit"},{"session",active_},{"consumed",consumed},{"rows",rows}}).dump()<<"\n";
+    }
+  }
   for(size_t layer=0;layer<states_.size();++layer){
     auto& state=states_[layer];
     if(state.key.defined())state.length=consumed+committed;

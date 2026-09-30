@@ -174,6 +174,19 @@ __global__ void append_chunk(const bf* k,const bf* v,bf* keys,bf* values,const i
   int i=blockIdx.x*256+threadIdx.x;
   if(i<n){keys[offset[0]*stride+i]=k[i];values[offset[0]*stride+i]=v[i];}
 }
+__global__ void attention_merge_live(const float* partial,const float* stats,bf* output,
+ const int64_t* offset,int D,int P,int H){
+ int h=blockIdx.x,active=min(P,(int(offset[0])+h/H+256)/256);
+ float maximum=-INFINITY;
+ for(int p=threadIdx.x;p<active;p+=256)maximum=fmaxf(maximum,stats[(h*P+p)*2]);
+ maximum=block_max(maximum);float denominator=0.f;
+ for(int p=threadIdx.x;p<active;p+=256)denominator+=stats[(h*P+p)*2+1]*expf(stats[(h*P+p)*2]-maximum);
+ denominator=block_sum(denominator);
+ for(int d=threadIdx.x;d<D;d+=256){
+  float value=0.f;for(int p=0;p<active;p++)value+=partial[(h*P+p)*D+d]*expf(stats[(h*P+p)*2]-maximum);
+  output[h*D+d]=__float2bfloat16_rn(value/denominator);
+ }
+}
 Tensor gqa_chunk_dynamic(Tensor q,Tensor k,Tensor v,Tensor keys,Tensor values,Tensor offset){
   q=q.contiguous();k=k.contiguous();v=v.contiguous();
   TORCH_CHECK(q.is_cuda()&&q.dim()==3&&k.dim()==3&&keys.dim()==3&&q.scalar_type()==at::kBFloat16&&
@@ -190,7 +203,7 @@ Tensor gqa_chunk_dynamic(Tensor q,Tensor k,Tensor v,Tensor keys,Tensor values,Te
   // Caller checks offset+T against capacity before capture/replay.
   append_chunk<<<(T*HK*D+255)/256,256,0,stream>>>(ptr(k),ptr(v),outptr(keys),outptr(values),offset.data_ptr<int64_t>(),T*HK*D,HK*D);
   attention_parts<<<dim3(H,P,T),256,0,stream>>>(ptr(q),ptr(keys),ptr(values),offset.data_ptr<int64_t>(),partial.data_ptr<float>(),stats.data_ptr<float>(),H,HK,D,P);
-  attention_merge<<<T*H,256,0,stream>>>(partial.data_ptr<float>(),stats.data_ptr<float>(),outptr(out),D,P);
+  attention_merge_live<<<T*H,256,0,stream>>>(partial.data_ptr<float>(),stats.data_ptr<float>(),outptr(out),offset.data_ptr<int64_t>(),D,P,H);
   C10_CUDA_KERNEL_LAUNCH_CHECK();return out;
 }
 // Parallel causal queries over a shared KV prefix; no repeated GQA keys or dense mask.

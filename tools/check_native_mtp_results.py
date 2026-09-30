@@ -14,7 +14,7 @@ def main():
             raise SystemExit(f'TP{a.tp} MTP{window}: token mismatch; retain outputs for diagnosis')
         if len(reference)>1 and result['mtp']['rounds']<1:
             raise SystemExit('MTP execution was not exercised')
-    for name in ('graph','cached','verify'):
+    for name in ('graph','cached','verify','shared-bf16','shared-fp8'):
         path=a.root/f'tp{a.tp}-mtp-{name}.json'
         if path.exists() and json.loads(path.read_text())['generated_ids']!=reference:
             raise SystemExit(f'TP{a.tp} MTP {name}: token mismatch')

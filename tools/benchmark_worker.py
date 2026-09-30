@@ -28,7 +28,13 @@ def main():
  p.add_argument('--gdn-cooperative',action='store_true')
  p.add_argument('--gdn-wy',action='store_true')
  p.add_argument('--mtp-verify-graph',action='store_true')
+ p.add_argument('--multi-token-gemv',action='store_true')
+ p.add_argument('--multi-token-gemv-fp8',action='store_true')
+ p.add_argument('--fused-gdn-prepare',action='store_true')
+ p.add_argument('--gdn-wy-fused',action='store_true')
+ p.add_argument('--reuse-verify-graph',action='store_true')
  p.add_argument('--profile-kernels',action='store_true')
+ p.add_argument('--audit-logits',action='store_true')
  p.add_argument('--fused-gdn-conv',action='store_true')
  p.add_argument('--bf16-tp-reduce',action='store_true')
  p.add_argument('--frontend-format',choices=['hf','vllm-string'],default='hf')
@@ -71,7 +77,13 @@ def main():
  if a.gdn_cooperative:cmd+=['--gdn-cooperative']
  if a.gdn_wy:cmd+=['--gdn-wy']
  if a.mtp_verify_graph:cmd+=['--mtp-verify-graph']
+ if a.multi_token_gemv:cmd+=['--multi-token-gemv']
+ if a.multi_token_gemv_fp8:cmd+=['--multi-token-gemv-fp8']
+ if a.fused_gdn_prepare:cmd+=['--fused-gdn-prepare']
+ if a.gdn_wy_fused:cmd+=['--gdn-wy-fused']
+ if a.reuse_verify_graph:cmd+=['--reuse-verify-graph']
  if a.profile_kernels:cmd+=['--profile-kernels']
+ if a.audit_logits:cmd+=['--audit-logits']
  if a.fused_gdn_conv:cmd+=['--fused-gdn-conv']
  if a.bf16_tp_reduce:cmd+=['--bf16-tp-reduce']
  if a.profile_stages:cmd+=['--profile-stages']
@@ -135,8 +147,9 @@ def main():
   report.update(mtp_tokens=a.mtp_tokens,weight_cache_mib=a.weight_cache_mib,mtp_draft_graph=a.mtp_draft_graph)
   report['gdn_chunk']=a.gdn_chunk
   report.update(flash_prefill=a.flash_prefill,cache_vision_weights=a.cache_vision_weights)
-  report['synchronized_diagnostic']=a.profile_stages or a.profile_kernels
-  report.update(gdn_wy=a.gdn_wy,mtp_verify_graph=a.mtp_verify_graph,profile_kernels=a.profile_kernels)
+  report['synchronized_diagnostic']=a.profile_stages or a.profile_kernels or a.audit_logits
+  report.update(gdn_wy=a.gdn_wy,mtp_verify_graph=a.mtp_verify_graph,profile_kernels=a.profile_kernels,audit_logits=a.audit_logits,
+    multi_token_gemv=a.multi_token_gemv,multi_token_gemv_fp8=a.multi_token_gemv_fp8,fused_gdn_prepare=a.fused_gdn_prepare,gdn_wy_fused=a.gdn_wy_fused,reuse_verify_graph=a.reuse_verify_graph)
   report.update(fused_gdn_conv=a.fused_gdn_conv,gdn_cooperative=a.gdn_cooperative,bf16_tp_reduce=a.bf16_tp_reduce,frontend_format=a.frontend_format,frontend_threads=a.frontend_threads,bf16_patches=a.bf16_patches,spool_dir=a.spool_dir)
   report['timing_scope']='CPU image decode/tokenization/preprocessing + disk IPC + native inference + output decoding' if frontend else 'prepared input + native inference'
   report['prompt_token_ids']=prompt_ids

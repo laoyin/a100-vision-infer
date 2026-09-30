@@ -3,6 +3,44 @@
 #include <iostream>
 void run_optimized_tests(){
  auto opt=at::TensorOptions().device(at::kCUDA).dtype(at::kFloat);at::manual_seed(17);
+ // Shared weights across query rows, odd tails and original FP8 block scales.
+ for(int M:{1,2,4,6,8})for(int K:{17,128,257,5120}){
+  int N=19;auto x=at::randn({M,K},opt).to(at::kBFloat16);
+  auto codes=at::randint(0,126,{N,K},opt.dtype(at::kByte));auto scales=at::rand({N,(K+127)/128},opt)*.01+.001;
+  auto decoded=avi::fp8_decode(codes,scales);
+  auto actual=avi::small_linear_shared(x,codes,scales),bf16=avi::small_linear_shared(x,decoded);
+  TORCH_CHECK(at::equal(actual,bf16),"Shared GEMV FP8/BF16 rounding mismatch");
+  TORCH_CHECK(at::allclose(actual.to(at::kFloat),at::matmul(x,decoded.t()).to(at::kFloat),.025,.05),"Shared GEMV reference mismatch");
+ }
+ // Packed loads must fall back for otherwise contiguous unaligned views.
+ {
+  int M=2,N=19,K=132;
+  auto x=at::randn({M*K+1},opt).to(at::kBFloat16).narrow(0,1,M*K).reshape({M,K});
+  auto codes=at::randint(0,126,{N*K+1},opt.dtype(at::kByte)).narrow(0,1,N*K).reshape({N,K});
+  auto scales=at::ones({N,(K+127)/128},opt)*.01;
+  TORCH_CHECK(at::allclose(avi::small_linear_shared(x,codes,scales).to(at::kFloat),
+    at::matmul(x,avi::fp8_decode(codes,scales).t()).to(at::kFloat),.025,.05),"Unaligned shared GEMV fallback mismatch");
+ }
+ // Nonzero convolution history, repeated key heads and BF16 rounding boundaries.
+ for(int T:{32,33,129})for(int K:{16,128})for(int V:{17,128}){
+  int HK=2,H=6,C=2*HK*K+H*V,width=4;
+  auto projected=at::randn({T,C+H*V+2*H},opt).to(at::kBFloat16);
+  auto weight=at::randn({C,1,width},opt).to(at::kBFloat16);
+  auto history=at::randn({1,C,width-1},opt).to(at::kBFloat16),original=history.clone();
+  auto log_decay=at::randn({H},opt).to(at::kBFloat16),bias=at::randn({H},opt).to(at::kBFloat16);
+  auto mixed=projected.narrow(1,0,C).t().unsqueeze(0);
+  auto input=at::cat({original,mixed},-1),conv=avi::conv_prefill(input,weight);
+  auto q=avi::fused_l2(conv.narrow(1,0,HK*K).reshape({T,HK,K})).repeat_interleave(H/HK,1);
+  auto k=avi::fused_l2(conv.narrow(1,HK*K,HK*K).reshape({T,HK,K})).repeat_interleave(H/HK,1);
+  auto v=conv.narrow(1,2*HK*K,H*V).reshape({T,H,V});
+  auto gates=avi::fused_gdn_gates(projected.narrow(1,C+H*V+H,H),projected.narrow(1,C+H*V,H),log_decay,bias);
+  auto actual=avi::fused_gdn_prepare(projected,weight,history,log_decay,bias,HK,H,K,V);
+  TORCH_CHECK(at::allclose(actual[0].to(at::kFloat),q.to(at::kFloat),.02,.003)&&
+    at::allclose(actual[1].to(at::kFloat),k.to(at::kFloat),.02,.003)&&
+    at::allclose(actual[2].to(at::kFloat),v.to(at::kFloat),.02,.003),"Fused GDN convolution/L2 mismatch");
+  TORCH_CHECK(at::allclose(actual[3],gates.first,.0001,.00001)&&at::equal(actual[4],gates.second),"Fused GDN gates mismatch");
+  TORCH_CHECK(at::equal(history,input.narrow(-1,T,width-1)),"Fused GDN history update mismatch");
+ }
  // Packed GEMV: signed/subnormal FP8, block boundaries, batch and scalar fallback.
  for(int M:{1,2,8})for(int K:{4,128,132,257,5120}){
   int N=19;auto input=at::randn({M,K},opt).to(at::kBFloat16);
@@ -143,9 +181,12 @@ void run_optimized_tests(){
   auto q=avi::fused_l2(at::randn({T,H,K},opt).to(at::kBFloat16));
   auto k=avi::fused_l2(at::randn_like(q)),v=at::randn({T,H,V},opt).to(at::kBFloat16);
   auto g=-at::rand({T,H},opt)*decay,b=at::rand({T,H},opt);
-  auto state=at::randn({H,K,V},opt),reference=state.clone();
+  auto state=at::randn({H,K,V},opt),reference=state.clone(),fused_state=state.clone();
   auto expected=avi::delta_scan_fast(q,k,v,g,b,reference);
   auto actual=avi::delta_scan_wy(q,k,v,g,b,state);
+  auto fused=avi::delta_scan_wy(q,k,v,g,b,fused_state,32,true);
+  TORCH_CHECK(at::allclose(fused.to(at::kFloat),expected.to(at::kFloat),.02,.003)&&
+    at::allclose(fused_state,reference,.001,.0001),"CUDA WY output/state mismatch");
   TORCH_CHECK(at::allclose(actual.to(at::kFloat),expected.to(at::kFloat),.02,.003),"Batched WY output mismatch");
   TORCH_CHECK(at::allclose(state,reference,.001,.0001),"Batched WY final state mismatch");
  }

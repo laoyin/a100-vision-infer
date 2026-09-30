@@ -4,7 +4,7 @@
 namespace avi {
 // State-independent WY transforms are batched across all chunks and heads.
 at::Tensor delta_scan_wy(at::Tensor q,at::Tensor k,at::Tensor v,
-    at::Tensor g,at::Tensor beta,at::Tensor state,int chunk){
+    at::Tensor g,at::Tensor beta,at::Tensor state,int chunk,bool fused){
   TORCH_CHECK(chunk>0&&chunk<=64&&q.is_cuda()&&q.dim()==3&&q.sizes()==k.sizes()&&
       v.dim()==3&&v.size(0)==q.size(0)&&v.size(1)==q.size(1)&&state.scalar_type()==at::kFloat,"Invalid WY inputs");
   int64_t T=q.size(0),H=q.size(1),K=q.size(2),V=v.size(2),blocks=(T+chunk-1)/chunk;
@@ -26,6 +26,7 @@ at::Tensor delta_scan_wy(at::Tensor q,at::Tensor k,at::Tensor v,
   auto attention=at::matmul(Q,kt)*decay,scaled_q=Q*exponential;
   auto last=G.select(-1,chunk-1);
   auto weighted_keys=keys*(last.unsqueeze(-1)-G).exp().unsqueeze(-1);
+  if(fused)return wy_propagate(W,U,scaled_q,attention,weighted_keys,last,state,T);
   auto output=at::empty({blocks,H,chunk,V},v.options());
   for(int64_t block=0;block<blocks;++block){
     auto update=U[block]-at::matmul(W[block],state);

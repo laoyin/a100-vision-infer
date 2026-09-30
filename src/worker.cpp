@@ -81,6 +81,12 @@ int main(int argc,char** argv){
       if(key=="--flash-prefill"){options.flash_prefill=true;continue;}
       if(key=="--gdn-cooperative"){options.gdn_cooperative=true;continue;}
       if(key=="--gdn-wy"){options.gdn_wy=true;continue;}
+      if(key=="--audit-logits"){options.audit_logits=true;continue;}
+      if(key=="--multi-token-gemv"){options.multi_token_gemv=true;continue;}
+      if(key=="--multi-token-gemv-fp8"){options.multi_token_gemv=true;options.shared_gemv_fp8=true;continue;}
+      if(key=="--fused-gdn-prepare"){options.fused_gdn_prepare=true;continue;}
+      if(key=="--gdn-wy-fused"){options.gdn_wy_fused=true;continue;}
+      if(key=="--reuse-verify-graph"){options.reuse_verify_graph=true;continue;}
       if(key=="--mtp-verify-graph"){options.mtp_verify_graph=true;continue;}
       if(key=="--fused-gdn-conv"){options.fused_gdn_conv=true;continue;}
       if(key=="--bf16-tp-reduce"){options.bf16_tp_reduce=true;continue;}
@@ -93,7 +99,7 @@ int main(int argc,char** argv){
    else if(key=="--image-cache-mib")options.image_cache_bytes=std::stoull(value)<<20;else if(key=="--prefix-cache-mib")options.prefix_cache_bytes=std::stoull(value)<<20;else { TORCH_CHECK(false,"Unknown option ",key); }
   }
   TORCH_CHECK(!model.empty()&&capacity>0&&chunk>0&&concurrency>0&&concurrency<=8,"Invalid worker configuration");
-  if(options.profile_kernels){draft_graph=false;options.mtp_verify_graph=false;options.cuda_graph=false;}
+  if(options.profile_kernels){draft_graph=false;options.mtp_verify_graph=false;options.reuse_verify_graph=false;options.cuda_graph=false;}
   if(options.mtp_tokens){options.prefix_cache_bytes=0;options.host_prefix_cache_bytes=0;}
   TORCH_CHECK(!draft_graph||options.mtp_tokens>0,"Draft Graph requires --mtp-tokens");
   int nlocal,count;MPI_Comm_size(host,&nlocal);TORCH_CHECK(nlocal==world&&(world==1||world==2||world==4),"Use 1/2/4 local ranks");

@@ -32,6 +32,31 @@ def acceptance(profiles, comparisons, upstream_count=2):
             'scope':'C1 latency on this image only. Both vLLM MTP2/3 must match. C2 has no matched vLLM concurrency result.'}
 
 
+def fused_profiles(frontend,gdn):
+    base=frontend+gdn+['--bf16-tp-reduce']
+    graph=['--mtp-verify-graph','--reuse-verify-graph']
+    prepare=['--fused-gdn-prepare']
+    gemv=['--multi-token-gemv']
+    fp8=['--multi-token-gemv-fp8']
+    wy=['--gdn-wy-fused']
+    return [
+        ('reference',base,512,24576),
+        ('graph-pool',base+graph,512,24576),
+        ('prepare',base+prepare,512,24576),
+        ('shared-gemv',base+gemv,512,24576),
+        ('shared-fp8',base+fp8,512,24576),
+        ('wy-fused',base+prepare+wy,512,24576),
+        ('combined',base+graph+prepare+gemv,512,24576),
+        ('combined-fp8',base+graph+prepare+fp8,512,24576),
+        ('combined-1024',base+graph+prepare+gemv,1024,24576),
+        ('combined-2048',base+graph+prepare+gemv,2048,24576),
+        ('combined-wy',base+graph+prepare+gemv+wy,2048,24576),
+        ('combined-c2',base+graph+prepare+gemv+['--concurrency','2'],512,24576),
+        ('diagnostic',base+['--profile-stages','--profile-kernels','--audit-logits'],512,24576),
+        ('diagnostic-fused',base+prepare+gemv+['--profile-stages','--profile-kernels'],512,24576),
+    ]
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     for key in ('previous', 'hf-model', 'vllm-results', 'out'):
@@ -39,7 +64,7 @@ def main():
     p.add_argument('--requests', type=int, default=5)
     p.add_argument('--timeout', type=float, default=1800)
     p.add_argument('--max-pixels', type=int, default=4000000)
-    p.add_argument('--suite', choices=['prefill','deep','graph-wy'], default='prefill')
+    p.add_argument('--suite', choices=['prefill','deep','graph-wy','native-fused'], default='prefill')
     a = p.parse_args()
     if a.requests < 1 or a.timeout <= 0:
         p.error('Invalid limits')
@@ -62,7 +87,7 @@ def main():
         ('flash-vision-cache32', ['--flash-prefill', '--cache-vision-weights'], 512, 32768),
         ('diagnostic', ['--flash-prefill', '--cache-vision-weights', '--profile-stages'], 512, 24576),
     ]
-    if a.suite in ('deep','graph-wy'):
+    if a.suite in ('deep','graph-wy','native-fused'):
         common+=['--flash-prefill','--frontend-format','vllm-string']
         frontend=['--frontend-threads','4','--bf16-patches','--spool-dir','/dev/shm']
         gdn=['--gdn-cooperative','--fused-gdn-conv']
@@ -93,6 +118,8 @@ def main():
             ('diagnostic',tuned+['--profile-stages','--profile-kernels'],512,24576),
             ('diagnostic-wy',tuned+wy+['--profile-stages','--profile-kernels'],512,24576),
         ]
+    if a.suite=='native-fused':
+        profiles=fused_profiles(frontend,gdn)
     summary = {'suite':a.suite,'profiles': [], 'comparison': [], 'vllm_reports': str(a.vllm_results.resolve()),
                'note': 'vLLM reports are supplied separately (the deep test script generates them in this run). Measurements are sequential, not interleaved. Diagnostic synchronizes GPU and is excluded from speed comparisons.'}
     reference = None
@@ -121,6 +148,8 @@ def main():
                        graph_counters=[r.get('cache') for r in report['results']])
             if '--mtp-verify-graph' in flags and not any((r.get('cache') or {}).get('verify_graph_replays',0)>0 for r in report['results']):
                 row.update(status='graph_not_exercised')
+            if '--reuse-verify-graph' in flags and not any((r.get('cache') or {}).get('verify_graph_reuses',0)>0 for r in report['results']):
+                row.update(status='graph_reuse_not_exercised')
             if not report.get('synchronized_diagnostic',False) and report['concurrency']==1:
                 for label, target in upstream.items():
                     prompt = prompt_difference(report['prompt_token_ids'], target['results'][0]['prompt_token_ids'])
@@ -137,9 +166,11 @@ def main():
         print(json.dumps(row), flush=True)
     ratios=[r['latency_ratio_vllm_over_native'] for r in summary['comparison'] if r['latency_ratio_vllm_over_native'] is not None]
     summary['acceptance']=acceptance(summary['profiles'],summary['comparison'],len(upstream))
+    summary['failure_reasons']={'native_profiles':[r['name'] for r in summary['profiles'] if r['status']!='passed'],
+                                'no_matching_cross_engine_comparison':not bool(ratios)}
     (a.out/'summary.json').write_text(json.dumps(summary,indent=2),encoding='utf-8')
     print(json.dumps(summary['acceptance']),flush=True)
-    if any(r['status'] != 'passed' for r in summary['profiles']) or (a.suite in ('deep','graph-wy') and not ratios):
+    if any(r['status'] != 'passed' for r in summary['profiles']) or (a.suite in ('deep','graph-wy','native-fused') and not ratios):
         raise SystemExit(1)
 
 

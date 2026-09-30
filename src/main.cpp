@@ -34,6 +34,12 @@ int main(int argc,char** argv) {
       if(key=="--flash-prefill"){options.flash_prefill=true;continue;}
       if(key=="--gdn-cooperative"){options.gdn_cooperative=true;continue;}
       if(key=="--gdn-wy"){options.gdn_wy=true;continue;}
+      if(key=="--audit-logits"){options.audit_logits=true;continue;}
+      if(key=="--multi-token-gemv"){options.multi_token_gemv=true;continue;}
+      if(key=="--multi-token-gemv-fp8"){options.multi_token_gemv=true;options.shared_gemv_fp8=true;continue;}
+      if(key=="--fused-gdn-prepare"){options.fused_gdn_prepare=true;continue;}
+      if(key=="--gdn-wy-fused"){options.gdn_wy_fused=true;continue;}
+      if(key=="--reuse-verify-graph"){options.reuse_verify_graph=true;continue;}
       if(key=="--mtp-verify-graph"){options.mtp_verify_graph=true;continue;}
       if(key=="--fused-gdn-conv"){options.fused_gdn_conv=true;continue;}
       if(key=="--bf16-tp-reduce"){options.bf16_tp_reduce=true;continue;}

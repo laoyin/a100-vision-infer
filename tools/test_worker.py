@@ -5,7 +5,7 @@ from pathlib import Path
 def main():
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--model',required=True);p.add_argument('--request',required=True)
     p.add_argument('--host-cache',action='store_true');p.add_argument('--worker',default='build/avi-worker');p.add_argument('--tp',type=int,default=2);p.add_argument('--cuda-graph',action='store_true')
-    p.add_argument('--tp-lm-head',action='store_true');p.add_argument('--vector-gemv',action='store_true');p.add_argument('--mtp-tokens',type=int,default=0);p.add_argument('--mtp-draft-graph',action='store_true');p.add_argument('--mtp-verify-graph',action='store_true');a=p.parse_args()
+    p.add_argument('--tp-lm-head',action='store_true');p.add_argument('--vector-gemv',action='store_true');p.add_argument('--mtp-tokens',type=int,default=0);p.add_argument('--mtp-draft-graph',action='store_true');p.add_argument('--mtp-verify-graph',action='store_true');p.add_argument('--reuse-verify-graph',action='store_true');a=p.parse_args()
     req=json.loads((Path(a.request)/'request.json').read_text())
     cmd=['mpirun','-np',str(a.tp),a.worker,'--model',a.model,'--max-context',str(req['max_context']),
          '--max-concurrency','2','--prefill-chunk','4']+(['--cuda-graph'] if a.cuda_graph else [])
@@ -15,6 +15,7 @@ def main():
     if a.mtp_tokens:cmd+=['--mtp-tokens',str(a.mtp_tokens)]
     if a.mtp_draft_graph:cmd+=['--mtp-draft-graph']
     if a.mtp_verify_graph:cmd+=['--mtp-verify-graph']
+    if a.reuse_verify_graph:cmd+=['--reuse-verify-graph','--image-cache-mib','0']
     variants=Path(temp.name)
     if a.host_cache:
         config=json.loads((Path(a.model)/'manifest.json').read_text())['config']['text_config'];tp=a.tp
@@ -59,9 +60,33 @@ def main():
             input_file.write_bytes(tokens.tobytes())
             send({'op':'submit','id':'other','request':str(variant.resolve())})
             wait(lambda e:e['event']=='done' and e['id']=='other')
+        if a.reuse_verify_graph:
+            import numpy as np
+            variant=variants/'different';shutil.copytree(a.request,variant)
+            data=variant/req['input_ids']['file'];tokens=np.fromfile(data,dtype='<i8')
+            index=next(i for i,t in enumerate(tokens) if int(t)!=req['image_token_id'])
+            manifest=json.loads((Path(a.model)/'manifest.json').read_text())
+            vocab=manifest['config']['text_config']['vocab_size']
+            tokens[index]=(int(tokens[index])+7)%vocab
+            if int(tokens[index])==req['image_token_id']:tokens[index]=0
+            data.write_bytes(tokens.tobytes())
+            expected=variants/'different-clean.json'
+            subprocess.run(['mpirun','-np',str(a.tp),'build/avi-infer','--model',a.model,
+                '--request',str(variant),'--output',str(expected),'--prefill-chunk','4','--tp-lm-head','--vector-gemv'],check=True,timeout=300)
+            send({'op':'submit','id':'different','request':str(variant.resolve())})
+            other=wait(lambda e:e['event']=='done' and e['id']=='different')
+            assert other['generated_ids']==json.loads(expected.read_text())['generated_ids'],'Pooled graph retained another prompt state'
+            short=variants/'short';shutil.copytree(a.request,short)
+            short_req=dict(req);short_req['max_new_tokens']=1
+            (short/'request.json').write_text(json.dumps(short_req))
+            send({'op':'submit','id':'short','request':str(short.resolve())})
+            limited=wait(lambda e:e['event']=='done' and e['id']=='short')
+            assert limited['generated_ids']==results['a']['generated_ids'][:1],'Capacity eviction changed first token'
         send({'op':'submit','id':'cached','request':str(Path(a.request).resolve())})
         cached=wait(lambda e:e['event']=='done' and e['id']=='cached')
         assert cached['generated_ids']==results['a']['generated_ids'],'Prefix restore changed generation'
+        if a.reuse_verify_graph:
+            assert cached['cache']['verify_graph_reuses']>0,'Expected verification graph reuse'
         if not a.mtp_tokens:assert cached['cache']['prefix_hits']>0,'Expected exact prompt cache hit'
         else:assert cached['cache']['prefix_hits']==0,'MTP must not reuse incomplete prefix state'
         if a.host_cache:assert cached['cache']['host_prefix_hits']>0,'Host restore path was not exercised'
