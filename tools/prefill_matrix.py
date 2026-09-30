@@ -39,7 +39,7 @@ def main():
     p.add_argument('--requests', type=int, default=5)
     p.add_argument('--timeout', type=float, default=1800)
     p.add_argument('--max-pixels', type=int, default=4000000)
-    p.add_argument('--suite', choices=['prefill','deep'], default='prefill')
+    p.add_argument('--suite', choices=['prefill','deep','graph-wy'], default='prefill')
     a = p.parse_args()
     if a.requests < 1 or a.timeout <= 0:
         p.error('Invalid limits')
@@ -47,6 +47,10 @@ def main():
     request = json.loads((a.previous/'request/request.json').read_text(encoding='utf-8'))
     upstream = {n: json.loads((a.vllm_results/(n+'.json')).read_text(encoding='utf-8'))
                 for n in ('mtp2', 'mtp3')}
+    upstream_status={}
+    audit=a.vllm_results/'summary.json'
+    if audit.exists():
+        upstream_status={r['name']:r['status'] for r in json.loads(audit.read_text(encoding='utf-8'))}
     common = ['--tp-lm-head', '--vector-gemv', '--extra-fusions', '--cublas-prefill',
               '--mtp-tokens', '3', '--mtp-draft-graph']
     profiles = [
@@ -58,7 +62,7 @@ def main():
         ('flash-vision-cache32', ['--flash-prefill', '--cache-vision-weights'], 512, 32768),
         ('diagnostic', ['--flash-prefill', '--cache-vision-weights', '--profile-stages'], 512, 24576),
     ]
-    if a.suite=='deep':
+    if a.suite in ('deep','graph-wy'):
         common+=['--flash-prefill','--frontend-format','vllm-string']
         frontend=['--frontend-threads','4','--bf16-patches','--spool-dir','/dev/shm']
         gdn=['--gdn-cooperative','--fused-gdn-conv']
@@ -74,6 +78,21 @@ def main():
             ('combined-c2',frontend+gdn+['--bf16-tp-reduce','--concurrency','2'],512,24576),
             ('diagnostic',frontend+gdn+['--bf16-tp-reduce','--profile-stages'],512,24576),
         ]
+    if a.suite=='graph-wy':
+        tuned=frontend+gdn+['--bf16-tp-reduce']
+        graph=['--mtp-verify-graph']
+        wy=['--gdn-wy']
+        profiles=[
+            ('reference',tuned,512,24576),
+            ('verify-graph',tuned+graph,512,24576),
+            ('wy',tuned+wy,512,24576),
+            ('combined',tuned+graph+wy,512,24576),
+            ('combined-2048',tuned+graph+wy,2048,24576),
+            ('verify-graph-mtp2',tuned+graph+['--mtp-tokens','2'],512,24576),
+            ('verify-graph-c2',tuned+graph+['--concurrency','2'],512,24576),
+            ('diagnostic',tuned+['--profile-stages','--profile-kernels'],512,24576),
+            ('diagnostic-wy',tuned+wy+['--profile-stages','--profile-kernels'],512,24576),
+        ]
     summary = {'suite':a.suite,'profiles': [], 'comparison': [], 'vllm_reports': str(a.vllm_results.resolve()),
                'note': 'vLLM reports are supplied separately (the deep test script generates them in this run). Measurements are sequential, not interleaved. Diagnostic synchronizes GPU and is excluded from speed comparisons.'}
     reference = None
@@ -82,12 +101,12 @@ def main():
         command = [sys.executable, 'tools/benchmark_worker.py',
                    '--model', str(a.previous/'fp8-mtp-tp2'), '--request', str(a.previous/'request'),
                    '--frontend-model', str(a.hf_model), '--body', str(a.previous/'request.json'),
-                   '--out', str(output), '--requests', str(1 if name == 'diagnostic' else a.requests),
+                   '--out', str(output), '--requests', str(1 if name.startswith('diagnostic') else a.requests),
                    '--prefill-chunk', str(chunk), '--weight-cache-mib', str(cache),
                    '--max-pixels', str(a.max_pixels), '--timeout', str(a.timeout),
                    '--inherit-process-group']+common+flags
         code = run(command, a.out/(name+'.log'), a.timeout)
-        row = dict(name=name, exit_code=code, status='failed')
+        row = dict(name=name, exit_code=code, status='failed', log=str(a.out/(name+'.log')))
         if code == 0:
             report = json.loads(output.read_text(encoding='utf-8'))
             if name == 'reference':
@@ -97,16 +116,21 @@ def main():
                        concurrency=report['concurrency'],output_tokens_per_second=report['output_tokens_per_second'],
                        differences=differences, latency=report['latency_seconds'], ttft=report['ttft_seconds'],
                        frontend_seconds=[r.get('frontend_seconds') for r in report['results']],
-                       stages=[r.get('stages') for r in report['results']])
-            if name != 'diagnostic' and report['concurrency']==1:
+                       stages=[r.get('stages') for r in report['results']],
+                       kernel_times=[r.get('kernel_times') for r in report['results']],
+                       graph_counters=[r.get('cache') for r in report['results']])
+            if '--mtp-verify-graph' in flags and not any((r.get('cache') or {}).get('verify_graph_replays',0)>0 for r in report['results']):
+                row.update(status='graph_not_exercised')
+            if not report.get('synchronized_diagnostic',False) and report['concurrency']==1:
                 for label, target in upstream.items():
                     prompt = prompt_difference(report['prompt_token_ids'], target['results'][0]['prompt_token_ids'])
                     outputs = compare_outputs(report['results'], target['results'][0]['generated_ids'], request['eos_token_ids'])
                     stable = all(r['prompt_token_ids'] == target['results'][0]['prompt_token_ids'] and
                                  r['generated_ids'] == target['results'][0]['generated_ids'] for r in target['results'])
-                    valid = prompt is None and not outputs and stable and row['status'] == 'passed'
+                    baseline_valid=upstream_status.get(label)=='passed'
+                    valid = baseline_valid and prompt is None and not outputs and stable and row['status'] == 'passed'
                     summary['comparison'].append(dict(native=name, vllm=label, prompt_difference=prompt,
-                        output_differences=outputs, vllm_repeatable=stable,
+                        output_differences=outputs, vllm_repeatable=stable, vllm_baseline_valid=baseline_valid,
                         latency_ratio_vllm_over_native=target['latency_p50_seconds']/report['latency_seconds']['p50'] if valid else None))
         summary['profiles'].append(row)
         (a.out/'summary.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
@@ -115,7 +139,7 @@ def main():
     summary['acceptance']=acceptance(summary['profiles'],summary['comparison'],len(upstream))
     (a.out/'summary.json').write_text(json.dumps(summary,indent=2),encoding='utf-8')
     print(json.dumps(summary['acceptance']),flush=True)
-    if any(r['status'] != 'passed' for r in summary['profiles']) or (a.suite=='deep' and not ratios):
+    if any(r['status'] != 'passed' for r in summary['profiles']) or (a.suite in ('deep','graph-wy') and not ratios):
         raise SystemExit(1)
 
 

@@ -65,7 +65,7 @@ Tensor Engine::mtp_step(Tensor embeddings,Tensor positions,Tensor hidden,bool si
 
 struct DraftGraph {
   std::unique_ptr<at::cuda::CUDAGraph> graph;
-  Tensor ids,positions,input,output,keys,values;
+  Tensor ids,positions,input,output,keys,values,candidates;
   int capacity=0;
   ~DraftGraph(){graph.reset();}
 };
@@ -79,6 +79,7 @@ void Engine::release_draft(int id){
   drafts_.erase(id);
 }
 Tensor Engine::draft_one(int64_t token,int64_t position,Tensor hidden){
+  draft_candidates_=Tensor();
   auto& state=drafts_[active_].state;
   if(!draft_graph_enabled_)return mtp_step(embed(at::full({1},token,decode_offset_.options())),at::full({3,1},position,decode_offset_.options()),hidden);
   TORCH_CHECK(state.length<session_capacity(),"MTP graph KV capacity exceeded");
@@ -90,14 +91,61 @@ Tensor Engine::draft_one(int64_t token,int64_t position,Tensor hidden){
     {
       c10::cuda::CUDAStreamGuard guard(stream);
       // Only the pending KV slot is overwritten; no accepted prefix state changes.
-      for(int i=0;i<2;++i)g.output=mtp_step(embed(g.ids),g.positions,g.input,true);
+      for(int i=0;i<2;++i){g.output=mtp_step(embed(g.ids),g.positions,g.input,true);g.candidates=local_candidates(g.output);}
       g.keys=state.key;g.values=state.value;g.capacity=session_capacity();
       C10_CUDA_CHECK(cudaStreamSynchronize(stream));
       g.graph=std::make_unique<at::cuda::CUDAGraph>();g.graph->capture_begin();
-      g.output=mtp_step(embed(g.ids),g.positions,g.input,true);g.graph->capture_end();
+      g.output=mtp_step(embed(g.ids),g.positions,g.input,true);g.candidates=local_candidates(g.output);g.graph->capture_end();
     }
   }else {g.ids.fill_(token);g.positions.fill_(position);g.input.copy_(hidden);}
-  g.graph->replay();++state.length;return g.output;
+  g.graph->replay();draft_candidates_=g.candidates;++state.length;return g.output;
+}
+
+struct VerifyGraph {
+  std::unique_ptr<at::cuda::CUDAGraph> graph;
+  Tensor embeddings,positions,hidden,candidates;
+  std::vector<Tensor> trajectories,conv_inputs;
+  ~VerifyGraph(){graph.reset();}
+};
+
+std::pair<Tensor,Tensor> Engine::verify_graph(Tensor embeddings,Tensor positions,int consumed){
+  TORCH_CHECK(verifying_&&embeddings.size(0)==options_.mtp_tokens+1&&
+      consumed>=0&&consumed+embeddings.size(0)<=session_capacity(),"Invalid verification graph request");
+  decode_offset_.fill_(consumed);
+  auto& holder=verify_graphs_[active_];if(!holder)holder=std::make_shared<VerifyGraph>();
+  auto& graph=*holder;
+  if(!graph.graph){
+    graph.embeddings=embeddings.clone();graph.positions=positions.clone();
+    std::vector<std::pair<Tensor,Tensor>> saved;
+    for(const auto& state:states_)saved.emplace_back(state.conv.defined()?state.conv.clone():Tensor(),
+                                                    state.recurrent.defined()?state.recurrent.clone():Tensor());
+    auto restore=[&](){for(size_t i=0;i<states_.size();++i)if(saved[i].first.defined()){
+      states_[i].conv.copy_(saved[i].first);states_[i].recurrent.copy_(saved[i].second);
+    }};
+    struct Reset {bool& flag;~Reset(){flag=false;}} reset{verifying_graph_};
+    verifying_graph_=true;
+    C10_CUDA_CHECK(cudaDeviceSynchronize());
+    auto stream=c10::cuda::getStreamFromPool(false,device_);
+    {
+      c10::cuda::CUDAStreamGuard guard(stream);
+      graph.hidden=step(graph.embeddings,graph.positions);
+      graph.candidates=local_candidates(norm(graph.hidden,"model.language_model.norm"));
+      restore();C10_CUDA_CHECK(cudaStreamSynchronize(stream));
+      graph.graph=std::make_unique<at::cuda::CUDAGraph>();graph.graph->capture_begin();
+      graph.hidden=step(graph.embeddings,graph.positions);
+      graph.candidates=local_candidates(norm(graph.hidden,"model.language_model.norm"));
+      graph.graph->capture_end();
+      // Capture records operations; the warmup state was restored before capture.
+      graph.trajectories=verify_recurrent_;graph.conv_inputs=verify_conv_;
+    }
+    ++verify_graph_builds_;
+  }else{
+    graph.embeddings.copy_(embeddings);graph.positions.copy_(positions);
+  }
+  // Other eager verification shapes may have replaced these host tensor handles.
+  verify_recurrent_=graph.trajectories;verify_conv_=graph.conv_inputs;
+  graph.graph->replay();++verify_graph_replays_;
+  return {graph.hidden,graph.candidates};
 }
 
 void Engine::advance_draft(Tensor embeddings,Tensor positions,Tensor target_hidden){
@@ -131,7 +179,7 @@ SpeculativeResult Engine::speculate(int64_t pending,int64_t position,int consume
   auto hidden=previous;
   for(int i=0;i<count;++i){
     hidden=draft_one(inputs.back(),position+i,hidden);
-    int64_t token=gather_candidates(local_candidates(hidden))[0];proposals.push_back(token);inputs.push_back(token);
+    int64_t token=gather_candidates(draft_candidates_.defined()?draft_candidates_:local_candidates(hidden))[0];proposals.push_back(token);inputs.push_back(token);
     if(std::find(eos.begin(),eos.end(),token)!=eos.end())break;
   }
   auto host=at::empty({int64_t(inputs.size())},at::TensorOptions().dtype(at::kLong));
@@ -141,11 +189,14 @@ SpeculativeResult Engine::speculate(int64_t pending,int64_t position,int consume
   for(const auto& state:states_)if(state.key.defined()){TORCH_CHECK(state.length==consumed,"Target KV length mismatch");}
   struct Restore {bool& v;~Restore(){v=false;}} restore{verifying_};
   verifying_=true;
-  auto target_hidden=step(embeddings,positions);
+  Tensor target_hidden,captured_candidates;
+  if(options_.mtp_verify_graph&&!select&&inputs.size()==size_t(options_.mtp_tokens+1)){
+    auto result=verify_graph(embeddings,positions,consumed);target_hidden=result.first;captured_candidates=result.second;
+  }else target_hidden=step(embeddings,positions);
   verifying_=false;
   Tensor values;std::vector<int64_t> choices;
   if(select)values=logits(target_hidden);
-  else choices=gather_candidates(local_candidates(norm(target_hidden,"model.language_model.norm")));
+  else choices=gather_candidates(captured_candidates.defined()?captured_candidates:local_candidates(norm(target_hidden,"model.language_model.norm")));
   GreedyVerification decision(proposals,budget,eos);
   for(int i=0;!decision.done;++i){
     TORCH_CHECK(i<target_hidden.size(0),"Verification row out of range");

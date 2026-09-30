@@ -33,6 +33,8 @@ int main(int argc,char** argv) {
       if(key=="--gdn-chunk"){gdn_chunk=true;continue;}
       if(key=="--flash-prefill"){options.flash_prefill=true;continue;}
       if(key=="--gdn-cooperative"){options.gdn_cooperative=true;continue;}
+      if(key=="--gdn-wy"){options.gdn_wy=true;continue;}
+      if(key=="--mtp-verify-graph"){options.mtp_verify_graph=true;continue;}
       if(key=="--fused-gdn-conv"){options.fused_gdn_conv=true;continue;}
       if(key=="--bf16-tp-reduce"){options.bf16_tp_reduce=true;continue;}
       if(key=="--cache-vision-weights"){options.cache_vision_weights=true;continue;}
@@ -138,6 +140,7 @@ int main(int argc,char** argv) {
       result["mtp"]={{"window",options.mtp_tokens},{"rounds",rounds},{"proposed",proposed},{"accepted",accepted}};
       result["weight_cache_bytes"]=options.weight_cache_bytes;
       result["mtp_draft_graph"]=draft_graph;
+      result["cache"]=engine.cache_stats();
       result["gdn_chunk"]=gdn_chunk;
       std::ofstream f(output); f<<result.dump(2)<<"\n"; TORCH_CHECK(f.good(),"Cannot write output");
       std::cerr<<"Finished "<<generated.size()<<" tokens; output "<<output<<"\n";

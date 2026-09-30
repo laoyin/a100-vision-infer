@@ -2,6 +2,8 @@
 #include <ATen/ATen.h>
 #include <utility>
 namespace avi {
+at::Tensor delta_scan_wy(at::Tensor q,at::Tensor k,at::Tensor v,at::Tensor g,at::Tensor beta,at::Tensor state,int chunk=32);
+at::Tensor gqa_chunk_dynamic(at::Tensor q,at::Tensor k,at::Tensor v,at::Tensor keys,at::Tensor values,at::Tensor offset);
 at::Tensor flash_prefill(at::Tensor q,at::Tensor keys,at::Tensor values);
 at::Tensor fp8_linear(at::Tensor x,at::Tensor codes,at::Tensor scales,bool vector_gemv=false);
 at::Tensor fused_rms(at::Tensor x,at::Tensor weight,double eps,bool one_center);

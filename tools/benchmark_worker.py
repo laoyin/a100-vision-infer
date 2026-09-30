@@ -26,6 +26,9 @@ def main():
  p.add_argument('--gdn-chunk',action='store_true')
  p.add_argument('--flash-prefill',action='store_true')
  p.add_argument('--gdn-cooperative',action='store_true')
+ p.add_argument('--gdn-wy',action='store_true')
+ p.add_argument('--mtp-verify-graph',action='store_true')
+ p.add_argument('--profile-kernels',action='store_true')
  p.add_argument('--fused-gdn-conv',action='store_true')
  p.add_argument('--bf16-tp-reduce',action='store_true')
  p.add_argument('--frontend-format',choices=['hf','vllm-string'],default='hf')
@@ -66,6 +69,9 @@ def main():
  if a.gdn_chunk:cmd+=['--gdn-chunk']
  if a.flash_prefill:cmd+=['--flash-prefill']
  if a.gdn_cooperative:cmd+=['--gdn-cooperative']
+ if a.gdn_wy:cmd+=['--gdn-wy']
+ if a.mtp_verify_graph:cmd+=['--mtp-verify-graph']
+ if a.profile_kernels:cmd+=['--profile-kernels']
  if a.fused_gdn_conv:cmd+=['--fused-gdn-conv']
  if a.bf16_tp_reduce:cmd+=['--bf16-tp-reduce']
  if a.profile_stages:cmd+=['--profile-stages']
@@ -84,7 +90,7 @@ def main():
   return event
  def run(count,prefix):
   nonlocal prompt_ids
-  submitted=0;running=set();results=[];mtp={};stages={};started={};first={};paths={};frontend_seconds={};start=time.monotonic();deadline=start+a.timeout
+  submitted=0;running=set();results=[];mtp={};stages={};kernels={};started={};first={};paths={};frontend_seconds={};start=time.monotonic();deadline=start+a.timeout
   while len(results)<count:
    while submitted<count and len(running)<a.concurrency:
     name=prefix+str(submitted);running.add(name);submitted+=1
@@ -102,9 +108,11 @@ def main():
    if event.get('event')=='token' and event.get('id') in started:first.setdefault(event['id'],time.monotonic()-started[event['id']])
    if event.get('event')=='mtp_stats':mtp[event['id']]=event
    if event.get('event')=='stage_stats':stages[event['id']]=event
+   if event.get('event')=='kernel_stats':kernels[event['id']]=event
    if event.get('event')=='done' and event.get('id') in running:
     event['mtp']=mtp.get(event['id'])
     event['stages']=stages.get(event['id'])
+    event['kernel_times']=kernels.get(event['id'])
     if frontend:
      event['text']=frontend.processor.tokenizer.decode(event['generated_ids'],skip_special_tokens=True)
      event['native_worker_seconds']=event['total_seconds']
@@ -127,7 +135,8 @@ def main():
   report.update(mtp_tokens=a.mtp_tokens,weight_cache_mib=a.weight_cache_mib,mtp_draft_graph=a.mtp_draft_graph)
   report['gdn_chunk']=a.gdn_chunk
   report.update(flash_prefill=a.flash_prefill,cache_vision_weights=a.cache_vision_weights)
-  report['synchronized_diagnostic']=a.profile_stages
+  report['synchronized_diagnostic']=a.profile_stages or a.profile_kernels
+  report.update(gdn_wy=a.gdn_wy,mtp_verify_graph=a.mtp_verify_graph,profile_kernels=a.profile_kernels)
   report.update(fused_gdn_conv=a.fused_gdn_conv,gdn_cooperative=a.gdn_cooperative,bf16_tp_reduce=a.bf16_tp_reduce,frontend_format=a.frontend_format,frontend_threads=a.frontend_threads,bf16_patches=a.bf16_patches,spool_dir=a.spool_dir)
   report['timing_scope']='CPU image decode/tokenization/preprocessing + disk IPC + native inference + output decoding' if frontend else 'prepared input + native inference'
   report['prompt_token_ids']=prompt_ids

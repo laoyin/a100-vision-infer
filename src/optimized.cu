@@ -170,6 +170,29 @@ Tensor delta_scan_fast(Tensor q,Tensor k,Tensor v,Tensor g,Tensor beta,Tensor st
  else { TORCH_CHECK(false,"Register GDN supports K=16 or 128"); }C10_CUDA_KERNEL_LAUNCH_CHECK();return y;
 }
 
+__global__ void append_chunk(const bf* k,const bf* v,bf* keys,bf* values,const int64_t* offset,int n,int stride){
+  int i=blockIdx.x*256+threadIdx.x;
+  if(i<n){keys[offset[0]*stride+i]=k[i];values[offset[0]*stride+i]=v[i];}
+}
+Tensor gqa_chunk_dynamic(Tensor q,Tensor k,Tensor v,Tensor keys,Tensor values,Tensor offset){
+  q=q.contiguous();k=k.contiguous();v=v.contiguous();
+  TORCH_CHECK(q.is_cuda()&&q.dim()==3&&k.dim()==3&&keys.dim()==3&&q.scalar_type()==at::kBFloat16&&
+      k.scalar_type()==q.scalar_type()&&v.scalar_type()==q.scalar_type()&&keys.scalar_type()==q.scalar_type()&&
+      values.scalar_type()==q.scalar_type()&&v.sizes()==k.sizes()&&values.sizes()==keys.sizes()&&
+      keys.is_contiguous()&&values.is_contiguous(),"Invalid dynamic GQA tensors");
+  int T=q.size(0),H=q.size(1),D=q.size(2),HK=k.size(1),P=(keys.size(0)+255)/256;
+  TORCH_CHECK(T>0&&T<=8&&HK>0&&H%HK==0&&D>0&&D<=512&&k.size(0)==T&&k.size(2)==D&&
+      keys.size(1)==HK&&keys.size(2)==D&&keys.size(0)>=T&&offset.numel()==1&&
+      offset.scalar_type()==at::kLong&&offset.device()==q.device()&&k.device()==q.device()&&
+      v.device()==q.device()&&keys.device()==q.device()&&values.device()==q.device(),"Invalid dynamic GQA geometry");
+  auto out=at::empty_like(q),partial=at::empty({T,H,P,D},q.options().dtype(at::kFloat));
+  auto stats=at::empty({T,H,P,2},q.options().dtype(at::kFloat));auto stream=at::cuda::getCurrentCUDAStream();
+  // Caller checks offset+T against capacity before capture/replay.
+  append_chunk<<<(T*HK*D+255)/256,256,0,stream>>>(ptr(k),ptr(v),outptr(keys),outptr(values),offset.data_ptr<int64_t>(),T*HK*D,HK*D);
+  attention_parts<<<dim3(H,P,T),256,0,stream>>>(ptr(q),ptr(keys),ptr(values),offset.data_ptr<int64_t>(),partial.data_ptr<float>(),stats.data_ptr<float>(),H,HK,D,P);
+  attention_merge<<<T*H,256,0,stream>>>(partial.data_ptr<float>(),stats.data_ptr<float>(),outptr(out),D,P);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();return out;
+}
 // Parallel causal queries over a shared KV prefix; no repeated GQA keys or dense mask.
 Tensor gqa_chunk(Tensor q,Tensor k,Tensor v,Tensor keys,Tensor values,int old){
  q=q.contiguous();k=k.contiguous();v=v.contiguous();

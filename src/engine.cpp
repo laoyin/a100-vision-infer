@@ -15,6 +15,30 @@
 #include <functional>
 #include <algorithm>
 namespace avi {
+struct ProfileEvent {
+  cudaEvent_t start=nullptr,end=nullptr;std::string label;
+  ~ProfileEvent(){if(start)cudaEventDestroy(start);if(end)cudaEventDestroy(end);}
+};
+size_t Engine::profile_begin(const std::string& label){
+  if(!options_.profile_kernels)return std::numeric_limits<size_t>::max();
+  auto event=std::make_shared<ProfileEvent>();event->label=label;
+  C10_CUDA_CHECK(cudaEventCreate(&event->start));C10_CUDA_CHECK(cudaEventCreate(&event->end));
+  C10_CUDA_CHECK(cudaEventRecord(event->start,at::cuda::getCurrentCUDAStream()));
+  profile_events_.push_back(event);return profile_events_.size()-1;
+}
+void Engine::profile_end(size_t index){
+  if(index!=std::numeric_limits<size_t>::max())C10_CUDA_CHECK(cudaEventRecord(profile_events_.at(index)->end,at::cuda::getCurrentCUDAStream()));
+}
+json Engine::profile_report(){
+  json report=json::object();if(!options_.profile_kernels)return report;
+  C10_CUDA_CHECK(cudaDeviceSynchronize());
+  for(const auto& event:profile_events_){
+    float ms=0;C10_CUDA_CHECK(cudaEventElapsedTime(&ms,event->start,event->end));
+    auto& row=report[event->label];if(row.is_null())row={{"calls",0},{"cuda_ms",0.0}};
+    row["calls"]=row["calls"].get<int>()+1;row["cuda_ms"]=row["cuda_ms"].get<double>()+ms;
+  }
+  profile_events_.clear();return report;
+}
 json read_json(const std::string& file) { std::ifstream f(file); TORCH_CHECK(f.good(),"Cannot open ",file); json j; f>>j; return j; }
 static Tensor raw(const std::string& dir,const json& d,int device) {
   auto relative=std::filesystem::path(d.at("file").get<std::string>());
@@ -44,6 +68,7 @@ Engine::Engine(const std::string& dir,int rank,int world,int device,ncclComm_t c
   config_=manifest.at("config"); text_=config_.at("text_config"); vision_=config_.at("vision_config");
   TORCH_CHECK(config_.at("model_type")=="qwen3_5","Only qwen3_5 dense supported");
   TORCH_CHECK(options_.mtp_tokens>=0&&options_.mtp_tokens<=5,"MTP window must be 0..5");
+  TORCH_CHECK(!options_.mtp_verify_graph||options_.mtp_tokens>0,"Verification graph requires MTP");
   if(options_.mtp_tokens){
     TORCH_CHECK(options_.optimized&&manifest.value("native_mtp",false),"MTP requires optimized mode and an artifact imported with --include-mtp");
     TORCH_CHECK(text_.value("mtp_num_hidden_layers",0)==1&&!text_.value("mtp_use_dedicated_embeddings",false),"Only shared-embedding single-layer MTP supported");
@@ -146,14 +171,15 @@ Tensor Engine::tensor(const std::string& name) {
 Tensor Engine::read_input(const std::string& dir,const json& d) { return raw(dir,d,device_); }
 Tensor Engine::sum(Tensor x) {
   if(world_==1) return x;
+  auto timing=profile_begin("tp.reduce");
   if(options_.bf16_tp_reduce&&x.scalar_type()==at::kBFloat16){
     auto output=x.contiguous();
     auto status=ncclAllReduce(output.data_ptr(),output.data_ptr(),output.numel(),ncclBfloat16,ncclSum,comm_,at::cuda::getCurrentCUDAStream());
-    TORCH_CHECK(status==ncclSuccess,ncclGetErrorString(status));return output;
+    TORCH_CHECK(status==ncclSuccess,ncclGetErrorString(status));profile_end(timing);return output;
   }
   auto f=x.to(at::kFloat).contiguous();
   auto r=ncclAllReduce(f.data_ptr(),f.data_ptr(),f.numel(),ncclFloat,ncclSum,comm_,at::cuda::getCurrentCUDAStream());
-  TORCH_CHECK(r==ncclSuccess,ncclGetErrorString(r)); return f.to(x.scalar_type());
+  TORCH_CHECK(r==ncclSuccess,ncclGetErrorString(r));auto output=f.to(x.scalar_type());profile_end(timing);return output;
 }
 Tensor Engine::linear(Tensor x,const std::string& name,bool reduce) {
   auto mixed=mixed_projections_.find(name);
@@ -161,6 +187,7 @@ Tensor Engine::linear(Tensor x,const std::string& name,bool reduce) {
   auto it=weights_.find(name+".weight"); TORCH_CHECK(it!=weights_.end(),"Missing linear ",name);
   auto& w=it->second; Tensor y;
   TORCH_CHECK(w.data.dim()>=2,"Invalid matrix ",name);
+  auto timing=profile_begin(name=="lm_head"?"linear.head":name.rfind("model.visual.",0)==0?"linear.vision":name.rfind("mtp.",0)==0?"linear.mtp":"linear.text");
   auto cached=decoded_weights_.find(name+".weight");
   if(cached!=decoded_weights_.end()&&x.numel()/x.size(-1)>1){
     y=at::matmul(x,cached->second.t());
@@ -180,6 +207,7 @@ Tensor Engine::linear(Tensor x,const std::string& name,bool reduce) {
     auto matrix=w.data.reshape({w.data.size(0),-1});
     y=at::matmul(x,matrix.t());
   }
+  profile_end(timing);
   if(reduce) y=sum(y);
   auto b=weights_.find(name+".bias"); if(b!=weights_.end()) y=y+b->second.data;
   return y;
@@ -243,6 +271,11 @@ Tensor Engine::full_attention(Tensor x,Tensor positions,int layer,const std::str
   auto& state=external?*external:states_.at(layer);
   TORCH_CHECK(decode_mode_ || state.length+T<=session_capacity(),"KV capacity exceeded");
   if(!state.key.defined()) { state.key=at::empty({session_capacity(),HK,D},x.options()); state.value=at::empty_like(state.key); }
+  if(verifying_graph_){
+    auto out=gqa_chunk_dynamic(q,k,v,state.key,state.value,decode_offset_).reshape({T,H*D});
+    out=options_.extra_fusions?fused_sigmoid_gate(out,gate):out*gate.sigmoid();
+    return finish?linear(out,p+".o_proj",true):out;
+  }
   if(options_.optimized&&!decode_mode_&&T<=8){
     auto out=gqa_chunk(q,k,v,state.key,state.value,state.length).reshape({T,H*D});state.length+=T;
     out=options_.extra_fusions?fused_sigmoid_gate(out,gate):out*gate.sigmoid();
@@ -308,9 +341,12 @@ Tensor Engine::delta_attention(Tensor x,int layer,const std::string& p,Tensor pr
     if(!buffer.defined()||buffer.size(0)<T)buffer=at::empty({options_.mtp_tokens+1,H,K,V},s.recurrent.options());
     trajectory=buffer.narrow(0,0,T);
   }
+  auto scan_timing=profile_begin("gdn.scan");
   Tensor result;
-  if(gdn_chunk_enabled_&&!verifying_&&!decode_mode_&&T>=32)result=delta_scan_chunked(q,k,v,g,beta,s.recurrent);
+  if(options_.gdn_wy&&!verifying_&&!decode_mode_&&T>=32)result=delta_scan_wy(q,k,v,g,beta,s.recurrent);
+  else if(gdn_chunk_enabled_&&!verifying_&&!decode_mode_&&T>=32)result=delta_scan_chunked(q,k,v,g,beta,s.recurrent);
   else result=(options_.optimized&&(K==128||K==16))?delta_scan_fast(q,k,v.contiguous(),g.contiguous(),beta.contiguous(),s.recurrent,trajectory,options_.gdn_cooperative):delta_scan(q,k,v.contiguous(),g.contiguous(),beta.contiguous(),s.recurrent);
+  profile_end(scan_timing);
   auto z=(options_.optimized?projected.narrow(-1,C,H*V):linear(x,p+".in_proj_z")).reshape({T,H,V});
   result=(options_.optimized&&options_.extra_fusions)?fused_rms_gate(result,tensor(p+".norm.weight"),z,eps_):(norm(result,p+".norm",false).to(at::kFloat)*at::silu(z.to(at::kFloat))).to(at::kBFloat16);
   result=result.reshape({T,H*V});return finish?linear(result,p+".out_proj",true):result;
@@ -402,7 +438,7 @@ struct DecodeGraph {std::unique_ptr<at::cuda::CUDAGraph> graph;Tensor ids,positi
 Engine::~Engine(){
   // NCCL capture retains communicator resources until graph destruction.
   // The owning executable keeps the communicator alive through this destructor.
-  cudaDeviceSynchronize();graphs_.clear();draft_graphs_.clear();draft_graph_pool_.clear();
+  cudaDeviceSynchronize();verify_graphs_.clear();graphs_.clear();draft_graphs_.clear();draft_graph_pool_.clear();
 }
 int Engine::session_capacity() const {
     auto it=session_capacities_.find(active_);return it==session_capacities_.end()?capacity_:it->second;
@@ -420,7 +456,7 @@ int Engine::session_capacity() const {
 }
 void Engine::drop(int id) {
   C10_CUDA_CHECK(cudaDeviceSynchronize());release_draft(id);
-  graphs_.erase(id);session_capacities_.erase(id);
+  verify_graphs_.erase(id);graphs_.erase(id);session_capacities_.erase(id);
   if(id==active_)states_=std::vector<State>(text_.at("num_hidden_layers").get<int>());else sessions_.erase(id);
 }
 Tensor Engine::decode(int64_t token,int64_t position,int consumed) {
@@ -506,7 +542,7 @@ Tensor Engine::restore_prefix(const std::string& key) {
     if(src.conv.defined()){dst.conv=src.conv.to(at::Device(at::kCUDA,device_),src.conv.scalar_type(),false,true);dst.recurrent=src.recurrent.to(at::Device(at::kCUDA,device_),src.recurrent.scalar_type(),false,true);}}
   return entry.logits.to(at::Device(at::kCUDA,device_),entry.logits.scalar_type(),false,true);
 }
-json Engine::cache_stats() const {return {{"image_bytes",image_bytes_},{"prefix_bytes",prefix_bytes_},{"image_hits",image_hits_},{"prefix_hits",prefix_hits_},{"host_prefix_bytes",host_prefix_bytes_},{"host_prefix_hits",host_prefix_hits_}};}
+json Engine::cache_stats() const {return {{"verify_graph_builds",verify_graph_builds_},{"verify_graph_replays",verify_graph_replays_},{"image_bytes",image_bytes_},{"prefix_bytes",prefix_bytes_},{"image_hits",image_hits_},{"prefix_hits",prefix_hits_},{"host_prefix_bytes",host_prefix_bytes_},{"host_prefix_hits",host_prefix_hits_}};}
 std::string request_hash(const std::string& dir,const json& request) {
   std::unique_ptr<EVP_MD_CTX,decltype(&EVP_MD_CTX_free)> context(EVP_MD_CTX_new(),EVP_MD_CTX_free);
   TORCH_CHECK(context&&EVP_DigestInit_ex(context.get(),EVP_sha256(),nullptr)==1,"SHA256 initialization failed");

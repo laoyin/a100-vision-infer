@@ -42,3 +42,5 @@ upstream-mtp-*/
 native-mtp-*/
 prefill-test-*/
 deep-test-*/
+
+graph-wy-test-*/

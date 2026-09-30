@@ -5,7 +5,7 @@ from pathlib import Path
 def main():
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--model',required=True);p.add_argument('--request',required=True)
     p.add_argument('--host-cache',action='store_true');p.add_argument('--worker',default='build/avi-worker');p.add_argument('--tp',type=int,default=2);p.add_argument('--cuda-graph',action='store_true')
-    p.add_argument('--tp-lm-head',action='store_true');p.add_argument('--vector-gemv',action='store_true');p.add_argument('--mtp-tokens',type=int,default=0);p.add_argument('--mtp-draft-graph',action='store_true');a=p.parse_args()
+    p.add_argument('--tp-lm-head',action='store_true');p.add_argument('--vector-gemv',action='store_true');p.add_argument('--mtp-tokens',type=int,default=0);p.add_argument('--mtp-draft-graph',action='store_true');p.add_argument('--mtp-verify-graph',action='store_true');a=p.parse_args()
     req=json.loads((Path(a.request)/'request.json').read_text())
     cmd=['mpirun','-np',str(a.tp),a.worker,'--model',a.model,'--max-context',str(req['max_context']),
          '--max-concurrency','2','--prefill-chunk','4']+(['--cuda-graph'] if a.cuda_graph else [])
@@ -14,6 +14,7 @@ def main():
     if a.vector_gemv:cmd+=['--vector-gemv']
     if a.mtp_tokens:cmd+=['--mtp-tokens',str(a.mtp_tokens)]
     if a.mtp_draft_graph:cmd+=['--mtp-draft-graph']
+    if a.mtp_verify_graph:cmd+=['--mtp-verify-graph']
     variants=Path(temp.name)
     if a.host_cache:
         config=json.loads((Path(a.model)/'manifest.json').read_text())['config']['text_config'];tp=a.tp

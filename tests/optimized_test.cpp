@@ -137,6 +137,29 @@ void run_optimized_tests(){
   }
   TORCH_CHECK(at::equal(keys.narrow(0,0,old+T),refk.narrow(0,0,old+T)),"Chunk KV append mismatch");
  }
+ // WY batching must preserve recurrence across full/partial chunks and calls.
+ for(int K:{16,128})for(int T:{1,31,32,33,129})for(float decay:{.1f,20.f}){
+  int H=2,V=17;
+  auto q=avi::fused_l2(at::randn({T,H,K},opt).to(at::kBFloat16));
+  auto k=avi::fused_l2(at::randn_like(q)),v=at::randn({T,H,V},opt).to(at::kBFloat16);
+  auto g=-at::rand({T,H},opt)*decay,b=at::rand({T,H},opt);
+  auto state=at::randn({H,K,V},opt),reference=state.clone();
+  auto expected=avi::delta_scan_fast(q,k,v,g,b,reference);
+  auto actual=avi::delta_scan_wy(q,k,v,g,b,state);
+  TORCH_CHECK(at::allclose(actual.to(at::kFloat),expected.to(at::kFloat),.02,.003),"Batched WY output mismatch");
+  TORCH_CHECK(at::allclose(state,reference,.001,.0001),"Batched WY final state mismatch");
+ }
+ for(int T:{1,2,4,6})for(int old:{0,3,255,257}){
+  int H=6,HK=2,D=128;
+  auto q=at::randn({T,H,D},opt).to(at::kBFloat16),k=at::randn({T,HK,D},opt).to(at::kBFloat16),v=at::randn_like(k);
+  auto keys=at::randn({521,HK,D},opt).to(at::kBFloat16),values=at::randn_like(keys);
+  auto refk=keys.clone(),refv=values.clone();
+  auto offset=at::full({1},old,opt.dtype(at::kLong));
+  auto actual=avi::gqa_chunk_dynamic(q,k,v,keys,values,offset);
+  auto expected=avi::gqa_chunk(q,k,v,refk,refv,old);
+  TORCH_CHECK(at::allclose(actual.to(at::kFloat),expected.to(at::kFloat),.01,.01),"Dynamic prefix GQA output mismatch");
+  TORCH_CHECK(at::equal(keys,refk)&&at::equal(values,refv),"Dynamic prefix GQA writes outside appended range");
+ }
  // Nonzero recurrent states, long prefixes, partial value tiles and rollback.
  for(int K:{16,128})for(int T:{1,4,33,513})for(int V:{17,32,128}){
   auto q=avi::fused_l2(at::randn({T,2,K},opt).to(at::kBFloat16));

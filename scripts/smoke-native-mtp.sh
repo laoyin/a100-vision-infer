@@ -12,9 +12,10 @@ for tp in 1 2; do
   mpirun -np "$tp" ./build/avi-infer --model "$root/tp$tp" --request "$root/request" \
    --output "$root/tp$tp-mtp$window.json" --mtp-tokens "$window" --tp-lm-head --vector-gemv --prefill-chunk 4
  done
- for variant in graph cached; do
+ for variant in graph cached verify; do
   flags=(--mtp-draft-graph)
   if [[ "$variant" == cached ]]; then flags=(--weight-cache-mib 64); fi
+  if [[ "$variant" == verify ]]; then flags=(--mtp-draft-graph --mtp-verify-graph --gdn-cooperative --fused-gdn-conv --bf16-tp-reduce); fi
   mpirun -np "$tp" ./build/avi-infer --model "$root/tp$tp" --request "$root/request" \
    --output "$root/tp$tp-mtp-$variant.json" --mtp-tokens 3 --tp-lm-head --vector-gemv --prefill-chunk 4 "${flags[@]}"
  done
@@ -22,3 +23,4 @@ for tp in 1 2; do
 done
 python tools/test_worker.py --model "$root/tp2" --request "$root/request" --tp 2 --tp-lm-head --vector-gemv --mtp-tokens 3
 python tools/test_worker.py --model "$root/tp2" --request "$root/request" --tp 2 --tp-lm-head --vector-gemv --mtp-tokens 3 --mtp-draft-graph
+python tools/test_worker.py --model "$root/tp2" --request "$root/request" --tp 2 --tp-lm-head --vector-gemv --mtp-tokens 3 --mtp-draft-graph --mtp-verify-graph

@@ -77,8 +77,11 @@ int main(int argc,char** argv){
       if(key=="--mtp-draft-graph"){draft_graph=true;continue;}
       if(key=="--gdn-chunk"){gdn_chunk=true;continue;}
       if(key=="--profile-stages"){profile_stages=true;continue;}
+      if(key=="--profile-kernels"){options.profile_kernels=true;continue;}
       if(key=="--flash-prefill"){options.flash_prefill=true;continue;}
       if(key=="--gdn-cooperative"){options.gdn_cooperative=true;continue;}
+      if(key=="--gdn-wy"){options.gdn_wy=true;continue;}
+      if(key=="--mtp-verify-graph"){options.mtp_verify_graph=true;continue;}
       if(key=="--fused-gdn-conv"){options.fused_gdn_conv=true;continue;}
       if(key=="--bf16-tp-reduce"){options.bf16_tp_reduce=true;continue;}
       if(key=="--cache-vision-weights"){options.cache_vision_weights=true;continue;}
@@ -90,6 +93,7 @@ int main(int argc,char** argv){
    else if(key=="--image-cache-mib")options.image_cache_bytes=std::stoull(value)<<20;else if(key=="--prefix-cache-mib")options.prefix_cache_bytes=std::stoull(value)<<20;else { TORCH_CHECK(false,"Unknown option ",key); }
   }
   TORCH_CHECK(!model.empty()&&capacity>0&&chunk>0&&concurrency>0&&concurrency<=8,"Invalid worker configuration");
+  if(options.profile_kernels){draft_graph=false;options.mtp_verify_graph=false;options.cuda_graph=false;}
   if(options.mtp_tokens){options.prefix_cache_bytes=0;options.host_prefix_cache_bytes=0;}
   TORCH_CHECK(!draft_graph||options.mtp_tokens>0,"Draft Graph requires --mtp-tokens");
   int nlocal,count;MPI_Comm_size(host,&nlocal);TORCH_CHECK(nlocal==world&&(world==1||world==2||world==4),"Use 1/2/4 local ranks");
@@ -227,6 +231,7 @@ int main(int argc,char** argv){
     auto eos=j.req.at("eos_token_ids").get<std::vector<int64_t>>();if(std::find(eos.begin(),eos.end(),token)!=eos.end())j.finish="eos";else if(j.generated.size()>=j.req.at("max_new_tokens").get<size_t>())j.finish="length";
    }
    for(auto it=active.begin();it!=active.end();){auto& j=it->second;if(j.finish.empty()){++it;continue;}
+     if(options.profile_kernels)emit(rank,{{"event","kernel_stats"},{"id",j.id},{"timings",engine.profile_report()},{"eager_diagnostic",true}});
      if(profile_stages)emit(rank,{{"event","stage_stats"},{"id",j.id},{"vision_seconds",j.vision_seconds},{"text_prefill_seconds",j.prefill_seconds},{"synchronized_diagnostic",true}});
      emit(rank,{{"event","mtp_stats"},{"id",j.id},{"window",options.mtp_tokens},{"rounds",j.mtp_rounds},{"proposed",j.mtp_proposed},{"accepted",j.mtp_accepted}});
     emit(rank,{{"event","done"},{"id",j.id},{"finish_reason",j.finish},{"generated_ids",j.generated},{"input_tokens",j.initialized?j.ids.numel():0},{"ttft_seconds",j.first_token},{"total_seconds",age(j.submitted)},{"cache",engine.cache_stats()},{"json_complete",j.options.value("json_object",false)&&j.grammar.complete()}});

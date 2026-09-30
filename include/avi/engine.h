@@ -13,10 +13,12 @@ using json = nlohmann::json;
 Tensor fp8_decode(Tensor codes, Tensor scales);
 Tensor delta_scan(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, Tensor state);
 struct Weight { Tensor data, scale; };
-struct EngineOptions { bool optimized=true; bool extra_fusions=false; bool cublas_prefill=false; bool cuda_graph=false; bool tp_lm_head=false; bool reference_prefill=false; bool vector_gemv=false; bool flash_prefill=false; bool cache_vision_weights=false; bool gdn_cooperative=false; bool fused_gdn_conv=false; bool bf16_tp_reduce=false; int mtp_tokens=0; size_t weight_cache_bytes=0; size_t image_cache_bytes=256ULL<<20; size_t prefix_cache_bytes=512ULL<<20; size_t host_prefix_cache_bytes=0; };
+struct EngineOptions { bool optimized=true; bool extra_fusions=false; bool cublas_prefill=false; bool cuda_graph=false; bool tp_lm_head=false; bool reference_prefill=false; bool vector_gemv=false; bool flash_prefill=false; bool cache_vision_weights=false; bool gdn_cooperative=false; bool fused_gdn_conv=false; bool bf16_tp_reduce=false; bool gdn_wy=false; bool mtp_verify_graph=false; bool profile_kernels=false; int mtp_tokens=0; size_t weight_cache_bytes=0; size_t image_cache_bytes=256ULL<<20; size_t prefix_cache_bytes=512ULL<<20; size_t host_prefix_cache_bytes=0; };
 struct SpeculativeResult { std::vector<int64_t> tokens; int consumed=0,proposed=0,accepted=0; };
 struct DecodeGraph;
 struct DraftGraph;
+struct VerifyGraph;
+struct ProfileEvent;
 class Engine {
  public:
   Engine(const std::string& model_dir, int rank, int world, int device, ncclComm_t comm, int capacity, EngineOptions options={});
@@ -29,6 +31,7 @@ class Engine {
   void save_prefix(const std::string& key,Tensor logits);
   Tensor restore_prefix(const std::string& key);
   json cache_stats() const;
+  json profile_report();
   Tensor vision(const std::string& request_dir, const json& request);
   Tensor step(Tensor embeddings, Tensor positions);
   void set_trace_prefix(const std::string& prefix) { trace_prefix_=prefix; }
@@ -64,6 +67,14 @@ class Engine {
   void advance_draft(Tensor embeddings,Tensor positions,Tensor target_hidden);
   Tensor project_logits(Tensor normalized);
   bool verifying_=false;
+  bool verifying_graph_=false;
+  Tensor draft_candidates_;
+  std::unordered_map<int,std::shared_ptr<VerifyGraph>> verify_graphs_;
+  std::pair<Tensor,Tensor> verify_graph(Tensor embeddings,Tensor positions,int consumed);
+  uint64_t verify_graph_builds_=0,verify_graph_replays_=0;
+  size_t profile_begin(const std::string& label);
+  void profile_end(size_t index);
+  std::vector<std::shared_ptr<ProfileEvent>> profile_events_;
   bool gdn_chunk_enabled_=false;
   std::vector<Tensor> verify_recurrent_,verify_conv_;
   std::unordered_map<std::string,Tensor> decoded_weights_;
