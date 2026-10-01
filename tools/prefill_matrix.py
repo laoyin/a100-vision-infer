@@ -57,16 +57,58 @@ def fused_profiles(frontend,gdn):
     ]
 
 
-def tensor_exercised(report):
+def counter_exercised(report,key):
     # This suite measures sequential C1 requests. A cumulative warmup counter
     # alone must not make an unexercised measured request pass.
-    previous=(report.get('warmup_cache_baseline') or {}).get('gdn_tensor_calls',0)
+    previous=(report.get('warmup_cache_baseline') or {}).get(key,0)
     for row in report.get('results',[]):
-        current=(row.get('cache') or {}).get('gdn_tensor_calls',0)
+        current=(row.get('cache') or {}).get(key,0)
         if current<=previous:
             return False
         previous=current
     return bool(report.get('results'))
+
+
+def tensor_exercised(report):
+    return counter_exercised(report,'gdn_tensor_calls')
+
+
+def tiled_profiles(frontend,gdn,tilelang_dir=None):
+    base=frontend+gdn+['--bf16-tp-reduce','--fused-gdn-prepare']
+    graph=['--mtp-verify-graph','--reuse-verify-graph']
+    shared=['--multi-token-gemv-fp8']
+    old=base+graph+shared
+    fused=['--gdn-fused-solve']
+    tensor=['--gdn-tensor-prefill']
+    tc=['--fp8-tensor-small']
+    rows=[
+        ('reference',old,512,24576),
+        ('tensor-32',old+tensor+['--gdn-tensor-chunk','32'],512,24576),
+        ('tensor-64',old+tensor,512,24576),
+        ('fused-32',old+fused+['--gdn-tensor-chunk','32'],512,24576),
+        ('fused-64',old+fused,512,24576),
+        ('fp8-tensor-1',old+tc,512,24576),
+        ('fp8-tensor-4',old+tc+['--fp8-tensor-split','4'],512,24576),
+        ('combined-32',old+fused+tc+['--gdn-tensor-chunk','32'],512,24576),
+        ('combined-64-s4',old+fused+tc+['--fp8-tensor-split','4'],512,24576),
+        ('combined-2048',old+fused+tc+['--gdn-tensor-chunk','32'],2048,24576),
+        ('diagnostic-fused',base+shared+fused+tc+['--profile-stages','--profile-kernels'],512,24576),
+    ]
+    if tilelang_dir:
+        plugin=['--tilelang-dir',str(Path(tilelang_dir).resolve())]
+        tg=['--gdn-tilelang']
+        tf=['--tilelang-fp8']
+        rows += [
+            ('tilelang-gdn32',old+plugin+tg+['--gdn-tensor-chunk','32'],512,24576),
+            ('tilelang-gdn64',old+plugin+tg,512,24576),
+            ('tilelang-fp8-1',old+plugin+tf,512,24576),
+            ('tilelang-fp8-4',old+plugin+tf+['--fp8-tensor-split','4'],512,24576),
+            ('tilelang-combined32',old+plugin+tg+tf+['--gdn-tensor-chunk','32'],512,24576),
+            ('tilelang-combined64-s4',old+plugin+tg+tf+['--fp8-tensor-split','4'],512,24576),
+            ('tilelang-combined2048',old+plugin+tg+tf+['--gdn-tensor-chunk','32'],2048,24576),
+            ('diagnostic-tilelang',base+shared+plugin+tg+tf+['--profile-stages','--profile-kernels'],512,24576),
+        ]
+    return rows
 
 
 def tensor_profiles(frontend,gdn):
@@ -94,7 +136,8 @@ def main():
     p.add_argument('--requests', type=int, default=5)
     p.add_argument('--timeout', type=float, default=1800)
     p.add_argument('--max-pixels', type=int, default=4000000)
-    p.add_argument('--suite', choices=['prefill','deep','graph-wy','native-fused','gdn-tensor'], default='prefill')
+    p.add_argument('--suite', choices=['prefill','deep','graph-wy','native-fused','gdn-tensor','ampere-tiled'], default='prefill')
+    p.add_argument('--tilelang-dir',type=Path)
     a = p.parse_args()
     if a.requests < 1 or a.timeout <= 0:
         p.error('Invalid limits')
@@ -117,7 +160,7 @@ def main():
         ('flash-vision-cache32', ['--flash-prefill', '--cache-vision-weights'], 512, 32768),
         ('diagnostic', ['--flash-prefill', '--cache-vision-weights', '--profile-stages'], 512, 24576),
     ]
-    if a.suite in ('deep','graph-wy','native-fused','gdn-tensor'):
+    if a.suite in ('deep','graph-wy','native-fused','gdn-tensor','ampere-tiled'):
         common+=['--flash-prefill','--frontend-format','vllm-string']
         frontend=['--frontend-threads','4','--bf16-patches','--spool-dir','/dev/shm']
         gdn=['--gdn-cooperative','--fused-gdn-conv']
@@ -152,6 +195,8 @@ def main():
         profiles=fused_profiles(frontend,gdn)
     if a.suite=='gdn-tensor':
         profiles=tensor_profiles(frontend,gdn)
+    if a.suite=='ampere-tiled':
+        profiles=tiled_profiles(frontend,gdn,a.tilelang_dir)
     summary = {'suite':a.suite,'profiles': [], 'comparison': [], 'vllm_reports': str(a.vllm_results.resolve()),
                'note': 'vLLM reports are supplied separately (the deep test script generates them in this run). Measurements are sequential, not interleaved. Diagnostic synchronizes GPU and is excluded from speed comparisons.'}
     reference = None
@@ -165,7 +210,7 @@ def main():
                    '--max-pixels', str(a.max_pixels), '--timeout', str(a.timeout),
                    '--inherit-process-group']+common+flags
         code = run(command, a.out/(name+'.log'), a.timeout)
-        row = dict(name=name, exit_code=code, status='failed', log=str(a.out/(name+'.log')))
+        row = dict(name=name, flags=flags, prefill_chunk=chunk, exit_code=code, status='failed', log=str(a.out/(name+'.log')))
         if code == 0:
             report = json.loads(output.read_text(encoding='utf-8'))
             if name == 'reference':
@@ -178,6 +223,10 @@ def main():
                        stages=[r.get('stages') for r in report['results']],
                        kernel_times=[r.get('kernel_times') for r in report['results']],
                        graph_counters=[r.get('cache') for r in report['results']])
+            for flag,key in (('--gdn-fused-solve','gdn_fused_calls'),('--gdn-tilelang','gdn_tilelang_calls'),
+                             ('--fp8-tensor-small','fp8_tensor_calls'),('--tilelang-fp8','tilelang_fp8_calls')):
+                if flag in flags and not counter_exercised(report,key):
+                    row.update(status=key+'_not_exercised')
             if '--gdn-tensor-prefill' in flags and not tensor_exercised(report):
                 row.update(status='tensor_gdn_not_exercised')
             if '--mtp-verify-graph' in flags and not any((r.get('cache') or {}).get('verify_graph_replays',0)>0 for r in report['results']):
@@ -204,7 +253,7 @@ def main():
                                 'no_matching_cross_engine_comparison':not bool(ratios)}
     (a.out/'summary.json').write_text(json.dumps(summary,indent=2),encoding='utf-8')
     print(json.dumps(summary['acceptance']),flush=True)
-    if any(r['status'] != 'passed' for r in summary['profiles']) or (a.suite in ('deep','graph-wy','native-fused','gdn-tensor') and not ratios):
+    if any(r['status'] != 'passed' for r in summary['profiles']) or (a.suite in ('deep','graph-wy','native-fused','gdn-tensor','ampere-tiled') and not ratios):
         raise SystemExit(1)
 
 

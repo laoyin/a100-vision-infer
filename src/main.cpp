@@ -39,6 +39,10 @@ int main(int argc,char** argv) {
       if(key=="--multi-token-gemv-fp8"){options.multi_token_gemv=true;options.shared_gemv_fp8=true;continue;}
       if(key=="--fused-gdn-prepare"){options.fused_gdn_prepare=true;continue;}
       if(key=="--gdn-wy-fused"){options.gdn_wy_fused=true;continue;}
+      if(key=="--gdn-fused-solve"){options.gdn_tensor_prefill=true;options.gdn_fused_solve=true;continue;}
+      if(key=="--gdn-tilelang"){options.gdn_tensor_prefill=true;options.gdn_tilelang=true;continue;}
+      if(key=="--fp8-tensor-small"){options.fp8_tensor_small=true;continue;}
+      if(key=="--tilelang-fp8"){options.tilelang_fp8=true;continue;}
       if(key=="--gdn-tensor-prefill"){options.gdn_tensor_prefill=true;continue;}
       if(key=="--reuse-verify-graph"){options.reuse_verify_graph=true;continue;}
       if(key=="--mtp-verify-graph"){options.mtp_verify_graph=true;continue;}
@@ -56,6 +60,8 @@ int main(int argc,char** argv) {
       TORCH_CHECK(i+1<argc,"Missing argument for ",key); std::string value=argv[++i];
       if(key=="--model") model=value; else if(key=="--request") request=value;
       else if(key=="--output") output=value; else if(key=="--prefill-chunk") chunk=std::stoi(value);
+      else if(key=="--tilelang-dir")options.tilelang_dir=value;
+      else if(key=="--fp8-tensor-split")options.fp8_tensor_split=std::stoi(value);
       else if(key=="--gdn-tensor-chunk")options.gdn_tensor_chunk=std::stoi(value);
       else if(key=="--mtp-tokens") options.mtp_tokens=std::stoi(value);
       else if(key=="--weight-cache-mib") options.weight_cache_bytes=std::stoull(value)<<20;

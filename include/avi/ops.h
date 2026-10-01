@@ -3,10 +3,11 @@
 #include <utility>
 #include <vector>
 namespace avi {
+at::Tensor fp8_tensor_small(at::Tensor x,at::Tensor codes,at::Tensor scales,int split=1);
 at::Tensor small_linear_shared(at::Tensor x,at::Tensor weight,at::Tensor scales={});
 std::vector<at::Tensor> fused_gdn_prepare(at::Tensor projected,at::Tensor weight,at::Tensor history,at::Tensor log_decay,at::Tensor bias,int HK,int H,int K,int V,bool grouped_qk=false);
 at::Tensor wy_propagate(at::Tensor W,at::Tensor U,at::Tensor Q,at::Tensor A,at::Tensor keys,at::Tensor last,at::Tensor state,int T);
-at::Tensor delta_scan_tensor(at::Tensor q,at::Tensor k,at::Tensor v,at::Tensor g,at::Tensor beta,at::Tensor state,int chunk=64);
+at::Tensor delta_scan_tensor(at::Tensor q,at::Tensor k,at::Tensor v,at::Tensor g,at::Tensor beta,at::Tensor state,int chunk=64,bool fused_solve=false,bool tilelang=false);
 at::Tensor delta_scan_wy(at::Tensor q,at::Tensor k,at::Tensor v,at::Tensor g,at::Tensor beta,at::Tensor state,int chunk=32,bool fused=false);
 at::Tensor gqa_chunk_dynamic(at::Tensor q,at::Tensor k,at::Tensor v,at::Tensor keys,at::Tensor values,at::Tensor offset);
 at::Tensor flash_prefill(at::Tensor q,at::Tensor keys,at::Tensor values);

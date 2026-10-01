@@ -1,4 +1,5 @@
 #include "avi/ops.h"
+#include "avi/tilelang.h"
 #include <ATen/cuda/CUDAGraph.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAStream.h>
@@ -40,6 +41,11 @@ void check(at::Tensor out,at::Tensor state,const std::pair<at::Tensor,at::Tensor
 }
 }
 void run_tensor_gdn_tests(){
+ std::vector<int> backends={0,1};if(avi::tilelang_configured())backends.push_back(2);
+ for(int backend:backends){
+ auto scan=[&](at::Tensor q,at::Tensor k,at::Tensor v,at::Tensor g,at::Tensor beta,at::Tensor state,int C){
+  return avi::delta_scan_tensor(q,k,v,g,beta,state,C,backend==1,backend==2);
+ };
  auto f=at::TensorOptions().device(at::kCUDA).dtype(at::kFloat);at::manual_seed(314);
  for(int T:{1,31,32,33,63,64,65,129,513})for(int C:{32,64}){
   int HQ=1,H=3,V=128;
@@ -54,12 +60,12 @@ void run_tensor_gdn_tests(){
   auto g=-gates.select(2,0)*.08,beta=gates.select(2,1);
   auto initial=at::randn({H,128,V},f)*.1,state=initial.clone();
   auto ref=oracle(q,k,v,g,beta,initial);
-  auto actual=avi::delta_scan_tensor(q,k,v,g,beta,state,C);check(actual,state,ref,T,C);
+  auto actual=scan(q,k,v,g,beta,state,C);check(actual,state,ref,T,C);
   if(T>=65){
    auto split=initial.clone();
-   auto a=avi::delta_scan_tensor(q.narrow(0,0,37),k.narrow(0,0,37),v.narrow(0,0,37),
+   auto a=scan(q.narrow(0,0,37),k.narrow(0,0,37),v.narrow(0,0,37),
     g.narrow(0,0,37),beta.narrow(0,0,37),split,C);
-   auto z=avi::delta_scan_tensor(q.narrow(0,37,T-37),k.narrow(0,37,T-37),v.narrow(0,37,T-37),
+   auto z=scan(q.narrow(0,37,T-37),k.narrow(0,37,T-37),v.narrow(0,37,T-37),
     g.narrow(0,37,T-37),beta.narrow(0,37,T-37),split,C);
    check(at::cat({a,z}),split,ref,T,C);
   }
@@ -71,7 +77,7 @@ void run_tensor_gdn_tests(){
   auto k=avi::fused_l2(at::randn_like(q)),v=at::randn({T,H,128},f).to(at::kBFloat16);
   auto g=at::full({T,H},-decay,f),beta=at::rand({T,H},f),initial=at::randn({H,128,128},f)*.1;
   auto ref=oracle(q,k,v,g,beta,initial);
-  for(int C:{32,64}){auto state=initial.clone();check(avi::delta_scan_tensor(q,k,v,g,beta,state,C),state,ref,T,C);}
+  for(int C:{32,64}){auto state=initial.clone();check(scan(q,k,v,g,beta,state,C),state,ref,T,C);}
  }
  // Capture/replay must use live input buffers and restore the caller's state.
  {
@@ -84,14 +90,15 @@ void run_tensor_gdn_tests(){
   C10_CUDA_CHECK(cudaDeviceSynchronize());
   {
    c10::cuda::CUDAStreamGuard guard(stream);
-   out=avi::delta_scan_tensor(q,k,v,g,beta,state,64);
+   out=scan(q,k,v,g,beta,state,64);
    state.copy_(initial);C10_CUDA_CHECK(cudaStreamSynchronize(stream));
-   graph.capture_begin();out=avi::delta_scan_tensor(q,k,v,g,beta,state,64);graph.capture_end();
+   graph.capture_begin();out=scan(q,k,v,g,beta,state,64);graph.capture_end();
   }
   for(int i=0;i<2;i++){
    if(i)v.add_(.125);
    state.copy_(initial);graph.replay();check(out,state,oracle(q,k,v,g,beta,initial),T,64);
   }
  }
- std::cout<<"Tensor GDN FP64 oracle, TP2 grouped heads, partial chunks, continuation and graph replay passed\n";
+ }
+ std::cout<<"Tensor/fused/optional TileLang GDN FP64 oracle, TP2 grouped heads, partial chunks, continuation and graph replay passed\n";
 }

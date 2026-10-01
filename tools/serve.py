@@ -75,8 +75,10 @@ def create_app(args):
                  '--image-cache-mib',str(args.image_cache_mib),'--prefix-cache-mib',str(args.prefix_cache_mib)]
         if args.cuda_graph:command.append('--cuda-graph')
         if args.baseline:command.append('--baseline')
-        for name in ('extra_fusions','cublas_prefill','tp_lm_head','vector_gemv','mtp_draft_graph','gdn_chunk','flash_prefill','cache_vision_weights','gdn_cooperative','bf16_tp_reduce','fused_gdn_conv','gdn_wy','mtp_verify_graph','multi_token_gemv','multi_token_gemv_fp8','fused_gdn_prepare','gdn_wy_fused','reuse_verify_graph','gdn_tensor_prefill'):
+        for name in ('extra_fusions','cublas_prefill','tp_lm_head','vector_gemv','mtp_draft_graph','gdn_chunk','flash_prefill','cache_vision_weights','gdn_cooperative','bf16_tp_reduce','fused_gdn_conv','gdn_wy','mtp_verify_graph','multi_token_gemv','multi_token_gemv_fp8','fused_gdn_prepare','gdn_wy_fused','reuse_verify_graph','gdn_tensor_prefill','gdn_fused_solve','gdn_tilelang','fp8_tensor_small','tilelang_fp8'):
             if getattr(args,name,False):command.append('--'+name.replace('_','-'))
+        command+=['--fp8-tensor-split',str(getattr(args,'fp8_tensor_split',1))]
+        if getattr(args,'tilelang_dir',None):command+=['--tilelang-dir',str(Path(args.tilelang_dir).resolve())]
         command+=['--gdn-tensor-chunk',str(getattr(args,'gdn_tensor_chunk',64)),'--mtp-tokens',str(getattr(args,'mtp_tokens',0)),'--weight-cache-mib',str(getattr(args,'weight_cache_mib',0))]
         process=subprocess.Popen(command,stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True,bufsize=1,start_new_session=True)
         threading.Thread(target=reader,daemon=True).start()
@@ -230,8 +232,10 @@ def main():
     p.add_argument('--api-key',default=os.environ.get('AVI_API_KEY'));p.add_argument('--cuda-graph',action='store_true');p.add_argument('--baseline',action='store_true')
     p.add_argument('--mtp-tokens',type=int,choices=range(6),default=0)
     p.add_argument('--weight-cache-mib',type=int,default=0)
+    p.add_argument('--tilelang-dir')
+    p.add_argument('--fp8-tensor-split',type=int,choices=[1,4],default=1)
     p.add_argument('--gdn-tensor-chunk',type=int,choices=[32,64],default=64)
-    for name in ('extra-fusions','cublas-prefill','tp-lm-head','vector-gemv','mtp-draft-graph','gdn-chunk','flash-prefill','cache-vision-weights','gdn-cooperative','bf16-tp-reduce','fused-gdn-conv','gdn-wy','mtp-verify-graph','multi-token-gemv','multi-token-gemv-fp8','fused-gdn-prepare','gdn-wy-fused','reuse-verify-graph','gdn-tensor-prefill'):
+    for name in ('extra-fusions','cublas-prefill','tp-lm-head','vector-gemv','mtp-draft-graph','gdn-chunk','flash-prefill','cache-vision-weights','gdn-cooperative','bf16-tp-reduce','fused-gdn-conv','gdn-wy','mtp-verify-graph','multi-token-gemv','multi-token-gemv-fp8','fused-gdn-prepare','gdn-wy-fused','reuse-verify-graph','gdn-tensor-prefill','gdn-fused-solve','gdn-tilelang','fp8-tensor-small','tilelang-fp8'):
         p.add_argument('--'+name,action='store_true')
     args=p.parse_args();uvicorn.run(create_app(args),host=args.host,port=args.port)
 

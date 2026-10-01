@@ -108,6 +108,7 @@ struct VerifyGraph {
   Tensor embeddings,positions,hidden,candidates;
   std::vector<Tensor> trajectories,conv_inputs;
   std::vector<std::array<Tensor,4>> storage;
+  uint64_t fp8_tensor_calls=0,tilelang_fp8_calls=0;
   int capacity=0;
   ~VerifyGraph(){graph.reset();}
 };
@@ -169,10 +170,16 @@ std::pair<Tensor,Tensor> Engine::verify_graph(Tensor embeddings,Tensor positions
       graph.hidden=step(graph.embeddings,graph.positions);
       graph.candidates=local_candidates(norm(graph.hidden,"model.language_model.norm"));
       restore();C10_CUDA_CHECK(cudaStreamSynchronize(stream));
+      const auto fp8_before=fp8_tensor_calls_,tl_before=tilelang_fp8_calls_;
       graph.graph=std::make_unique<at::cuda::CUDAGraph>();graph.graph->capture_begin();
       graph.hidden=step(graph.embeddings,graph.positions);
       graph.candidates=local_candidates(norm(graph.hidden,"model.language_model.norm"));
       graph.graph->capture_end();
+      graph.fp8_tensor_calls=fp8_tensor_calls_-fp8_before;
+      graph.tilelang_fp8_calls=tilelang_fp8_calls_-tl_before;
+      // Capturing records launches without executing them. Count executions
+      // at replay, including graphs adopted by a later request.
+      fp8_tensor_calls_=fp8_before;tilelang_fp8_calls_=tl_before;
       // Capture records operations; the warmup state was restored before capture.
       graph.trajectories=verify_recurrent_;graph.conv_inputs=verify_conv_;
     }
@@ -183,6 +190,7 @@ std::pair<Tensor,Tensor> Engine::verify_graph(Tensor embeddings,Tensor positions
   // Other eager verification shapes may have replaced these host tensor handles.
   verify_recurrent_=graph.trajectories;verify_conv_=graph.conv_inputs;
   graph.graph->replay();++verify_graph_replays_;
+  fp8_tensor_calls_+=graph.fp8_tensor_calls;tilelang_fp8_calls_+=graph.tilelang_fp8_calls;
   return {graph.hidden,graph.candidates};
 }
 

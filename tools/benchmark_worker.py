@@ -32,6 +32,12 @@ def main():
  p.add_argument('--multi-token-gemv-fp8',action='store_true')
  p.add_argument('--fused-gdn-prepare',action='store_true')
  p.add_argument('--gdn-wy-fused',action='store_true')
+ p.add_argument('--gdn-fused-solve',action='store_true')
+ p.add_argument('--gdn-tilelang',action='store_true')
+ p.add_argument('--fp8-tensor-small',action='store_true')
+ p.add_argument('--tilelang-fp8',action='store_true')
+ p.add_argument('--fp8-tensor-split',type=int,choices=[1,4],default=1)
+ p.add_argument('--tilelang-dir')
  p.add_argument('--gdn-tensor-prefill',action='store_true')
  p.add_argument('--gdn-tensor-chunk',type=int,choices=[32,64],default=64)
  p.add_argument('--reuse-verify-graph',action='store_true')
@@ -83,6 +89,10 @@ def main():
  if a.multi_token_gemv_fp8:cmd+=['--multi-token-gemv-fp8']
  if a.fused_gdn_prepare:cmd+=['--fused-gdn-prepare']
  if a.gdn_wy_fused:cmd+=['--gdn-wy-fused']
+ for flag in ('gdn_fused_solve','gdn_tilelang','fp8_tensor_small','tilelang_fp8'):
+  if getattr(a,flag):cmd+=['--'+flag.replace('_','-')]
+ cmd+=['--fp8-tensor-split',str(a.fp8_tensor_split)]
+ if a.tilelang_dir:cmd+=['--tilelang-dir',str(Path(a.tilelang_dir).resolve())]
  if a.gdn_tensor_prefill:cmd+=['--gdn-tensor-prefill','--gdn-tensor-chunk',str(a.gdn_tensor_chunk)]
  if a.reuse_verify_graph:cmd+=['--reuse-verify-graph']
  if a.profile_kernels:cmd+=['--profile-kernels']
@@ -153,7 +163,7 @@ def main():
   report['warmup_cache_baseline']=warmup_results[-1].get('cache',{}) if warmup_results else {}
   report['synchronized_diagnostic']=a.profile_stages or a.profile_kernels or a.audit_logits
   report.update(gdn_wy=a.gdn_wy,mtp_verify_graph=a.mtp_verify_graph,profile_kernels=a.profile_kernels,audit_logits=a.audit_logits,
-    multi_token_gemv=a.multi_token_gemv,multi_token_gemv_fp8=a.multi_token_gemv_fp8,fused_gdn_prepare=a.fused_gdn_prepare,gdn_wy_fused=a.gdn_wy_fused,reuse_verify_graph=a.reuse_verify_graph,gdn_tensor_prefill=a.gdn_tensor_prefill,gdn_tensor_chunk=a.gdn_tensor_chunk)
+    multi_token_gemv=a.multi_token_gemv,multi_token_gemv_fp8=a.multi_token_gemv_fp8,fused_gdn_prepare=a.fused_gdn_prepare,gdn_wy_fused=a.gdn_wy_fused,reuse_verify_graph=a.reuse_verify_graph,gdn_tensor_prefill=a.gdn_tensor_prefill,gdn_tensor_chunk=a.gdn_tensor_chunk,gdn_fused_solve=a.gdn_fused_solve,gdn_tilelang=a.gdn_tilelang,fp8_tensor_small=a.fp8_tensor_small,tilelang_fp8=a.tilelang_fp8,fp8_tensor_split=a.fp8_tensor_split,tilelang_dir=a.tilelang_dir)
   report.update(fused_gdn_conv=a.fused_gdn_conv,gdn_cooperative=a.gdn_cooperative,bf16_tp_reduce=a.bf16_tp_reduce,frontend_format=a.frontend_format,frontend_threads=a.frontend_threads,bf16_patches=a.bf16_patches,spool_dir=a.spool_dir)
   report['timing_scope']='CPU image decode/tokenization/preprocessing + disk IPC + native inference + output decoding' if frontend else 'prepared input + native inference'
   report['prompt_token_ids']=prompt_ids

@@ -2,6 +2,7 @@
 // References: fla-org/flash-linear-attention (MIT), Gated Delta Networks
 // arXiv:2412.06464. This CUDA implementation is original, not copied source.
 #include "avi/ops.h"
+#include "avi/tilelang.h"
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
@@ -104,6 +105,61 @@ template<int C> __global__ void solve_gdn(const bf* Q,const bf* K,const bf* V,
  }
 }
 
+// Fused QKT/KKT + substitution. Shared products are reused by grouped
+// value heads; the lower triangular matrix never touches global memory.
+template<int C> __global__ void intra_solve_gdn(const bf* Q,const bf* K,const bf* V,
+ const float* G,const float* beta,float* A,float* W,float* U,float* SQ,float* WK,
+ float* last,int H,int HQ){
+ __shared__ __align__(32) bf left[4][256],right[4][256];
+ __shared__ __align__(32) float tile[4][256];
+ extern __shared__ float scratch[];
+ float* KK=scratch;float* QK=KK+C*C;float* L=QK+C*C;float* solved=L+C*C;
+ int warp=threadIdx.x/32,lane=threadIdx.x%32,block=blockIdx.x/HQ,hq=blockIdx.x%HQ;
+ int64_t qbase=int64_t(block*HQ+hq)*C;
+ for(int kind=0;kind<2;kind++)for(int slot=warp;slot<(C/16)*(C/16);slot+=4){
+  int r0=slot/(C/16)*16,c0=slot%(C/16)*16;
+  wm::fragment<wm::accumulator,16,16,16,float> acc;wm::fill_fragment(acc,0.f);
+  for(int kk=0;kk<128;kk+=16){
+   for(int i=lane;i<256;i+=32){
+    left[warp][i]=(kind?Q:K)[(qbase+r0+i/16)*128+kk+i%16];
+    right[warp][i]=K[(qbase+c0+i/16)*128+kk+i%16];
+   }
+   __syncwarp();
+   wm::fragment<wm::matrix_a,16,16,16,bf,wm::row_major> a;
+   wm::fragment<wm::matrix_b,16,16,16,bf,wm::col_major> b;
+   wm::load_matrix_sync(a,left[warp],16);wm::load_matrix_sync(b,right[warp],16);
+   wm::mma_sync(acc,a,b,acc);__syncwarp();
+  }
+  wm::store_matrix_sync(tile[warp],acc,16,wm::mem_row_major);__syncwarp();
+  for(int i=lane;i<256;i+=32)(kind?QK:KK)[(r0+i/16)*C+c0+i%16]=tile[warp][i];
+  __syncwarp();
+ }
+ __syncthreads();
+ for(int h=hq*(H/HQ);h<(hq+1)*(H/HQ);h++){
+  int64_t base=int64_t(block*H+h)*C;float end=G[base+C-1];
+  if(threadIdx.x==0)last[block*H+h]=end;
+  for(int i=threadIdx.x;i<C*C;i+=128){
+   int r=i/C,c=i%C;float decay=c<=r?expf(G[base+r]-G[base+c]):0.f;
+   A[base*C+i]=c<=r?QK[i]*decay:0.f;L[i]=c<r?KK[i]*decay*beta[base+r]:0.f;
+  }
+  __syncthreads();
+  // A lane owns two independent RHS columns. No cross-lane dependencies
+  // during substitution; a CTA barrier separates the grouped heads.
+  for(int r=0;r<C;r++)for(int d=threadIdx.x;d<256;d+=128){
+   float value=beta[base+r]*(d<128?expf(G[base+r])*__bfloat162float(K[(qbase+r)*128+d]):
+     __bfloat162float(V[(base+r)*128+d-128]));
+   for(int c=0;c<r;c++)value-=L[r*C+c]*solved[c*256+d];
+   solved[r*256+d]=value;
+   if(d<128){
+    W[(base+r)*128+d]=value;
+    SQ[(base+r)*128+d]=__bfloat162float(Q[(qbase+r)*128+d])*expf(G[base+r]);
+    WK[(base+r)*128+d]=__bfloat162float(K[(qbase+r)*128+d])*expf(end-G[base+r]);
+   }else U[(base+r)*128+d-128]=value;
+  }
+  __syncthreads();
+ }
+}
+
 // TF32x4: retain FP32 state storage and accumulators; add the low-part product and both cross
 // products instead of rounding the entire recurrent state to one TF32 operand.
 // This is a distinct finite-precision path; the GPU tests qualify it against an FP64 oracle.
@@ -178,13 +234,14 @@ template<int C> __global__ void propagate_gdn(const float* W,const float* U,
  for(int i=threadIdx.x;i<128*16;i+=128)state[(h*128+i/16)*VD+j0+i%16]=s[i];
 }
 template<int C> at::Tensor launch_gdn(at::Tensor q,at::Tensor k,at::Tensor v,
- at::Tensor g,at::Tensor beta,at::Tensor state){
+ at::Tensor g,at::Tensor beta,at::Tensor state,bool fused,bool tilelang){
  int T=q.size(0),HQ=q.size(1),H=v.size(1),VD=v.size(2),blocks=(T+C-1)/C;
  auto f=q.options().dtype(at::kFloat);
  auto Q=at::empty({blocks,HQ,C,128},q.options()),K=at::empty_like(Q);
  auto V=at::empty({blocks,H,C,VD},q.options());
  auto G=at::empty({blocks,H,C},f),B=at::empty_like(G);
- auto L=at::empty({blocks,H,C,C},f),A=at::empty_like(L);
+ auto A=at::empty({blocks,H,C,C},f);
+ auto L=(!fused&&!tilelang)?at::empty_like(A):at::Tensor();
  auto W=at::empty({blocks,H,C,128},f),SQ=at::empty_like(W),WK=at::empty_like(W);
  auto U=at::empty({blocks,H,C,VD},f),last=at::empty({blocks,H},f),out=at::empty_like(v);
  auto stream=at::cuda::getCurrentCUDAStream();
@@ -192,16 +249,29 @@ template<int C> at::Tensor launch_gdn(at::Tensor q,at::Tensor k,at::Tensor v,
   wr(Q),wr(K),wr(V),G.data_ptr<float>(),B.data_ptr<float>(),T,H,HQ,VD,
   q.stride(0),q.stride(1),k.stride(0),k.stride(1),v.stride(0),v.stride(1),
   g.stride(0),g.stride(1),beta.stride(0),beta.stride(1));
+ if(tilelang){
+  tilelang_gdn_prepare(Q,K,V,G,B,A,W,U,SQ,WK,last,C,blocks,H,HQ,stream);
+ }else if(fused){
+  constexpr int bytes=(3*C*C+C*256)*sizeof(float);
+  static thread_local int configured_device=-1;
+  if(configured_device!=q.get_device()){
+   C10_CUDA_CHECK(cudaFuncSetAttribute(intra_solve_gdn<C>,cudaFuncAttributeMaxDynamicSharedMemorySize,bytes));
+   configured_device=q.get_device();
+  }
+  intra_solve_gdn<C><<<blocks*HQ,128,bytes,stream>>>(rd(Q),rd(K),rd(V),G.data_ptr<float>(),B.data_ptr<float>(),
+   A.data_ptr<float>(),W.data_ptr<float>(),U.data_ptr<float>(),SQ.data_ptr<float>(),WK.data_ptr<float>(),last.data_ptr<float>(),H,HQ);
+ }else{
  intra_gdn<C><<<dim3(blocks*HQ,C*C/1024),128,0,stream>>>(rd(Q),rd(K),G.data_ptr<float>(),B.data_ptr<float>(),L.data_ptr<float>(),A.data_ptr<float>(),H,HQ);
  solve_gdn<C><<<dim3(blocks*H,(128+VD+63)/64),64,0,stream>>>(rd(Q),rd(K),rd(V),G.data_ptr<float>(),B.data_ptr<float>(),L.data_ptr<float>(),
   W.data_ptr<float>(),U.data_ptr<float>(),SQ.data_ptr<float>(),WK.data_ptr<float>(),last.data_ptr<float>(),VD,H,HQ);
+ }
  propagate_gdn<C><<<dim3(H,VD/16),128,0,stream>>>(W.data_ptr<float>(),U.data_ptr<float>(),SQ.data_ptr<float>(),A.data_ptr<float>(),
   WK.data_ptr<float>(),last.data_ptr<float>(),state.data_ptr<float>(),wr(out),blocks,H,VD,T);
  C10_CUDA_KERNEL_LAUNCH_CHECK();return out;
 }
 }
 at::Tensor delta_scan_tensor(at::Tensor q,at::Tensor k,at::Tensor v,
- at::Tensor g,at::Tensor beta,at::Tensor state,int chunk){
+ at::Tensor g,at::Tensor beta,at::Tensor state,int chunk,bool fused,bool tilelang){
  TORCH_CHECK(q.is_cuda()&&q.dim()==3&&q.scalar_type()==at::kBFloat16&&q.size(2)==128&&q.stride(2)==1&&
   k.device()==q.device()&&k.sizes()==q.sizes()&&k.scalar_type()==q.scalar_type()&&k.stride(2)==1&&
   v.device()==q.device()&&v.dim()==3&&v.scalar_type()==q.scalar_type()&&v.stride(2)==1,
@@ -214,10 +284,11 @@ at::Tensor delta_scan_tensor(at::Tensor q,at::Tensor k,at::Tensor v,
   state.device()==q.device()&&state.scalar_type()==at::kFloat&&
   state.sizes()==at::IntArrayRef({H,128,VD})&&state.is_contiguous()&&
   (chunk==32||chunk==64),"Invalid tensor GDN geometry/dtypes");
+ TORCH_CHECK(!(fused||tilelang)||VD==128,"Fused/tilelang GDN requires V=128");
  c10::cuda::CUDAGuard guard(q.device());
  // The physical output uses contiguous token/head/value strides.
  // Inputs may be strided views; the pack kernel consumes their actual strides.
  v=v.contiguous();
- return chunk==64?launch_gdn<64>(q,k,v,g,beta,state):launch_gdn<32>(q,k,v,g,beta,state);
+ return chunk==64?launch_gdn<64>(q,k,v,g,beta,state,fused,tilelang):launch_gdn<32>(q,k,v,g,beta,state,fused,tilelang);
 }
 }

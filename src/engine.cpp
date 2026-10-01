@@ -1,5 +1,6 @@
 #include "avi/engine.h"
 #include "avi/ops.h"
+#include "avi/tilelang.h"
 #include <ATen/cuda/CUDAGraph.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <openssl/evp.h>
@@ -72,6 +73,12 @@ Engine::Engine(const std::string& dir,int rank,int world,int device,ncclComm_t c
   TORCH_CHECK(!options_.reuse_verify_graph||options_.mtp_verify_graph,"Graph reuse requires --mtp-verify-graph");
   TORCH_CHECK(options_.gdn_tensor_chunk==32||options_.gdn_tensor_chunk==64,"GDN tensor chunk must be 32 or 64");
   TORCH_CHECK(!options_.gdn_tensor_prefill||(options_.optimized&&!options_.reference_prefill&&text_.at("linear_key_head_dim")==128&&text_.at("linear_value_head_dim")==128),"Tensor GDN requires optimized K=V=128 prefill");
+  TORCH_CHECK(!(options_.gdn_fused_solve&&options_.gdn_tilelang),"Choose one fused GDN backend");
+  TORCH_CHECK(!(options_.fp8_tensor_small&&options_.tilelang_fp8),"Choose one FP8 Tensor Core backend");
+  TORCH_CHECK(options_.fp8_tensor_split==1||options_.fp8_tensor_split==4,"FP8 Tensor Core split must be 1 or 4");
+  TORCH_CHECK(!(options_.gdn_fused_solve||options_.gdn_tilelang)||options_.gdn_tensor_prefill,"Fused GDN requires tensor prefill");
+  TORCH_CHECK(!(options_.fp8_tensor_small||options_.tilelang_fp8)||options_.optimized,"FP8 Tensor Core requires optimized mode");
+  if(options_.gdn_tilelang||options_.tilelang_fp8)configure_tilelang(options_.tilelang_dir);
   if(options_.mtp_tokens){
     TORCH_CHECK(options_.optimized&&manifest.value("native_mtp",false),"MTP requires optimized mode and an artifact imported with --include-mtp");
     TORCH_CHECK(text_.value("mtp_num_hidden_layers",0)==1&&!text_.value("mtp_use_dedicated_embeddings",false),"Only shared-embedding single-layer MTP supported");
@@ -193,7 +200,15 @@ Tensor Engine::linear(Tensor x,const std::string& name,bool reduce) {
   auto timing=profile_begin(name=="lm_head"?"linear.head":name.rfind("model.visual.",0)==0?"linear.vision":name.rfind("mtp.",0)==0?"linear.mtp":"linear.text");
   auto cached=decoded_weights_.find(name+".weight");
   auto rows=x.numel()/x.size(-1);
-  if(options_.multi_token_gemv&&rows>1&&rows<=8){
+  bool tensor_small=(options_.fp8_tensor_small||options_.tilelang_fp8)&&rows>=2&&rows<=8&&w.scale.defined()&&
+    w.data.dim()==2&&w.data.size(1)%128==0&&w.scale.dim()==2&&w.scale.size(1)==w.data.size(1)/128&&
+    (!options_.tilelang_fp8||w.data.size(0)%16==0);
+  if(tensor_small){
+    auto input=x.reshape({rows,x.size(-1)}).contiguous();
+    if(options_.tilelang_fp8){++tilelang_fp8_calls_;y=tilelang_fp8_small(input,w.data,w.scale,options_.fp8_tensor_split);}
+    else{++fp8_tensor_calls_;y=fp8_tensor_small(input,w.data,w.scale,options_.fp8_tensor_split);}
+    auto shape=x.sizes().vec();shape.back()=w.data.size(0);y=y.reshape(shape);
+  }else if(options_.multi_token_gemv&&rows>1&&rows<=8){
     bool use_cached=cached!=decoded_weights_.end()&&!(options_.shared_gemv_fp8&&w.scale.defined());
     auto matrix=use_cached?cached->second:w.data.reshape({w.data.size(0),-1});
     auto scales=use_cached?Tensor():w.scale;
@@ -330,8 +345,8 @@ Tensor Engine::delta_attention(Tensor x,int layer,const std::string& p,Tensor pr
       tensor(p+".A_log"),tensor(p+".dt_bias"),HK,H,K,V,tensor_prefill);
     profile_end(preparation);
     auto timing=profile_begin("gdn.scan");
-    if(tensor_prefill)++gdn_tensor_calls_;
-    auto result=tensor_prefill?delta_scan_tensor(inputs[0],inputs[1],inputs[2],inputs[3],inputs[4],s.recurrent,options_.gdn_tensor_chunk):(options_.gdn_wy||options_.gdn_wy_fused)?
+    if(tensor_prefill){++gdn_tensor_calls_;if(options_.gdn_tilelang)++gdn_tilelang_calls_;else if(options_.gdn_fused_solve)++gdn_fused_calls_;}
+    auto result=tensor_prefill?delta_scan_tensor(inputs[0],inputs[1],inputs[2],inputs[3],inputs[4],s.recurrent,options_.gdn_tensor_chunk,options_.gdn_fused_solve,options_.gdn_tilelang):(options_.gdn_wy||options_.gdn_wy_fused)?
       delta_scan_wy(inputs[0],inputs[1],inputs[2],inputs[3],inputs[4],s.recurrent,32,options_.gdn_wy_fused):
       delta_scan_fast(inputs[0],inputs[1],inputs[2],inputs[3],inputs[4],s.recurrent,{},options_.gdn_cooperative);
     profile_end(timing);
@@ -370,7 +385,7 @@ Tensor Engine::delta_attention(Tensor x,int layer,const std::string& p,Tensor pr
   }
   auto scan_timing=profile_begin("gdn.scan");
   Tensor result;
-  if(tensor_prefill){++gdn_tensor_calls_;result=delta_scan_tensor(q,k,v,g,beta,s.recurrent,options_.gdn_tensor_chunk);}
+  if(tensor_prefill){++gdn_tensor_calls_;if(options_.gdn_tilelang)++gdn_tilelang_calls_;else if(options_.gdn_fused_solve)++gdn_fused_calls_;result=delta_scan_tensor(q,k,v,g,beta,s.recurrent,options_.gdn_tensor_chunk,options_.gdn_fused_solve,options_.gdn_tilelang);}
   else if((options_.gdn_wy||options_.gdn_wy_fused)&&!verifying_&&!decode_mode_&&T>=32)result=delta_scan_wy(q,k,v,g,beta,s.recurrent,32,options_.gdn_wy_fused);
   else if(gdn_chunk_enabled_&&!verifying_&&!decode_mode_&&T>=32)result=delta_scan_chunked(q,k,v,g,beta,s.recurrent);
   else result=(options_.optimized&&(K==128||K==16))?delta_scan_fast(q,k,v.contiguous(),g.contiguous(),beta.contiguous(),s.recurrent,trajectory,options_.gdn_cooperative):delta_scan(q,k,v.contiguous(),g.contiguous(),beta.contiguous(),s.recurrent);
@@ -572,7 +587,7 @@ Tensor Engine::restore_prefix(const std::string& key) {
     if(src.conv.defined()){dst.conv=src.conv.to(at::Device(at::kCUDA,device_),src.conv.scalar_type(),false,true);dst.recurrent=src.recurrent.to(at::Device(at::kCUDA,device_),src.recurrent.scalar_type(),false,true);}}
   return entry.logits.to(at::Device(at::kCUDA,device_),entry.logits.scalar_type(),false,true);
 }
-json Engine::cache_stats() const {return {{"gdn_tensor_calls",gdn_tensor_calls_},{"verify_graph_pool_tensor_bytes",verify_graph_pool_bytes_},{"verify_graph_reuses",verify_graph_reuses_},{"verify_graph_pool_entries",verify_graph_pool_.size()},{"verify_graph_builds",verify_graph_builds_},{"verify_graph_replays",verify_graph_replays_},{"image_bytes",image_bytes_},{"prefix_bytes",prefix_bytes_},{"image_hits",image_hits_},{"prefix_hits",prefix_hits_},{"host_prefix_bytes",host_prefix_bytes_},{"host_prefix_hits",host_prefix_hits_}};}
+json Engine::cache_stats() const {return {{"gdn_fused_calls",gdn_fused_calls_},{"gdn_tilelang_calls",gdn_tilelang_calls_},{"fp8_tensor_calls",fp8_tensor_calls_},{"tilelang_fp8_calls",tilelang_fp8_calls_},{"gdn_tensor_calls",gdn_tensor_calls_},{"verify_graph_pool_tensor_bytes",verify_graph_pool_bytes_},{"verify_graph_reuses",verify_graph_reuses_},{"verify_graph_pool_entries",verify_graph_pool_.size()},{"verify_graph_builds",verify_graph_builds_},{"verify_graph_replays",verify_graph_replays_},{"image_bytes",image_bytes_},{"prefix_bytes",prefix_bytes_},{"image_hits",image_hits_},{"prefix_hits",prefix_hits_},{"host_prefix_bytes",host_prefix_bytes_},{"host_prefix_hits",host_prefix_hits_}};}
 std::string request_hash(const std::string& dir,const json& request) {
   std::unique_ptr<EVP_MD_CTX,decltype(&EVP_MD_CTX_free)> context(EVP_MD_CTX_new(),EVP_MD_CTX_free);
   TORCH_CHECK(context&&EVP_DigestInit_ex(context.get(),EVP_sha256(),nullptr)==1,"SHA256 initialization failed");
