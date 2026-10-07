@@ -9,6 +9,7 @@ import statistics
 import subprocess
 import sys
 import time
+from workload_metrics import workload_metrics
 try:
     from .inspect_mtp import inspect, prepare_trial_model
 except ImportError:
@@ -73,6 +74,7 @@ def run_profile(a):
               'wall_seconds': elapsed, 'results': results,
               'speculative_metric_deltas': {k: v-before[k] for k, v in after.items() if k in before} if before is not None and after is not None else None,
               'note': 'Upstream vLLM inference including request preprocessing; excludes model load and warmup. Not comparable directly to native prepared-input timing. No TTFT estimate from non-streaming timing.'}
+    report['workload']=workload_metrics(results)
     with a.out.open('x', encoding='utf-8') as stream:
         json.dump(report, stream, indent=2, ensure_ascii=False)
 

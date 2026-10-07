@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import sys
 from native_mtp_matrix import run, compare_outputs
+from workload_metrics import workload_metrics
 
 
 def prompt_difference(actual, expected):
@@ -129,6 +130,24 @@ def tensor_profiles(frontend,gdn):
     ]
 
 
+def dual_profiles(frontend,gdn,one_token=False):
+    base=frontend+gdn+['--bf16-tp-reduce','--fused-gdn-prepare','--multi-token-gemv-fp8']
+    if not one_token:base+=['--mtp-verify-graph','--reuse-verify-graph']
+    fused=['--fused-residual-norm']
+    candidates=['--gpu-candidates']
+    both=base+fused+(candidates if not one_token else [])
+    rows=[('reference',base,512,24576)]
+    if not one_token:rows += [('residual',base+fused,512,24576),('candidates',base+candidates,512,24576)]
+    rows += [('combined',both,512,24576),
+             ('combined-gdn32',both+['--gdn-fused-solve','--gdn-tensor-chunk','32'],512,24576),
+             ('combined-gdn64',both+['--gdn-fused-solve'],512,24576),
+             ('combined-2048',both+['--gdn-fused-solve','--gdn-tensor-chunk','32'],2048,24576)]
+    if not one_token:
+        rows += [('combined-tensor',both+['--fp8-tensor-small','--fp8-tensor-split','4'],512,24576),
+                 ('combined-mtp2',both+['--mtp-tokens','2'],512,24576)]
+    return rows
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     for key in ('previous', 'hf-model', 'vllm-results', 'out'):
@@ -136,11 +155,17 @@ def main():
     p.add_argument('--requests', type=int, default=5)
     p.add_argument('--timeout', type=float, default=1800)
     p.add_argument('--max-pixels', type=int, default=4000000)
-    p.add_argument('--suite', choices=['prefill','deep','graph-wy','native-fused','gdn-tensor','ampere-tiled'], default='prefill')
+    p.add_argument('--suite', choices=['prefill','deep','graph-wy','native-fused','gdn-tensor','ampere-tiled','dual-path'], default='prefill')
     p.add_argument('--tilelang-dir',type=Path)
+    p.add_argument('--body',type=Path)
+    p.add_argument('--max-new-tokens',type=int)
+    p.add_argument('--max-context',type=int)
+    p.add_argument('--min-output-tokens',type=int,default=0)
+    p.add_argument('--require-complete-json',action='store_true')
     a = p.parse_args()
     if a.requests < 1 or a.timeout <= 0:
         p.error('Invalid limits')
+    if a.min_output_tokens<0 or (a.max_new_tokens is not None and a.max_new_tokens<1):p.error('Invalid token limits')
     a.out.mkdir(parents=True, exist_ok=False)
     request = json.loads((a.previous/'request/request.json').read_text(encoding='utf-8'))
     upstream = {n: json.loads((a.vllm_results/(n+'.json')).read_text(encoding='utf-8'))
@@ -160,7 +185,7 @@ def main():
         ('flash-vision-cache32', ['--flash-prefill', '--cache-vision-weights'], 512, 32768),
         ('diagnostic', ['--flash-prefill', '--cache-vision-weights', '--profile-stages'], 512, 24576),
     ]
-    if a.suite in ('deep','graph-wy','native-fused','gdn-tensor','ampere-tiled'):
+    if a.suite in ('deep','graph-wy','native-fused','gdn-tensor','ampere-tiled','dual-path'):
         common+=['--flash-prefill','--frontend-format','vllm-string']
         frontend=['--frontend-threads','4','--bf16-patches','--spool-dir','/dev/shm']
         gdn=['--gdn-cooperative','--fused-gdn-conv']
@@ -197,6 +222,7 @@ def main():
         profiles=tensor_profiles(frontend,gdn)
     if a.suite=='ampere-tiled':
         profiles=tiled_profiles(frontend,gdn,a.tilelang_dir)
+    if a.suite=='dual-path':profiles=dual_profiles(frontend,gdn,a.max_new_tokens==1)
     summary = {'suite':a.suite,'profiles': [], 'comparison': [], 'vllm_reports': str(a.vllm_results.resolve()),
                'note': 'vLLM reports are supplied separately (the deep test script generates them in this run). Measurements are sequential, not interleaved. Diagnostic synchronizes GPU and is excluded from speed comparisons.'}
     reference = None
@@ -204,11 +230,13 @@ def main():
         output = a.out/(name+'.json')
         command = [sys.executable, 'tools/benchmark_worker.py',
                    '--model', str(a.previous/'fp8-mtp-tp2'), '--request', str(a.previous/'request'),
-                   '--frontend-model', str(a.hf_model), '--body', str(a.previous/'request.json'),
+                   '--frontend-model', str(a.hf_model), '--body', str(a.body or a.previous/'request.json'),
                    '--out', str(output), '--requests', str(1 if name.startswith('diagnostic') else a.requests),
                    '--prefill-chunk', str(chunk), '--weight-cache-mib', str(cache),
                    '--max-pixels', str(a.max_pixels), '--timeout', str(a.timeout),
                    '--inherit-process-group']+common+flags
+        if a.max_new_tokens is not None:command+=['--max-new-tokens',str(a.max_new_tokens)]
+        if a.max_context is not None:command+=['--max-context',str(a.max_context)]
         code = run(command, a.out/(name+'.log'), a.timeout)
         row = dict(name=name, flags=flags, prefill_chunk=chunk, exit_code=code, status='failed', log=str(a.out/(name+'.log')))
         if code == 0:
@@ -223,6 +251,10 @@ def main():
                        stages=[r.get('stages') for r in report['results']],
                        kernel_times=[r.get('kernel_times') for r in report['results']],
                        graph_counters=[r.get('cache') for r in report['results']])
+            quality=workload_metrics(report['results'],a.min_output_tokens)
+            row['workload']=quality
+            if not quality['all_long_enough']:row['status']='insufficient_output_length'
+            if a.require_complete_json and not quality['all_complete_json']:row['status']='incomplete_or_invalid_json'
             for flag,key in (('--gdn-fused-solve','gdn_fused_calls'),('--gdn-tilelang','gdn_tilelang_calls'),
                              ('--fp8-tensor-small','fp8_tensor_calls'),('--tilelang-fp8','tilelang_fp8_calls')):
                 if flag in flags and not counter_exercised(report,key):
@@ -249,11 +281,15 @@ def main():
         print(json.dumps(row), flush=True)
     ratios=[r['latency_ratio_vllm_over_native'] for r in summary['comparison'] if r['latency_ratio_vllm_over_native'] is not None]
     summary['acceptance']=acceptance(summary['profiles'],summary['comparison'],len(upstream))
+    summary['measurement']={'body':str(a.body or a.previous/'request.json'),'max_new_tokens':a.max_new_tokens,
+      'min_output_tokens':a.min_output_tokens,'require_complete_json':a.require_complete_json,
+      'one_token_completion_proxy':a.max_new_tokens==1,
+      'note':'One-token completion latency is a prefill/first-token proxy, not vLLM streaming TTFT. Long output must end naturally and pass length/JSON checks.'}
     summary['failure_reasons']={'native_profiles':[r['name'] for r in summary['profiles'] if r['status']!='passed'],
                                 'no_matching_cross_engine_comparison':not bool(ratios)}
     (a.out/'summary.json').write_text(json.dumps(summary,indent=2),encoding='utf-8')
     print(json.dumps(summary['acceptance']),flush=True)
-    if any(r['status'] != 'passed' for r in summary['profiles']) or (a.suite in ('deep','graph-wy','native-fused','gdn-tensor','ampere-tiled') and not ratios):
+    if any(r['status'] != 'passed' for r in summary['profiles']) or (a.suite in ('deep','graph-wy','native-fused','gdn-tensor','ampere-tiled','dual-path') and not ratios):
         raise SystemExit(1)
 
 

@@ -7,11 +7,14 @@ if [[ $(id -u) == 0 ]]; then export OMPI_ALLOW_RUN_AS_ROOT=1 OMPI_ALLOW_RUN_AS_R
 python tools/make_tiny_fixture.py --out "$root" --block-fp8 --mtp --text-tokens 64
 for tp in 1 2; do
  python tools/import_fp8.py --model "$root/model" --out "$root/tp$tp" --tp "$tp" --include-mtp
- variants=(reference fused32 fused64 fp8s1 fp8s4 combined)
+ variants=(reference residual candidates dual fused32 fused64 fp8s1 fp8s4 combined)
  if [[ -n "${AVI_TILELANG_DIR:-}" ]]; then variants+=(tile32 tile64 tilefp8s1 tilefp8s4 tilecombined); fi
  for variant in "${variants[@]}"; do
   flags=()
   case "$variant" in
+   residual) flags=(--fused-residual-norm);;
+   candidates) flags=(--gpu-candidates);;
+   dual) flags=(--fused-residual-norm --gpu-candidates);;
    fused32) flags=(--gdn-fused-solve --gdn-tensor-chunk 32);;
    fused64) flags=(--gdn-fused-solve);;
    fp8s1) flags=(--fp8-tensor-small);;

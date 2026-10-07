@@ -48,3 +48,5 @@ native-fused-test-*/
 
 gdn-tensor-test-*/
 ampere-tiled-test-*/
+
+dual-path-test-*/

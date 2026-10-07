@@ -1,5 +1,6 @@
 """Resident native worker benchmark: excludes model startup and Python preprocessing."""
 import argparse,json,os,queue,signal,statistics,subprocess,threading,time,tempfile,shutil
+from workload_metrics import workload_metrics
 from pathlib import Path
 
 def summarize(results,seconds):
@@ -10,6 +11,15 @@ def summarize(results,seconds):
  return {'completed':len(results),'successful':len(good),'wall_seconds':seconds,'output_tokens_per_second':sum(len(r['generated_ids']) for r in good)/seconds,
          'ttft_seconds':stats([r['ttft_seconds'] for r in good if r['ttft_seconds']>=0]),'latency_seconds':stats([r['total_seconds'] for r in good]),
          'all_tokens_equal':all(r['generated_ids']==good[0]['generated_ids'] for r in good) if good else None}
+
+def override_limits(req,max_tokens=None,max_context=None):
+ req=dict(req)
+ if max_tokens is not None:req['max_new_tokens']=max_tokens
+ if max_context is not None:req['max_context']=max_context
+ if req['max_new_tokens']<1 or req['max_context']<=req['max_new_tokens']:
+  raise ValueError('Require 0 < max tokens < max context')
+ return req
+
 
 def main():
  p=argparse.ArgumentParser(description=__doc__)
@@ -32,6 +42,8 @@ def main():
  p.add_argument('--multi-token-gemv-fp8',action='store_true')
  p.add_argument('--fused-gdn-prepare',action='store_true')
  p.add_argument('--gdn-wy-fused',action='store_true')
+ p.add_argument('--fused-residual-norm',action='store_true')
+ p.add_argument('--gpu-candidates',action='store_true')
  p.add_argument('--gdn-fused-solve',action='store_true')
  p.add_argument('--gdn-tilelang',action='store_true')
  p.add_argument('--fp8-tensor-small',action='store_true')
@@ -54,10 +66,14 @@ def main():
  p.add_argument('--weight-cache-mib',type=int,default=0)
  p.add_argument('--frontend-model');p.add_argument('--body')
  p.add_argument('--max-pixels',type=int,default=4000000)
+ p.add_argument('--max-new-tokens',type=int)
+ p.add_argument('--max-context',type=int)
  a=p.parse_args()
  if a.requests<1 or a.warmup<0 or not 1<=a.concurrency<=8 or a.timeout<=0:p.error('Invalid benchmark limits')
  if Path(a.out).exists():p.error('Output exists')
  req=json.loads((Path(a.request)/'request.json').read_text())
+ if (a.max_new_tokens is not None or a.max_context is not None) and not a.frontend_model:p.error('Limit overrides require frontend preprocessing')
+ req=override_limits(req,a.max_new_tokens,a.max_context)
  frontend=None
  if bool(a.frontend_model)!=bool(a.body):p.error('--frontend-model and --body must be provided together')
  if a.frontend_model:
@@ -89,7 +105,7 @@ def main():
  if a.multi_token_gemv_fp8:cmd+=['--multi-token-gemv-fp8']
  if a.fused_gdn_prepare:cmd+=['--fused-gdn-prepare']
  if a.gdn_wy_fused:cmd+=['--gdn-wy-fused']
- for flag in ('gdn_fused_solve','gdn_tilelang','fp8_tensor_small','tilelang_fp8'):
+ for flag in ('fused_residual_norm','gpu_candidates','gdn_fused_solve','gdn_tilelang','fp8_tensor_small','tilelang_fp8'):
   if getattr(a,flag):cmd+=['--'+flag.replace('_','-')]
  cmd+=['--fp8-tensor-split',str(a.fp8_tensor_split)]
  if a.tilelang_dir:cmd+=['--tilelang-dir',str(Path(a.tilelang_dir).resolve())]
@@ -156,13 +172,14 @@ def main():
   report={'tp_lm_head':a.tp_lm_head,'reference_prefill':a.reference_prefill,'extra_fusions':a.extra_fusions,'cublas_prefill':a.cublas_prefill,'mode':a.mode,'cache_enabled':a.cache,'concurrency':a.concurrency,'prefill_chunk':a.prefill_chunk,'warmup':a.warmup,'input_tokens':req['input_ids']['shape'][0],
           'max_new_tokens':req['max_new_tokens'],**summarize(results,seconds),'results':results,'note':'Resident engine; no trace. Includes per-request Graph capture when enabled. Multirequest batches use eager decode.'}
   if prompt_ids is not None:report['input_tokens']=len(prompt_ids)
+  report['workload']=workload_metrics(results)
   report['vector_gemv']=a.vector_gemv
   report.update(mtp_tokens=a.mtp_tokens,weight_cache_mib=a.weight_cache_mib,mtp_draft_graph=a.mtp_draft_graph)
   report['gdn_chunk']=a.gdn_chunk
   report.update(flash_prefill=a.flash_prefill,cache_vision_weights=a.cache_vision_weights)
   report['warmup_cache_baseline']=warmup_results[-1].get('cache',{}) if warmup_results else {}
   report['synchronized_diagnostic']=a.profile_stages or a.profile_kernels or a.audit_logits
-  report.update(gdn_wy=a.gdn_wy,mtp_verify_graph=a.mtp_verify_graph,profile_kernels=a.profile_kernels,audit_logits=a.audit_logits,
+  report.update(fused_residual_norm=a.fused_residual_norm,gpu_candidates=a.gpu_candidates,gdn_wy=a.gdn_wy,mtp_verify_graph=a.mtp_verify_graph,profile_kernels=a.profile_kernels,audit_logits=a.audit_logits,
     multi_token_gemv=a.multi_token_gemv,multi_token_gemv_fp8=a.multi_token_gemv_fp8,fused_gdn_prepare=a.fused_gdn_prepare,gdn_wy_fused=a.gdn_wy_fused,reuse_verify_graph=a.reuse_verify_graph,gdn_tensor_prefill=a.gdn_tensor_prefill,gdn_tensor_chunk=a.gdn_tensor_chunk,gdn_fused_solve=a.gdn_fused_solve,gdn_tilelang=a.gdn_tilelang,fp8_tensor_small=a.fp8_tensor_small,tilelang_fp8=a.tilelang_fp8,fp8_tensor_split=a.fp8_tensor_split,tilelang_dir=a.tilelang_dir)
   report.update(fused_gdn_conv=a.fused_gdn_conv,gdn_cooperative=a.gdn_cooperative,bf16_tp_reduce=a.bf16_tp_reduce,frontend_format=a.frontend_format,frontend_threads=a.frontend_threads,bf16_patches=a.bf16_patches,spool_dir=a.spool_dir)
   report['timing_scope']='CPU image decode/tokenization/preprocessing + disk IPC + native inference + output decoding' if frontend else 'prepared input + native inference'

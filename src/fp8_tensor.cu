@@ -1,3 +1,4 @@
+#include "avi/fp8_codec.cuh"
 // Ampere W8A16: original E4M3FN bytes and row-expanded block128 multipliers.
 // Decode each tile directly into BF16 shared memory; no full BF16 matrix.
 #include "avi/ops.h"
@@ -12,10 +13,8 @@
 namespace avi {
 namespace {
 using bf=__nv_bfloat16;namespace wm=nvcuda::wmma;
-__device__ float value(unsigned char b){
- int e=(b>>3)&15,m=b&7;float x=e?ldexpf(1.f+m*.125f,e-7):ldexpf(float(m),-9);
- if(e==15&&m==7)x=nanf("");return (b&128)?-x:x;
-}
+__device__ float value(unsigned char b){return fp8_e4m3_value(b);}
+
 template<int SPLIT> __global__ void w8a16(const bf* x,const unsigned char* w,const float* scales,
  bf* output,float* partial,int M,int N,int K){
  __shared__ __align__(32) bf a[16*128],b[64*128];

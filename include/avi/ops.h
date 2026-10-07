@@ -3,6 +3,10 @@
 #include <utility>
 #include <vector>
 namespace avi {
+std::pair<at::Tensor,at::Tensor> residual_rms(at::Tensor residual,at::Tensor update,at::Tensor weight,double eps,bool centered=true);
+at::Tensor vocabulary_candidates(at::Tensor logits,int64_t offset=0);
+at::Tensor merge_candidates(at::Tensor gathered);
+
 at::Tensor fp8_tensor_small(at::Tensor x,at::Tensor codes,at::Tensor scales,int split=1);
 at::Tensor small_linear_shared(at::Tensor x,at::Tensor weight,at::Tensor scales={});
 std::vector<at::Tensor> fused_gdn_prepare(at::Tensor projected,at::Tensor weight,at::Tensor history,at::Tensor log_decay,at::Tensor bias,int HK,int H,int K,int V,bool grouped_qk=false);

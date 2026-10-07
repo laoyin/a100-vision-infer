@@ -402,9 +402,11 @@ Tensor Engine::step(Tensor x,Tensor positions) {
   for(size_t i=0;i<states_.size();i++) {
     std::string p="model.language_model.layers."+std::to_string(i);
     auto n=norm(x,p+".input_layernorm");
-    if(text_.at("layer_types").at(i)=="full_attention") x=x+full_attention(n,positions,i,p+".self_attn");
-    else x=x+delta_attention(n,i,p+".linear_attn");
-    n=norm(x,p+".post_attention_layernorm");
+    auto update=text_.at("layer_types").at(i)=="full_attention"?full_attention(n,positions,i,p+".self_attn"):delta_attention(n,i,p+".linear_attn");
+    if(options_.optimized&&options_.fused_residual_norm){
+      auto pair=residual_rms(x,update,tensor(p+".post_attention_layernorm.weight"),eps_);
+      x=pair.first;n=pair.second;
+    }else{x=x+update;n=norm(x,p+".post_attention_layernorm");}
     auto gated=options_.optimized?fused_swiglu(linear(n,p+".mlp.gate_up")):at::silu(linear(n,p+".mlp.gate_proj"))*linear(n,p+".mlp.up_proj");
     x=x+linear(gated,p+".mlp.down_proj",true);
     if(!trace_prefix_.empty())trace_layer(x,int(i));

@@ -22,7 +22,9 @@ int64_t Engine::greedy(Tensor values){
 }
 
 Tensor Engine::local_candidates(Tensor normalized){
-  auto values=linear(normalized,"lm_head").to(at::kFloat);
+  auto projected=linear(normalized,"lm_head");
+  if(options_.gpu_candidates)return vocabulary_candidates(projected,options_.tp_lm_head?rank_*projected.size(-1):0);
+  auto values=projected.to(at::kFloat);
   auto top=at::max(values,-1);
   auto ids=std::get<1>(top);
   if(options_.tp_lm_head&&world_>1)ids=ids+rank_*values.size(-1);
@@ -35,7 +37,20 @@ std::vector<int64_t> Engine::gather_candidates(Tensor candidates){
     auto status=ncclAllGather(candidates.data_ptr(),gathered.data_ptr(),candidates.numel(),ncclDouble,comm_,at::cuda::getCurrentCUDAStream());
     TORCH_CHECK(status==ncclSuccess,ncclGetErrorString(status));
   }else gathered.select(0,0).copy_(candidates);
+  if(options_.gpu_candidates&&ranks==1&&world_>1){
+    auto status=ncclBroadcast(gathered.data_ptr(),gathered.data_ptr(),gathered.numel(),ncclDouble,0,comm_,at::cuda::getCurrentCUDAStream());
+    TORCH_CHECK(status==ncclSuccess,ncclGetErrorString(status));
+  }
   std::vector<int64_t> result(rows);
+  if(options_.gpu_candidates){
+    // AllGather gives identical candidates on every rank. Deterministic GPU
+    // merge removes the rank-0 CPU reduction and the subsequent MPI broadcast.
+    // Host token orchestration still requires one small D2H transfer per round.
+    auto ids=merge_candidates(gathered).to(at::kCPU);
+    std::copy_n(ids.data_ptr<int64_t>(),rows,result.data());
+    for(auto id:result)TORCH_CHECK(id>=0,"Nonfinite local vocabulary maximum");
+    return result;
+  }
   if(rank_==0){
     auto cpu=gathered.to(at::kCPU);auto data=cpu.data_ptr<double>();
     for(int64_t row=0;row<rows;++row){
@@ -58,8 +73,10 @@ Tensor Engine::mtp_step(Tensor embeddings,Tensor positions,Tensor hidden,bool si
   decode_mode_=single_decode;
   auto x=linear(at::cat({norm(embeddings,"mtp.pre_fc_norm_embedding"),norm(hidden,"mtp.pre_fc_norm_hidden")},-1),"mtp.fc");
   const std::string p="mtp.layers.0";
-  x=x+full_attention(norm(x,p+".input_layernorm"),positions,0,p+".self_attn",{},true,&drafts_[active_].state);
-  auto n=norm(x,p+".post_attention_layernorm");
+  auto update=full_attention(norm(x,p+".input_layernorm"),positions,0,p+".self_attn",{},true,&drafts_[active_].state);
+  Tensor n;
+  if(options_.fused_residual_norm){auto pair=residual_rms(x,update,tensor(p+".post_attention_layernorm.weight"),eps_);x=pair.first;n=pair.second;}
+  else{x=x+update;n=norm(x,p+".post_attention_layernorm");}
   auto gate=options_.optimized?fused_swiglu(linear(n,p+".mlp.gate_up")):at::silu(linear(n,p+".mlp.gate_proj"))*linear(n,p+".mlp.up_proj");
   x=x+linear(gate,p+".mlp.down_proj",true);
   return norm(x,"mtp.norm");

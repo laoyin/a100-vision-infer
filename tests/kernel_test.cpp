@@ -8,6 +8,7 @@
 void run_optimized_tests();
 void run_tensor_gdn_tests();
 void run_fp8_tensor_tests();
+void run_dual_path_tests();
 int main() {
  try {
   c10::InferenceMode guard; TORCH_CHECK(cudaSetDevice(0)==cudaSuccess,"No GPU");
@@ -19,7 +20,7 @@ int main() {
     int e=(b>>3)&15,m=b&7; float expected=e==0?std::ldexp(float(m),-9):std::ldexp(1.f+m/8.f,e-7);
     if(b&128) expected=-expected;
     if(e==15 && m==7) { TORCH_CHECK(std::isnan(data[b]),"NaN decoding mismatch"); }
-    else { TORCH_CHECK(data[b]==expected,"FP8 decoding mismatch at ",b); }
+    else { TORCH_CHECK(data[b]==expected && (expected!=0 || std::signbit(data[b])==bool(b&128)),"FP8 decoding mismatch at ",b); }
   }
   at::manual_seed(42); int T=7,H=2,K=8,V=8;
   auto q=at::randn({T,H,K},opt).to(at::kBFloat16),k=at::randn({T,H,K},opt).to(at::kBFloat16);
@@ -43,6 +44,7 @@ int main() {
   if(auto directory=std::getenv("AVI_TILELANG_DIR"))avi::configure_tilelang(directory);
   run_tensor_gdn_tests();
   run_fp8_tensor_tests();
+  run_dual_path_tests();
   std::cout<<"FP8 decoding, GDN recurrence and continuation passed\n"; return 0;
  } catch(const std::exception& e) { std::cerr<<e.what()<<"\n"; return 1; }
 }

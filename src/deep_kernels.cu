@@ -1,3 +1,4 @@
+#include "avi/fp8_codec.cuh"
 #include "avi/ops.h"
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
@@ -17,12 +18,7 @@ __device__ float reduce_block(float x){
  x=threadIdx.x<8?values[lane]:0.f;x=reduce_warp(x);
  if(!threadIdx.x)values[0]=x;__syncthreads();float result=values[0];__syncthreads();return result;
 }
-__device__ float decode_e4m3(unsigned char code){
- unsigned exp=(code>>3)&15,mant=code&7;
- if(exp==15&&mant==7)return __uint_as_float(0x7fffffff);
- return exp?__uint_as_float(((code&128)<<24)|((exp+120)<<23)|(mant<<20)):
-   ldexpf(float(mant),-9)*(code&128?-1.f:1.f);
-}
+__device__ float decode_e4m3(unsigned char code){return fp8_e4m3_value(code);}
 // One warp per output row; all query rows share the weight/scale loads.
 template<bool Quantized> __global__ void shared_gemv(const bf* x,const void* weight,
  const float* scales,bf* y,int M,int N,int K,int S){

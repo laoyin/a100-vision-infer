@@ -1,3 +1,4 @@
+#include "avi/fp8_codec.cuh"
 #include "avi/engine.h"
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -7,12 +8,8 @@
 #include <cmath>
 namespace avi {
 // E4M3FN: exp=15 is finite except mantissa=7; max magnitude is 448.
-__device__ float decode_e4m3(unsigned char b) {
-  int e=(b>>3)&15, m=b&7;
-  float v = e==0 ? ldexpf(float(m),-9) : ldexpf(1.0f+float(m)/8.0f,e-7);
-  if(e==15 && m==7) v=NAN;
-  return (b&128) ? -v : v;
-}
+__device__ float decode_e4m3(unsigned char b) { return fp8_e4m3_value(b); }
+
 __global__ void dequant(const unsigned char* q,const float* s,__nv_bfloat16* y,long n,int cols,int scale_cols) {
   for(long i=blockIdx.x*blockDim.x+threadIdx.x;i<n;i+=long(blockDim.x)*gridDim.x)
     y[i]=__float2bfloat16_rn(decode_e4m3(q[i])*s[(i/cols)*scale_cols+(scale_cols==1?0:(i%cols)/128)]);

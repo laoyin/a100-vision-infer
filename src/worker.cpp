@@ -86,6 +86,8 @@ int main(int argc,char** argv){
       if(key=="--multi-token-gemv-fp8"){options.multi_token_gemv=true;options.shared_gemv_fp8=true;continue;}
       if(key=="--fused-gdn-prepare"){options.fused_gdn_prepare=true;continue;}
       if(key=="--gdn-wy-fused"){options.gdn_wy_fused=true;continue;}
+      if(key=="--fused-residual-norm"){options.fused_residual_norm=true;continue;}
+      if(key=="--gpu-candidates"){options.gpu_candidates=true;continue;}
       if(key=="--gdn-fused-solve"){options.gdn_tensor_prefill=true;options.gdn_fused_solve=true;continue;}
       if(key=="--gdn-tilelang"){options.gdn_tensor_prefill=true;options.gdn_tilelang=true;continue;}
       if(key=="--fp8-tensor-small"){options.fp8_tensor_small=true;continue;}

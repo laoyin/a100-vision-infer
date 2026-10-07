@@ -1,3 +1,4 @@
+#include "avi/fp8_codec.cuh"
 #include "avi/ops.h"
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
@@ -10,7 +11,8 @@ namespace avi {
 using at::Tensor; using bf=__nv_bfloat16;
 static const bf* ptr(const Tensor& x){return reinterpret_cast<const bf*>(x.data_ptr<at::BFloat16>());}
 static bf* outptr(Tensor& x){return reinterpret_cast<bf*>(x.data_ptr<at::BFloat16>());}
-__device__ float fp8(unsigned char b){int e=(b>>3)&15,m=b&7;float f=e?ldexpf(1.f+m/8.f,e-7):ldexpf(float(m),-9);return b&128?-f:f;}
+__device__ float fp8(unsigned char b){return fp8_e4m3_value(b);}
+
 __device__ float warp_sum(float x){for(int d=16;d;d/=2)x+=__shfl_down_sync(0xffffffff,x,d);return x;}
 __device__ float warp_max(float x){for(int d=16;d;d/=2)x=fmaxf(x,__shfl_down_sync(0xffffffff,x,d));return x;}
 __device__ float block_sum(float x){__shared__ float buf[8];int lane=threadIdx.x%32,w=threadIdx.x/32;x=warp_sum(x);if(!lane)buf[w]=x;__syncthreads();x=threadIdx.x<8?buf[lane]:0;x=warp_sum(x);if(!threadIdx.x)buf[0]=x;__syncthreads();return buf[0];}
@@ -46,9 +48,7 @@ __global__ void gemv_vector(const bf* x,const unsigned char* w,const float* scal
    float s=scale[row*S+(S==1?0:k/128)];
    #pragma unroll
    for(int j=0;j<4;j++){
-    unsigned code=(packed>>(8*j))&255,exp=(code>>3)&15,mant=code&7;
-    float decoded=exp?__uint_as_float(((code&128)<<24)|((exp+120)<<23)|(mant<<20)):ldexpf(float(mant),-9)*(code&128?-1.f:1.f);
-    if(exp==15&&mant==7)decoded=__uint_as_float(0x7fffffff);
+    float decoded=fp8_e4m3_value((packed>>(8*j))&255);
     float weight=__bfloat162float(__float2bfloat16_rn(decoded*s));
     unsigned bits=j<2?activations.x:activations.y;
     float value=__bfloat162float(__ushort_as_bfloat16((bits>>(16*(j%2)))&65535));

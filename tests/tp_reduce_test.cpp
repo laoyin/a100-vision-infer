@@ -1,4 +1,5 @@
 #include <ATen/ATen.h>
+#include "avi/ops.h"
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/core/InferenceMode.h>
@@ -28,6 +29,15 @@ int main(int argc,char** argv){
       check(ncclAllReduce(expected.data_ptr(),expected.data_ptr(),n,ncclFloat,ncclSum,comm,stream));
       check(ncclAllReduce(actual.data_ptr(),actual.data_ptr(),n,ncclBfloat16,ncclSum,comm,stream));
       TORCH_CHECK(at::equal(actual,expected.to(at::kBFloat16)),"TP2 BF16 sum differs from FP32 sum rounded to BF16");
+    }
+    // Both ranks must make the same GPU-only candidate decision, including ties.
+    for(bool tie:{false,true}){
+      auto logits=at::zeros({4,4097},opt).to(at::kBFloat16);
+      logits.select(1,4096).fill_(tie?8:8+rank);
+      auto local=avi::vocabulary_candidates(logits,rank*4097),gathered=at::empty({2,4,2},local.options());
+      check(ncclAllGather(local.data_ptr(),gathered.data_ptr(),local.numel(),ncclDouble,comm,at::cuda::getCurrentCUDAStream()));
+      auto ids=avi::merge_candidates(gathered);
+      TORCH_CHECK(at::equal(ids,at::full({4},tie?4096:8193,ids.options())),"Distributed candidate decision mismatch");
     }
     C10_CUDA_CHECK(cudaDeviceSynchronize());check(ncclCommDestroy(comm));
     if(!rank)std::cout<<"TP2 BF16 reduction matches FP32 reference\n";
