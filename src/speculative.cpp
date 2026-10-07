@@ -1,4 +1,5 @@
 #include "avi/engine.h"
+#include "avi/profile.h"
 #include "avi/speculative.h"
 #include "avi/ops.h"
 #include <mpi.h>
@@ -31,6 +32,7 @@ Tensor Engine::local_candidates(Tensor normalized){
   return at::stack({std::get<0>(top).to(at::kDouble),ids.to(at::kDouble)},-1).contiguous();
 }
 std::vector<int64_t> Engine::gather_candidates(Tensor candidates){
+  TraceRange trace("mtp.candidates");
   int ranks=options_.tp_lm_head?world_:1;auto rows=candidates.size(0);
   auto gathered=at::empty({ranks,rows,2},candidates.options());
   if(ranks>1){
@@ -67,6 +69,7 @@ std::vector<int64_t> Engine::gather_candidates(Tensor candidates){
 }
 
 Tensor Engine::mtp_step(Tensor embeddings,Tensor positions,Tensor hidden,bool single_decode){
+  TraceRange trace("mtp.layer");
   // MTP consumes the next token embedding and the preceding normalized hidden.
   // The MTP output norm is already applied; do not apply the target norm again.
   struct Restore {bool& v;bool old;~Restore(){v=old;}} restore{decode_mode_,decode_mode_};
@@ -98,6 +101,7 @@ void Engine::release_draft(int id){
   drafts_.erase(id);
 }
 Tensor Engine::draft_one(int64_t token,int64_t position,Tensor hidden){
+  TraceRange trace("mtp.draft");
   draft_candidates_=Tensor();
   auto& state=drafts_[active_].state;
   if(!draft_graph_enabled_)return mtp_step(embed(at::full({1},token,decode_offset_.options())),at::full({3,1},position,decode_offset_.options()),hidden);
@@ -164,6 +168,7 @@ void Engine::adopt_verify(){
 }
 
 std::pair<Tensor,Tensor> Engine::verify_graph(Tensor embeddings,Tensor positions,int consumed){
+  TraceRange trace("mtp.verify_graph");
   TORCH_CHECK(verifying_&&embeddings.size(0)==options_.mtp_tokens+1&&
       consumed>=0&&consumed+embeddings.size(0)<=session_capacity(),"Invalid verification graph request");
   decode_offset_.fill_(consumed);
@@ -232,6 +237,7 @@ void Engine::advance_draft(Tensor embeddings,Tensor positions,Tensor target_hidd
 
 SpeculativeResult Engine::speculate(int64_t pending,int64_t position,int consumed,int budget,
     const std::vector<int64_t>& eos,const std::function<int64_t(Tensor)>& select){
+  TraceRange trace("mtp.round");
   TORCH_CHECK(options_.mtp_tokens>0&&!verifying_&&budget>0,"Invalid speculative invocation");
   auto& draft=drafts_[active_];TORCH_CHECK(draft.hidden.defined(),"MTP prompt state not initialized");
   int count=std::min(options_.mtp_tokens,budget-1);

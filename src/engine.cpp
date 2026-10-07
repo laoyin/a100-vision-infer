@@ -1,4 +1,5 @@
 #include "avi/engine.h"
+#include "avi/profile.h"
 #include "avi/ops.h"
 #include "avi/tilelang.h"
 #include <ATen/cuda/CUDAGraph.h>
@@ -180,6 +181,7 @@ Tensor Engine::tensor(const std::string& name) {
 }
 Tensor Engine::read_input(const std::string& dir,const json& d) { return raw(dir,d,device_); }
 Tensor Engine::sum(Tensor x) {
+  TraceRange trace("tp.reduce");
   if(world_==1) return x;
   auto timing=profile_begin("tp.reduce");
   if(options_.bf16_tp_reduce&&x.scalar_type()==at::kBFloat16){
@@ -192,6 +194,7 @@ Tensor Engine::sum(Tensor x) {
   TORCH_CHECK(r==ncclSuccess,ncclGetErrorString(r));auto output=f.to(x.scalar_type());profile_end(timing);return output;
 }
 Tensor Engine::linear(Tensor x,const std::string& name,bool reduce) {
+  TraceRange trace(name.c_str());
   auto mixed=mixed_projections_.find(name);
   if(mixed!=mixed_projections_.end()){std::vector<Tensor> parts;for(auto& source:mixed->second)parts.push_back(linear(x,source,false));auto out=at::cat(parts,-1);return reduce?sum(out):out;}
   auto it=weights_.find(name+".weight"); TORCH_CHECK(it!=weights_.end(),"Missing linear ",name);
@@ -327,6 +330,7 @@ Tensor Engine::full_attention(Tensor x,Tensor positions,int layer,const std::str
   out=(options_.optimized&&options_.extra_fusions)?fused_sigmoid_gate(out,gate):out*gate.sigmoid();return finish?linear(out,p+".o_proj",true):out;
 }
 Tensor Engine::delta_attention(Tensor x,int layer,const std::string& p,Tensor projected,bool finish) {
+  TraceRange trace("gdn.attention");
   int K=text_.at("linear_key_head_dim"), V=text_.at("linear_value_head_dim");
   int HK=text_.at("linear_num_key_heads").get<int>()/world_, H=text_.at("linear_num_value_heads").get<int>()/world_;
   int kernel=text_.at("linear_conv_kernel_dim"); auto T=x.size(0); auto& s=states_.at(layer);
@@ -395,6 +399,7 @@ Tensor Engine::delta_attention(Tensor x,int layer,const std::string& p,Tensor pr
   result=result.reshape({T,H*V});return finish?linear(result,p+".out_proj",true):result;
 }
 Tensor Engine::step(Tensor x,Tensor positions) {
+  TraceRange trace("text.step");
   auto embeddings=x;
   struct Restore {bool& value;bool saved;~Restore(){value=saved;}} restore{options_.optimized,options_.optimized};
   if(options_.reference_prefill&&!decode_mode_&&!verifying_)options_.optimized=false;
@@ -432,6 +437,7 @@ void Engine::trace_layer(Tensor hidden,int layer) {
   if(state.conv.defined())write("conv",state.conv);
 }
 Tensor Engine::vision(const std::string& dir,const json& request) {
+  TraceRange trace("vision.encode");
   if(!request.contains("images") || request.at("images").empty()) return {};
   std::vector<Tensor> outputs; int H=vision_.at("num_heads"), hidden=vision_.at("hidden_size"), D=hidden/H;
   int merge=vision_.at("spatial_merge_size");

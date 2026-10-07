@@ -21,9 +21,18 @@ def override_limits(req,max_tokens=None,max_context=None):
  return req
 
 
+def profile_control(send,receive,start,timeout):
+ send({'op':'profile_start' if start else 'profile_stop'})
+ wanted='profile_started' if start else 'profile_stopped'
+ deadline=time.monotonic()+timeout
+ while receive(deadline).get('event')!=wanted:pass
+
+
 def main():
  p=argparse.ArgumentParser(description=__doc__)
  p.add_argument('--model',required=True);p.add_argument('--request',required=True);p.add_argument('--out',required=True)
+ p.add_argument('--nsys-profile-dir',type=Path)
+ p.add_argument('--nsys-bin',default='nsys')
  p.add_argument('--worker',default='build/avi-worker');p.add_argument('--tp',type=int,default=2);p.add_argument('--concurrency',type=int,default=1)
  p.add_argument('--requests',type=int,default=5);p.add_argument('--warmup',type=int,default=1);p.add_argument('--timeout',type=float,default=600)
  p.add_argument('--mode',choices=['baseline','optimized','graph'],default='optimized');p.add_argument('--prefill-chunk',type=int,default=128);p.add_argument('--cache',action='store_true')
@@ -117,6 +126,12 @@ def main():
  if a.bf16_tp_reduce:cmd+=['--bf16-tp-reduce']
  if a.profile_stages:cmd+=['--profile-stages']
  if a.cache_vision_weights:cmd+=['--cache-vision-weights']
+ if a.nsys_profile_dir:
+  a.nsys_profile_dir.mkdir(parents=True,exist_ok=False)
+  os.environ['AVI_PROFILE_DIR']=str(a.nsys_profile_dir.resolve())
+  os.environ['AVI_NSYS']=a.nsys_bin
+  os.environ['AVI_NVTX']='1'
+  cmd[3:3]=['bash',str(Path(__file__).resolve().parents[1]/'scripts/profile-rank.sh')]
  process=subprocess.Popen(cmd,stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True,bufsize=1,start_new_session=not a.inherit_process_group);events=queue.Queue()
  def reader():
   for line in process.stdout:
@@ -166,12 +181,18 @@ def main():
   return results,time.monotonic()-start
  try:
   deadline=time.monotonic()+a.timeout
-  while receive(deadline).get('event')!='ready':pass
+  while True:
+   ready=receive(deadline)
+   if ready.get('event')=='ready':break
+  if a.nsys_profile_dir and ready.get('profiler_control')!=1:raise RuntimeError('Rebuild avi-worker: profiler control unavailable')
   warmup_results=run(a.warmup,'warmup-')[0] if a.warmup else []
+  if a.nsys_profile_dir:profile_control(send,receive,True,a.timeout)
   results,seconds=run(a.requests,'measure-')
+  if a.nsys_profile_dir:profile_control(send,receive,False,a.timeout)
   report={'tp_lm_head':a.tp_lm_head,'reference_prefill':a.reference_prefill,'extra_fusions':a.extra_fusions,'cublas_prefill':a.cublas_prefill,'mode':a.mode,'cache_enabled':a.cache,'concurrency':a.concurrency,'prefill_chunk':a.prefill_chunk,'warmup':a.warmup,'input_tokens':req['input_ids']['shape'][0],
-          'max_new_tokens':req['max_new_tokens'],**summarize(results,seconds),'results':results,'note':'Resident engine; no trace. Includes per-request Graph capture when enabled. Multirequest batches use eager decode.'}
+          'max_new_tokens':req['max_new_tokens'],**summarize(results,seconds),'results':results,'note':'Resident engine; profiler status is recorded separately. Includes per-request Graph capture when enabled. Multirequest batches use eager decode.'}
   if prompt_ids is not None:report['input_tokens']=len(prompt_ids)
+  report['profiler']={'enabled':bool(a.nsys_profile_dir),'nvtx_enabled':ready.get('nvtx_enabled',False),'scope':'measured requests only; load and warmup excluded'}
   report['workload']=workload_metrics(results)
   report['vector_gemv']=a.vector_gemv
   report.update(mtp_tokens=a.mtp_tokens,weight_cache_mib=a.weight_cache_mib,mtp_draft_graph=a.mtp_draft_graph)
@@ -186,7 +207,7 @@ def main():
   report['prompt_token_ids']=prompt_ids
   with open(a.out,'x',encoding='utf-8') as f:json.dump(report,f,indent=2)
   print(json.dumps({k:v for k,v in report.items() if k not in ('results','prompt_token_ids')},indent=2))
-  send({'op':'shutdown'});process.stdin.close();process.wait(timeout=30)
+  send({'op':'shutdown'});process.stdin.close();process.wait(timeout=300 if a.nsys_profile_dir else 30)
   if process.returncode or report['successful']!=a.requests:raise RuntimeError('Worker or requests failed')
  finally:
   if process.poll() is None:

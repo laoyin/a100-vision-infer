@@ -1,4 +1,5 @@
 #include "avi/engine.h"
+#include "avi/profile.h"
 #include "avi/json_grammar.h"
 #include "avi/memory_budget.h"
 #include <c10/cuda/CUDACachingAllocator.h>
@@ -7,6 +8,7 @@
 #include <cmath>
 #include <mpi.h>
 #include <cuda_runtime.h>
+#include <cuda_profiler_api.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/core/InferenceMode.h>
 #include <ATen/Parallel.h>
@@ -134,8 +136,8 @@ int main(int argc,char** argv){
   }
   if(!rank&&!vocabulary.empty()){ TORCH_CHECK(vocabulary.size()==engine.config().at("text_config").at("vocab_size").get<size_t>(),"Vocabulary size mismatch"); }
   int grammar_available=!vocabulary.empty();MPI_Bcast(&grammar_available,1,MPI_INT,0,MPI_COMM_WORLD);
-  emit(rank,{{"event","ready"},{"tp",world},{"max_context",capacity},{"max_concurrency",concurrency},{"session_budget_bytes",memory.limit()},{"workspace_bytes",workspace_bytes}});
-  std::deque<Job> pending;std::map<int,Job> active;std::set<std::string> ids;std::string input;bool stopping=false;int slot_serial=1;size_t turn=0;
+  emit(rank,{{"event","ready"},{"profiler_control",1},{"nvtx_enabled",avi::nvtx_enabled()},{"tp",world},{"max_context",capacity},{"max_concurrency",concurrency},{"session_budget_bytes",memory.limit()},{"workspace_bytes",workspace_bytes}});
+  std::deque<Job> pending;std::map<int,Job> active;std::set<std::string> ids;std::string input;bool stopping=false;bool profiler_active=false;int slot_serial=1;size_t turn=0;
   while(!stopping||!pending.empty()||!active.empty()){
    json commands=json::array();
    if(!rank&&!stopping){pollfd descriptor{STDIN_FILENO,POLLIN,0};int wait=active.empty()&&pending.empty()?10:0;
@@ -145,7 +147,15 @@ int main(int argc,char** argv){
    }
    commands=broadcast(commands,rank);
    for(auto& command:commands){auto op=command.value("op",std::string());auto id=command.value("id",std::string());
-    if(op=="shutdown"){stopping=true;continue;}
+    if(op=="profile_start"||op=="profile_stop"){
+      TORCH_CHECK(active.empty()&&pending.empty(),"Profiler control requires an idle worker");
+      TORCH_CHECK(op=="profile_start"?!profiler_active:profiler_active,"Invalid profiler transition");
+      C10_CUDA_CHECK(cudaDeviceSynchronize());
+      if(op=="profile_start"){C10_CUDA_CHECK(cudaProfilerStart());profiler_active=true;}
+      else{C10_CUDA_CHECK(cudaProfilerStop());profiler_active=false;}
+      emit(rank,{{"event",op=="profile_start"?"profile_started":"profile_stopped"},{"nvtx_enabled",avi::nvtx_enabled()}});continue;
+    }
+    if(op=="shutdown"){if(profiler_active){C10_CUDA_CHECK(cudaProfilerStop());profiler_active=false;}stopping=true;continue;}
     if(op=="cancel"){for(auto& j:pending)if(j.id==id)j.cancelled=true;for(auto& item:active)if(item.second.id==id)item.second.cancelled=true;continue;}
     if(op=="stats"){emit(rank,{{"event","stats"},{"active",active.size()},{"pending",pending.size()},{"cache",engine.cache_stats()},{"reserved_bytes",memory.used()},{"budget_bytes",memory.limit()}});continue;}
     if(op!="submit"){emit(rank,{{"event","error"},{"id",id},{"message","Unknown operation"}});continue;}

@@ -50,3 +50,5 @@ gdn-tensor-test-*/
 ampere-tiled-test-*/
 
 dual-path-test-*/
+
+profile-test-*/
